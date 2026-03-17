@@ -55,7 +55,7 @@ For each confirmed finding, write one file to `__RESULT_DIR__/` named `__FINDING
 <!-- Location: __LOCATION__ -->
 <!-- Target: __TARGET_PATH__ -->
 
-### F-01: {Short Title}
+### F-{NN}: {Short Title}
 - **Location**: `{file}:{function}` (lines {X}-{Y})
 - **Vulnerability class**: {class}
 - **Root cause**: {description in 1-3 sentences}
@@ -67,8 +67,8 @@ For each confirmed finding, write one file to `__RESULT_DIR__/` named `__FINDING
 - **Reachability notes**: {how an attacker reaches this, prerequisites}
 ```
 
-**Format rules (strictly enforced by the validation script):**
-1. Heading must be exactly `### F-01:` followed by a space and the title.
+**Format rules (strictly enforced by the built-in validator):**
+1. Heading must be `### F-{NN}:` followed by a space and the title.
 2. Required fields (each on its own `- **{name}**:` line): `Location`, `Vulnerability class`, `Root cause`, `Preliminary severity`.
 3. Severity must be exactly one of: `Critical`, `High`, `Medium`, `Low`.
 4. Nothing outside the source context comment and finding block — no intro paragraphs, extra headings, or closing remarks.
@@ -82,4 +82,4 @@ For each confirmed finding, write one file to `__RESULT_DIR__/` named `__FINDING
 - [ ] Entry point source code read and analyzed
 - [ ] All attacker-controlled data paths traced to dangerous sinks
 - [ ] One finding file written per confirmed security issue (or zero files if no findings)
-- [ ] Each file passes the `validate_stage3.py` format requirements
+- [ ] Each file passes the Stage 3 validator's format requirements

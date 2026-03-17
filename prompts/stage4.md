@@ -71,7 +71,7 @@ Write your evaluation to `__OUTPUT_PATH__`. Use **exactly** this format:
 
 **IMPORTANT**: The `"id"` in the JSON and the `**ID**` in the Detail section must both be `TBD`. The orchestrator will assign the real ID after all evaluations complete.
 
-**IMPORTANT**: The output file MUST be parseable by `validate_stage4.py`. The JSON must be valid (no trailing commas, properly quoted strings).
+**IMPORTANT**: The output file MUST be parseable by the built-in Stage 4 validator. The JSON must be valid (no trailing commas, properly quoted strings).
 
 ## Completion Checklist
 

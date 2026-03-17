@@ -1,19 +1,12 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
+# Build output
 dist/
-build/
-*.egg
-.eggs/
 
-# Virtual environments
+# Local environments
 .venv/
 venv/
 env/
 
 # Audit runtime artifacts
-.checkpoint.json
 audit-output/
 **/audit-output/
 
@@ -23,3 +16,7 @@ audit-output/
 *.swo
 .idea/
 .vscode/
+
+# Node
+node_modules/
+npm-debug.log*

@@ -33,6 +33,7 @@ async def _run_module_agent(
         logger.info("Stage 2: %s agent already complete.", module.id)
         return
 
+    logger.info("Stage 2: Starting analysis of module %s.", module.id)
     prompt = load_prompt("stage2.md", {
         "stage1_output_path": stage1_output,
         "result_dir": draft_dir,

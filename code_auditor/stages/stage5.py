@@ -80,6 +80,7 @@ async def _run_finding(
         logger.info("Stage 5: %s already complete, skipping.", stage3_filename)
         return pending_path if os.path.exists(pending_path) else None
 
+    logger.info("Stage 5: Starting evaluation of %s.", stage3_filename)
     prompt = load_prompt("stage5.md", {
         "finding_file_path": stage3_file_path,
         "output_path": pending_path,
@@ -153,6 +154,56 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
     return finalized
 
 
+def _backfill_stage5_markers(
+    finding_files: list[str],
+    config: AuditConfig,
+    checkpoint: CheckpointManager,
+) -> None:
+    """Create markers for findings already processed in a previous run.
+
+    When a previous run evaluated findings but was interrupted (or predates
+    marker-based tracking), some findings may lack checkpoint markers even
+    though they were already processed.
+
+    Heuristic: find the highest AU number that has any file in ``_pending/``
+    and create markers for every input finding whose AU number is ≤ that
+    value, since those AUs must have been reached by the previous run.
+    """
+    pending_dir = os.path.join(config.output_dir, "stage-5-details", "_pending")
+    if not os.path.isdir(pending_dir):
+        return
+
+    pending_files = os.listdir(pending_dir)
+    if not pending_files:
+        return
+
+    au_re = re.compile(r"AU-(\d+)")
+    max_au = 0
+    for name in pending_files:
+        m = au_re.search(name)
+        if m:
+            max_au = max(max_au, int(m.group(1)))
+
+    if max_au == 0:
+        return
+
+    backfilled = 0
+    for ff in finding_files:
+        filename = os.path.basename(ff)
+        m = au_re.search(filename)
+        if m and int(m.group(1)) <= max_au:
+            key = _task_key(filename)
+            if not checkpoint.is_complete(key):
+                checkpoint.mark_complete(key)
+                backfilled += 1
+
+    if backfilled:
+        logger.info(
+            "Stage 5: Backfilled %d markers (highest completed AU: %d).",
+            backfilled, max_au,
+        )
+
+
 async def run_stage5(
     finding_files: list[str],
     config: AuditConfig,
@@ -162,6 +213,9 @@ async def run_stage5(
     if not finding_files:
         logger.info("Stage 5: No findings to evaluate.")
         return _list_existing_final_files(os.path.join(config.output_dir, "stage-5-details"))
+
+    if config.resume:
+        _backfill_stage5_markers(finding_files, config, checkpoint)
 
     results = await run_parallel_limited(
         finding_files,

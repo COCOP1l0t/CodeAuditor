@@ -42,6 +42,10 @@ class CheckpointManager:
         if task_key == "stage4":
             return os.path.join(self._output_dir, "stage-4-security-context.md")
         if task_key.startswith("stage5:"):
+            marker = self._marker_path(task_key)
+            if os.path.exists(marker):
+                return marker
+            # Fall back to pending file for runs that predate marker-based tracking.
             filename = task_key[len("stage5:"):]
             return os.path.join(self._output_dir, "stage-5-details", "_pending", filename)
         if task_key == "stage6":
@@ -50,7 +54,7 @@ class CheckpointManager:
         return None
 
     def _needs_marker(self, task_key: str) -> bool:
-        return task_key.startswith("stage2:") or task_key.startswith("stage3:")
+        return task_key.startswith("stage2:") or task_key.startswith("stage3:") or task_key.startswith("stage5:")
 
     def _marker_path(self, task_key: str) -> str:
         return os.path.join(self._markers_dir, task_key.replace(":", "-"))

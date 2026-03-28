@@ -32,6 +32,7 @@ async def _run_unit(
         logger.info("Stage 3: %s already complete, skipping.", unit.id)
         return list_matching_files(result_dir, finding_pattern)
 
+    logger.info("Stage 3: Starting bug discovery for %s.", unit.id)
     prompt = load_prompt("stage3.md", {
         "au_file_path": unit.au_file_path,
         "result_dir": result_dir,

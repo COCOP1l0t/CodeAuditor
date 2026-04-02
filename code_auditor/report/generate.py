@@ -156,13 +156,13 @@ def _format_finding_detail(finding: dict) -> str:
 
 def generate_report(
     research_record_path: str,
-    stage5_dir: str,
+    findings_dir: str,
     output_path: str,
 ) -> GeneratedReportSummary:
     project_summary, threat_context = _parse_research_record(research_record_path)
 
     raw_findings: list[dict] = []
-    for file_path in list_json_files_sync(stage5_dir):
+    for file_path in list_json_files_sync(findings_dir):
         finding = _parse_finding_file(file_path)
         if finding is not None:
             raw_findings.append(finding)

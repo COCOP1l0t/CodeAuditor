@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 import os
-import re
 
 from .checkpoint import CheckpointManager
-from .config import AnalysisUnit, AuditConfig, Module
+from .config import AnalysisUnit, AuditConfig
 from .logger import get_logger
-from .parsing.stage2 import parse_modules
+from .parsing.stage2 import parse_au_files
 from .stages.stage0 import run_setup
 from .stages.stage1 import Stage1Output, run_stage1
 from .stages.stage2 import run_stage2
 from .stages.stage3 import run_stage3
 from .stages.stage4 import run_stage4
 from .stages.stage5 import run_stage5
-from .stages.stage6 import run_stage6
 from .utils import list_json_files
 
 logger = get_logger("orchestrator")
@@ -35,7 +33,7 @@ async def run_audit(config: AuditConfig) -> str:
         stage1_out = await run_stage1(config, checkpoint)
 
     # Pause for user review before continuing
-    if 1 not in config.skip_stages and not all(s in config.skip_stages for s in range(2, 7)):
+    if 1 not in config.skip_stages and not all(s in config.skip_stages for s in range(2, 6)):
         details_dir_preview = os.path.join(config.output_dir, "stage-1-details")
         logger.info(
             "Stage 1 complete. Review generated files in: %s", details_dir_preview
@@ -53,57 +51,41 @@ async def run_audit(config: AuditConfig) -> str:
         else os.path.join(details_dir, "vulnerability-criteria.md")
     )
 
-    # Stage 2: decompose project into modules
-    modules: list[Module] = []
-    if 2 not in config.skip_stages:
-        modules = await run_stage2(config, checkpoint)
-    elif 3 not in config.skip_stages:
-        logger.info("Stage 2 skipped. Loading existing modules.")
-        modules = parse_modules(os.path.join(config.output_dir, "stage-2-modules.json"))
-    else:
-        logger.info("Stage 2 skipped.")
-
-    if not modules and 3 not in config.skip_stages:
-        raise RuntimeError("Stage 2 produced no modules.")
-
-    # Stage 3: assess scale and define analysis units
+    # Stage 2: decompose project into analysis units
     analysis_units: list[AnalysisUnit] = []
-    if 3 not in config.skip_stages:
-        analysis_units = await run_stage3(modules, config, checkpoint)
+    if 2 not in config.skip_stages:
+        analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
     else:
-        logger.info("Stage 3 skipped.")
-        stage3_dir = os.path.join(config.output_dir, "stage-3-details")
-        au_files = sorted(
-            f for f in list_json_files(stage3_dir) if re.search(r"[\\/]AU-\d+\.json$", f)
-        )
-        for au_file_path in au_files:
-            m = re.search(r"AU-(\d+)\.json$", au_file_path)
-            if m:
-                analysis_units.append(AnalysisUnit(id=f"AU-{m.group(1)}", module_id="", au_file_path=au_file_path))
+        logger.info("Stage 2 skipped. Loading existing analysis units.")
+        stage2_dir = os.path.join(config.output_dir, "stage-2-details")
+        analysis_units = parse_au_files(stage2_dir)
 
-    # Stage 4: bug discovery per AU
+    if not analysis_units and 3 not in config.skip_stages:
+        raise RuntimeError("Stage 2 produced no analysis units.")
+
+    # Stage 3: bug discovery per AU
     bug_files: list[str] = []
-    if 4 not in config.skip_stages:
-        bug_files = await run_stage4(
+    if 3 not in config.skip_stages:
+        bug_files = await run_stage3(
             analysis_units, config, checkpoint,
             auditing_focus_path, vuln_criteria_path,
         )
     else:
-        logger.info("Stage 4 skipped.")
-        bug_files = list_json_files(os.path.join(config.output_dir, "stage-4-details"))
+        logger.info("Stage 3 skipped.")
+        bug_files = list_json_files(os.path.join(config.output_dir, "stage-3-details"))
 
-    # Stage 5: evaluate findings
+    # Stage 4: evaluate findings
+    if 4 not in config.skip_stages:
+        await run_stage4(bug_files, config, checkpoint, vuln_criteria_path)
+    else:
+        logger.info("Stage 4 skipped.")
+
+    # Stage 5: generate report
+    report_path = ""
     if 5 not in config.skip_stages:
-        await run_stage5(bug_files, config, checkpoint, vuln_criteria_path)
+        report_path = await run_stage5(config, checkpoint)
     else:
         logger.info("Stage 5 skipped.")
-
-    # Stage 6: generate report
-    report_path = ""
-    if 6 not in config.skip_stages:
-        report_path = await run_stage6(config, checkpoint)
-    else:
-        logger.info("Stage 6 skipped.")
 
     logger.info("Audit complete. Report: %s", report_path)
     return report_path

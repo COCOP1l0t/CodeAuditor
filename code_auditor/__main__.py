@@ -12,7 +12,7 @@ from .orchestrator import run_audit
 logger = get_logger("main")
 
 
-_ALL_STAGES = list(range(7))  # 0–6
+_ALL_STAGES = list(range(6))  # 0–5
 
 
 def _parse_skip_stages(raw: str | None) -> list[int]:

@@ -34,7 +34,6 @@ class Module:
 @dataclass
 class AnalysisUnit:
     id: str
-    module_id: str
     au_file_path: str
 
 

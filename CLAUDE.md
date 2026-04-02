@@ -1,6 +1,6 @@
 # CodeAuditor
 
-Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target project, it researches security context → decomposes the codebase into modules → analysis units → findings → vulnerabilities → final report.
+Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target project, it researches security context → decomposes the codebase into analysis units → findings → vulnerabilities → final report.
 
 ## Quick reference
 
@@ -35,7 +35,7 @@ code-auditor --target /path/to/project [--output-dir DIR] [--max-parallel 4] [--
 ```bash
 pytest                                    # run all tests
 pytest code_auditor/tests/            # same thing
-pytest -k test_stage3                     # filter by name
+pytest -k test_stage2                     # filter by name
 ```
 
 Tests are in `code_auditor/tests/test_parsers_and_report.py`. They cover parsers, validators, and report generation — no agent calls needed.
@@ -52,30 +52,29 @@ code_auditor/
 ├── checkpoint.py        # File/marker-based checkpoint/resume
 ├── logger.py            # stdlib logging wrapper
 ├── utils.py             # run_parallel_limited, file helpers, severity sort
-├── stages/              # stage0–stage6 (one file per stage)
-├── parsing/             # stage2.py, stage3.py, stage4.py — extract structured data from agent output
-├── validation/          # common.py + stage1–stage5 — validate agent output format
+├── stages/              # stage0–stage5 (one file per stage)
+├── parsing/             # stage2.py, stage3.py — extract structured data from agent output
+├── validation/          # common.py + stage1–stage4 — validate agent output format
 ├── report/              # generate.py, helpers.py — deterministic report assembly
 └── tests/
-prompts/                 # stage1.md–stage5.md — prompt templates with __KEY__ placeholders
+prompts/                 # stage1.md–stage4.md — prompt templates with __KEY__ placeholders
 ```
 
-## Architecture (6 stages)
+## Architecture (5 stages)
 
 | Stage | What it does | Parallelism |
 |-------|-------------|-------------|
 | 0 | Create output dirs | None (pure fs) |
 | 1 | Security context research (git, web, SECURITY.md) | Single agent |
-| 2 | Decompose project into modules | Single agent |
-| 3 | Split modules into analysis units (AUs) | 1 agent per module |
-| 4 | Bug discovery per AU | 1 agent per AU |
-| 5 | Evaluate findings: real vuln? severity? | 1 agent per finding |
-| 6 | Generate final report.md | No agent (deterministic) |
+| 2 | Decompose project into analysis units (AUs) | Single agent |
+| 3 | Bug discovery per AU | 1 agent per AU |
+| 4 | Evaluate findings: real vuln? severity? | 1 agent per finding |
+| 5 | Generate final report.md | No agent (deterministic) |
 
 ## Key patterns
 
 - **Prompt templates**: `prompts/stageN.md` with `__KEY__` placeholders, loaded via `prompts.py:load_prompt()`
-- **Directive injection**: Stage 1 produces auditing focus and vulnerability criteria directives; injected into Stage 4 (both) and Stage 5 (vuln criteria only)
+- **Directive injection**: Stage 1 produces auditing focus and vulnerability criteria directives; injected into Stage 2 (scope/hot-spots), Stage 3 (both), and Stage 4 (vuln criteria only)
 - **Validation + retry**: Each agent output is validated; on failure, a repair prompt is sent (up to `max_retries`)
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`

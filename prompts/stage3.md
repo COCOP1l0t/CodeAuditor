@@ -1,72 +1,39 @@
-# Stage 3: Codebase Scale Assessment and Analysis Unit Definition
+# Stage 3: Vulnerability Analysis
 
-You are performing **Stage 3** of an orchestrated software security audit. Write your output to disk; do not print it in your response.
+You are performing **Stage 3** of an orchestrated software security audit. Write your findings to disk; do not print them in your response.
 
-## Your Task
+## Your Assignment
 
-Assess the codebase scale of module **__MODULE_ID__** and produce one or more **analysis unit** files that will each be assigned to an independent sub-agent for bug analysis.
+Before starting analysis, read the auditing focus at `__AUDITING_FOCUS_PATH__` and the vulnerability criteria at `__VULN_CRITERIA_PATH__`. The auditing focus tells you which components deserve the closest scrutiny. The vulnerability criteria define what distinguishes a vulnerability from a bug. Use this context to focus your analysis on reachable, exploitable issues.
 
-- **Stage 2 output**: `__STAGE2_OUTPUT_PATH__`
-- **Result directory**: `__RESULT_DIR__`
-- **Your module**: `__MODULE_ID__`
+Read your analysis unit file at `__AU_FILE_PATH__`. It describes the codebase you are assigned to and provides the context you need to start your analysis.
 
-## Workflow
+Your task: discover security bugs and vulnerabilities in the assigned codebase.
 
-### Step 1: Read Stage 2 Output
+## Output
 
-Read `__STAGE2_OUTPUT_PATH__` (JSON) to identify the module's name, description, and file paths.
+For each confirmed vulnerability, write one JSON file to `__RESULT_DIR__/` named `__FINDING_PREFIX__-F-{NN}.json` (zero-padded: F-01, F-02, ...).
 
-### Step 2: Measure Codebase Scale
-
-Enumerate the module's source files and measure their size:
-
-- Count files and total lines of code (LOC)
-- Survey the top-level structure: major subsystems, dispatch tables, protocol branches, distinct functional areas
-- Determine whether a single sub-agent can analyze the full module with sufficient depth
-
-**Scale thresholds (guidelines, not hard rules):**
-
-| Scale | Size | Decision |
-|-------|------|----------|
-| Small | ≤ 800 LOC, ≤ 5 files | Single analysis unit |
-| Medium | 800–2000 LOC, 5–15 files | Single analysis unit (with focused scope) |
-| Large | > 2000 LOC or > 15 files | Split into multiple units |
-
-### Step 3: Define Analysis Units and Write Output
-
-Write **one JSON file per analysis unit** to the result directory. Name them:
-- `__RESULT_DIR__/__MODULE_ID__-1.json`
-- `__RESULT_DIR__/__MODULE_ID__-2.json` (if split)
-- etc.
-
-Each file is a self-contained work package for a sub-agent:
+**Each finding file must contain a single JSON object with this exact structure:**
 
 ```json
 {
-  "description": "Short description of what this unit covers",
-  "files": ["relative/path/to/file1.c", "relative/path/to/file2.c"],
-  "focus": "Concrete analysis guidance: which functions or subsystems are most complex, which code paths handle external input, what data structures are central, which operations are dangerous (memory copies, size arithmetic, state transitions). Be specific enough that a sub-agent can start analysis immediately."
+  "finding_id": "F-01",
+  "title": "Short descriptive title",
+  "location": "file:function (lines X-Y)",
+  "vulnerability_class": "e.g. buffer overflow, integer underflow, use-after-free",
+  "root_cause": "Brief description",
+  "preliminary_severity": "Critical|High|Medium|Low",
+  "code_snippet": "5-30 lines of annotated code showing the vulnerability",
+  "reachability_notes": "How an attacker reaches this, prerequisites"
 }
 ```
 
-**Splitting rules:**
+**Format rules** (enforced by validator):
+1. The file must contain valid JSON (no trailing commas, no comments).
+2. Required keys: `finding_id`, `title`, `location`, `vulnerability_class`, `root_cause`, `preliminary_severity`, `code_snippet`.
+3. `preliminary_severity` must be exactly one of: `Critical`, `High`, `Medium`, `Low`.
+4. `finding_id` must match the `F-{NN}` pattern from the filename.
+5. One finding per file.
 
-1. **Non-overlapping files.** Each unit must cover a distinct, non-overlapping set of source files.
-2. **Split at stable boundaries.** Prefer protocol message type boundaries, top-level dispatch branches, or distinct functional layers.
-3. **Size-bound each unit.** Aim for 500–1500 LOC per unit.
-4. **Aim for 2–5 units.** If more seem necessary, reconsider — some units may be mergeable.
-5. **Focus must be actionable.** Name concrete functions, data flows, or code patterns — not generic phrases.
-
-**Output rules:**
-- Each file must be valid JSON (no trailing commas, no comments)
-- The `files` field must be a JSON array of strings (file paths)
-- If the module needs only one analysis unit, write exactly one file: `__MODULE_ID__-1.json`
-
-## Completion Checklist
-
-- [ ] Stage 2 output read to obtain module name and file paths
-- [ ] All source files enumerated and LOC counted
-- [ ] Scale assessed and split decision made
-- [ ] One JSON file per analysis unit written to `__RESULT_DIR__/`
-- [ ] No overlapping files between units (if split)
-- [ ] Each focus is specific and actionable
+If no vulnerabilities are found, write no files.

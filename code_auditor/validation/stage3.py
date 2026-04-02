@@ -5,15 +5,8 @@ import json
 from ..config import ValidationIssue
 from .common import read_file_or_issues
 
-_PLACEHOLDERS = {"none", "n/a", "...", "tbd", ""}
-
-
-def _is_blank(value: object) -> bool:
-    if isinstance(value, str):
-        return value.lower().strip() in _PLACEHOLDERS
-    if isinstance(value, list):
-        return len(value) == 0
-    return not value
+_REQUIRED_KEYS = ["finding_id", "title", "location", "vulnerability_class", "root_cause", "preliminary_severity"]
+_VALID_SEVERITIES = {"critical", "high", "medium", "low"}
 
 
 def validate_stage3_file(file_path: str) -> list[ValidationIssue]:
@@ -23,9 +16,9 @@ def validate_stage3_file(file_path: str) -> list[ValidationIssue]:
 
     if not content.strip():
         return [ValidationIssue(
-            description="Analysis unit file is empty.",
-            expected="A JSON object with description, files, and focus fields.",
-            fix="Write the analysis unit definition as JSON to this file.",
+            description="Bug finding file is empty.",
+            expected="A JSON object with finding details.",
+            fix="Write the finding as JSON, or delete the file if no bugs were found.",
         )]
 
     try:
@@ -39,23 +32,20 @@ def validate_stage3_file(file_path: str) -> list[ValidationIssue]:
 
     validation_issues: list[ValidationIssue] = []
 
-    if _is_blank(data.get("description")):
+    for key in _REQUIRED_KEYS:
+        if key not in data or not data[key]:
+            validation_issues.append(ValidationIssue(
+                description=f'Missing required key: "{key}".',
+                expected=f'A non-empty "{key}" field.',
+                fix=f'Add "{key}" to the JSON object.',
+            ))
+
+    severity = data.get("preliminary_severity", "")
+    if isinstance(severity, str) and severity and severity.lower() not in _VALID_SEVERITIES:
         validation_issues.append(ValidationIssue(
-            description='Missing or blank "description".',
-            expected="A short description of what this unit covers.",
-            fix='Add a "description" field.',
-        ))
-    if _is_blank(data.get("files")):
-        validation_issues.append(ValidationIssue(
-            description='Missing or empty "files".',
-            expected="A non-empty array of source file paths.",
-            fix='Add a "files" array with at least one path.',
-        ))
-    if _is_blank(data.get("focus")):
-        validation_issues.append(ValidationIssue(
-            description='Missing or blank "focus".',
-            expected="Concrete analysis guidance.",
-            fix='Add a "focus" field with actionable analysis guidance.',
+            description=f'Invalid preliminary_severity: "{severity}".',
+            expected="One of: Critical, High, Medium, Low.",
+            fix="Change preliminary_severity to one of: Critical, High, Medium, Low.",
         ))
 
     return validation_issues

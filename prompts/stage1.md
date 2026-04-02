@@ -27,9 +27,9 @@ Investigate the project's security posture by collecting information from the fo
 
 **Source tier 1:**
 - Read `SECURITY.md` (or equivalent) carefully. Note the vulnerability disclosure process, scope statements, and critically, any links to external resources (security announcements page, bug bounty program, mailing lists).
-- If SECURITY.md or other docs link to a **project website**, a **security announcements page**, or a **bug bounty program**, you **must** visit them.
+- Usually the SECURITY.md or other docs link to a **project website**, a **security announcements page**, or a **bug bounty program**, and you **must** visit and collect information from them carefully.
 
-**Source tier 2:**
+**Source tier 2:(optional)**
 - Search git history for security-relevant commits: keywords "CVE", "security", "fix", "vulnerability", "overflow", "injection", "bypass", "DOS", "crash", "patch", etc.
 
 **Source tier 3 (fallback only):**
@@ -39,11 +39,10 @@ Investigate the project's security posture by collecting information from the fo
 - Check NVD, OSV.dev, and GitHub Advisory Database.
 - For widely-packaged projects, check distro security trackers (Debian, Red Hat) website.
 
-**Important**: Only consult tier 3 sources if tiers 1 and 2 yield insufficient information. Tier 3 is a fallback, not a default step.
+**Important**: Only consult tier 2 and 3 sources if tiers 1 yields insufficient information. Tier 2 and 3 are not a default step.
 
 **Information to collect:**
 - **Scope announcements** (from tier 1 only): Which functional modules and issue types are explicitly declared in or out of vulnerability scope by the project.
-
 - **Historical vulnerabilities** (from tiers 1, 2, and 3): For each finding, record: CVE ID (if any), date, affected module/component, vulnerability class, root cause, impact, severity, and attacker profile (attack vector, prerequisites, network position).
 
 ### Step 2: Write Research Record

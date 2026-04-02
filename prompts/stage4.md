@@ -1,39 +1,79 @@
-# Stage 4: Vulnerability Analysis
+# Stage 4: Vulnerability Evaluation
 
-You are performing **Stage 4** of an orchestrated software security audit. Write your findings to disk; do not print them in your response.
+You are performing **Stage 4** of an orchestrated software security audit. Write your result to disk; do not print it in your response.
 
-## Your Assignment
+## Your Task
 
-Before starting analysis, read the auditing focus at `__AUDITING_FOCUS_PATH__` and the vulnerability criteria at `__VULN_CRITERIA_PATH__`. The auditing focus tells you which components deserve the closest scrutiny. The vulnerability criteria define what distinguishes a vulnerability from a bug. Use this context to focus your analysis on reachable, exploitable issues.
+Evaluate one vulnerability finding from Stage 3.
 
-Read your analysis unit file at `__AU_FILE_PATH__`. It describes the codebase you are assigned to and provides the context you need to start your analysis.
+- **Finding file**: `__FINDING_FILE_PATH__`
+- **Output file**: `__OUTPUT_PATH__` (write here ONLY if the vulnerability is confirmed and CVSS >= 4.0)
+- **Vulnerability criteria** (bug vs. vulnerability boundary + historical calibration): `__VULN_CRITERIA_PATH__`
 
-Your task: discover security bugs and vulnerabilities in the assigned codebase.
+## Workflow
 
-## Output
+### Step 1: Read the Finding File
 
-For each confirmed vulnerability, write one JSON file to `__RESULT_DIR__/` named `__FINDING_PREFIX__-F-{NN}.json` (zero-padded: F-01, F-02, …).
+Read `__FINDING_FILE_PATH__` (JSON). It contains one vulnerability finding with location, vulnerability class, root cause, preliminary severity, a code snippet, and reachability notes.
 
-**Each finding file must contain a single JSON object with this exact structure:**
+### Step 2: Verify Existence (False-Positive Check)
+
+Read the relevant source code at the target project path. Perform an in-depth static analysis:
+- Is the vulnerability reachable from attacker-controlled input?
+- Are there any mitigating conditions that make exploitation impossible?
+- Is the code path actually executed in the context described?
+
+**If this is a false positive:** do NOT write any output file. The orchestrator will treat a missing output file as "filtered." Your task is complete -- stop here.
+
+### Step 3: Assess Pre-Requisites
+
+Before scoring severity, determine the exact conditions required to trigger the vulnerability:
+
+- **Compile-time flags**: Is the vulnerable code path only compiled in when a non-default or rarely-used flag is set (e.g., `#ifdef ENABLE_LEGACY_FEATURE`, an optional CMake/configure flag not enabled in typical builds)?
+- **Runtime configuration**: Does triggering the vulnerability require a non-default configuration option that is unlikely to be enabled in real-world deployments?
+- **Environment assumptions**: Does exploitation depend on an atypical deployment topology, hardware, or operating mode?
+
+If the vulnerability requires a non-default compile flag or non-default runtime configuration that is uncommon in real-world deployments, cap its severity at **Medium** regardless of the theoretical impact. Document this constraint explicitly in the prerequisites field. The rationale: a vulnerability that most installations never expose is structurally less severe than one present in all default builds.
+
+### Step 4: Assess Impact and CVSS Score
+
+Read `__VULN_CRITERIA_PATH__` for project-specific vulnerability criteria: the bug-vs-vulnerability boundary and historical calibration.
+
+Using this context together with your pre-requisite assessment, analyze the security impact:
+- Determine what an attacker can achieve (RCE, DoS, info-leak, auth bypass, etc.)
+- Compute a CVSS v3.1 base score (the orchestrator will derive the severity label from this score)
+- If the non-default-config cap from Step 3 applies, cap the CVSS score at 6.9
+
+**If the CVSS score is below 4.0:** do NOT write any output file. Your task is complete -- stop here.
+
+### Step 5: Write Evaluation Result
+
+Write your evaluation to `__OUTPUT_PATH__` as a single JSON object:
 
 ```json
 {
-  "finding_id": "F-01",
-  "title": "Short descriptive title",
+  "id": "TBD",
+  "title": "short summary",
   "location": "file:function (lines X-Y)",
-  "vulnerability_class": "e.g. buffer overflow, integer underflow, use-after-free",
-  "root_cause": "Brief description",
-  "preliminary_severity": "Critical|High|Medium|Low",
-  "code_snippet": "5-30 lines of annotated code showing the vulnerability",
-  "reachability_notes": "How an attacker reaches this, prerequisites"
+  "cwe_id": ["CWE-XXX"],
+  "vulnerability_class": ["class1", "class2"],
+  "cvss_score": "X.X",
+  "prerequisites": "specific compile flags, runtime configuration options, or deployment conditions required; note if non-default",
+  "impact": "describe the output of triggering this vulnerability, how the security boundary is voilated",
+  "code_snippet": "paste the relevant lines with inline comments explaining the root cause and trigger path"
 }
 ```
 
-**Format rules** (enforced by validator):
-1. The file must contain valid JSON (no trailing commas, no comments).
-2. Required keys: `finding_id`, `title`, `location`, `vulnerability_class`, `root_cause`, `preliminary_severity`, `code_snippet`.
-3. `preliminary_severity` must be exactly one of: `Critical`, `High`, `Medium`, `Low`.
-4. `finding_id` must match the `F-{NN}` pattern from the filename.
-5. One finding per file.
+**IMPORTANT**: The `"id"` field must be `"TBD"`. The orchestrator will assign the real ID after all evaluations complete.
 
-If no vulnerabilities are found, write no files.
+**IMPORTANT**: The output file MUST be valid JSON (no trailing commas, no comments, properly quoted strings).
+
+## Completion Checklist
+
+- [ ] Finding file read and source code verified
+- [ ] False-positive check performed
+- [ ] Pre-requisites assessed (compile flags, runtime config, deployment assumptions)
+- [ ] Vulnerability criteria read (`__VULN_CRITERIA_PATH__`)
+- [ ] Non-default-config CVSS cap applied if applicable
+- [ ] If confirmed and CVSS >= 4.0: output written to `__OUTPUT_PATH__` as valid JSON
+- [ ] If false positive or CVSS < 4.0: no output file written

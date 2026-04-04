@@ -147,6 +147,22 @@ def _format_finding_detail(finding: dict) -> str:
         if value:
             lines.append(f"- **{label}**: {_format_array_field(value)}")
 
+    trace = finding.get("data_flow_trace")
+    if isinstance(trace, dict):
+        trace_lines: list[str] = ["- **Data Flow**:"]
+        if trace.get("entry_point"):
+            trace_lines.append(f"  - **Entry point**: {trace['entry_point']}")
+        chain = trace.get("propagation_chain")
+        if isinstance(chain, list) and chain:
+            trace_lines.append("  - **Propagation**:")
+            for i, step in enumerate(chain, 1):
+                trace_lines.append(f"    {i}. {step}")
+        if trace.get("neutralizing_checks"):
+            trace_lines.append(f"  - **Neutralizing checks**: {trace['neutralizing_checks']}")
+        if trace.get("sink"):
+            trace_lines.append(f"  - **Sink**: {trace['sink']}")
+        lines.append("\n".join(trace_lines))
+
     code_snippet = finding.get("code_snippet")
     if code_snippet:
         lines.append(f"- **Code snippet**:\n```\n{code_snippet}\n```")

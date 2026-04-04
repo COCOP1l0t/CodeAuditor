@@ -8,6 +8,12 @@ Before starting analysis, read the auditing focus at `__AUDITING_FOCUS_PATH__` a
 
 Read your analysis unit file at `__AU_FILE_PATH__`. It describes the codebase you are assigned to and provides the context you need to start your analysis.
 
+### Scope of Your Analysis
+
+The files listed in your analysis unit are your **starting point**, not a hard boundary. Begin your analysis there, but follow cross-file dependencies whenever your analysis requires it — for example, to understand a called function's behavior, verify whether input is sanitized upstream, trace data flow into a downstream consumer, or check assumptions about a dependency's contract.
+
+Your primary focus remains the code and concerns described in the analysis unit. Do not exhaustively read unrelated modules — but do not stop at AU boundaries when tracing a relevant code path.
+
 Your task: discover security bugs and vulnerabilities in the assigned codebase.
 
 ## Output

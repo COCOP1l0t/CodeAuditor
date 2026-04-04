@@ -16,14 +16,18 @@ Evaluate one vulnerability finding from Stage 3.
 
 Read `__FINDING_FILE_PATH__` (JSON). It contains one vulnerability finding with location, vulnerability class, root cause, preliminary severity, a code snippet, and reachability notes.
 
-### Step 2: Verify Existence (False-Positive Check)
+### Step 2: Data-Flow Trace (False-Positive Check)
 
-Read the relevant source code at the target project path. Perform an in-depth static analysis:
-- Is the vulnerability reachable from attacker-controlled input?
-- Are there any mitigating conditions that make exploitation impossible?
-- Is the code path actually executed in the context described?
+Read the relevant source code at the target project path. Before making any verdict, you **must** trace the complete data-flow path from attacker-controlled input to the vulnerability trigger point:
 
-**If this is a false positive:** do NOT write any output file. The orchestrator will treat a missing output file as "filtered." Your task is complete -- stop here.
+1. **Entry point**: Identify exactly where attacker-controlled data enters the system (network read, file parse, API parameter, environment variable, etc.).
+2. **Propagation**: Track the data through every function call, assignment, and transformation between entry and the vulnerable sink. For each hop, note: which variable carries the tainted data, what function passes it, and whether the data is copied, cast, truncated, or otherwise transformed.
+3. **Neutralizing checks**: At each step in the propagation chain, look for checks, sanitizers, or validators that could prevent exploitation — bounds checks, allowlist filters, type enforcement, length limits, encoding normalization, etc. For each check found, determine whether it is sufficient to fully neutralize the vulnerability or whether it can be bypassed.
+4. **Sink**: Confirm the tainted data reaches the security-sensitive operation described in the finding, in a form that triggers the vulnerability.
+
+**If any step in the chain breaks** — the data is fully sanitized, a check provably blocks the attacker's input, or the code path is unreachable — this is a false positive. Do NOT write any output file. The orchestrator will treat a missing output file as "filtered." Your task is complete -- stop here.
+
+**If the full chain holds**, proceed to Step 3. You will record this trace in the output (Step 5).
 
 ### Step 3: Assess Pre-Requisites
 
@@ -55,11 +59,20 @@ Write your evaluation to `__OUTPUT_PATH__` as a single JSON object:
   "id": "TBD",
   "title": "short summary",
   "location": "file:function (lines X-Y)",
+  "data_flow_trace": {
+    "entry_point": "where attacker-controlled data enters (e.g. file:function, network read, API parameter)",
+    "propagation_chain": [
+      "step 1: description of how data moves from entry to next function",
+      "step 2: description of next transformation or pass-through"
+    ],
+    "neutralizing_checks": "checks encountered along the path and why they are insufficient, or 'none'",
+    "sink": "the security-sensitive operation where tainted data triggers the vulnerability"
+  },
   "cwe_id": ["CWE-XXX"],
   "vulnerability_class": ["class1", "class2"],
   "cvss_score": "X.X",
   "prerequisites": "specific compile flags, runtime configuration options, or deployment conditions required; note if non-default",
-  "impact": "describe the output of triggering this vulnerability, how the security boundary is voilated",
+  "impact": "describe the output of triggering this vulnerability, how the security boundary is violated",
   "code_snippet": "paste the relevant lines with inline comments explaining the root cause and trigger path"
 }
 ```
@@ -71,7 +84,7 @@ Write your evaluation to `__OUTPUT_PATH__` as a single JSON object:
 ## Completion Checklist
 
 - [ ] Finding file read and source code verified
-- [ ] False-positive check performed
+- [ ] Data-flow trace performed (entry point -> propagation -> neutralizing checks -> sink)
 - [ ] Pre-requisites assessed (compile flags, runtime config, deployment assumptions)
 - [ ] Vulnerability criteria read (`__VULN_CRITERIA_PATH__`)
 - [ ] Non-default-config CVSS cap applied if applicable

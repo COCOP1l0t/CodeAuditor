@@ -20,7 +20,7 @@ Read `__FINDING_FILE_PATH__` (JSON). It contains one vulnerability finding with 
 
 Read the relevant source code at the target project path. Before making any verdict, you **must** trace the complete data-flow path from attacker-controlled input to the vulnerability trigger point:
 
-1. **Entry point**: Identify exactly where attacker-controlled data enters the system (network read, file parse, API parameter, environment variable, etc.).
+1. **Entry point**: Identify exactly where attacker-controlled data enters the system (network read, file parse, API parameter, environment variable, etc.). Also, you must ensure that this entry point is reasonably reachable by an attacker in a realistic scenario.
 2. **Propagation**: Track the data through every function call, assignment, and transformation between entry and the vulnerable sink. For each hop, note: which variable carries the tainted data, what function passes it, and whether the data is copied, cast, truncated, or otherwise transformed.
 3. **Neutralizing checks**: At each step in the propagation chain, look for checks, sanitizers, or validators that could prevent exploitation — bounds checks, allowlist filters, type enforcement, length limits, encoding normalization, etc. For each check found, determine whether it is sufficient to fully neutralize the vulnerability or whether it can be bypassed.
 4. **Sink**: Confirm the tainted data reaches the security-sensitive operation described in the finding, in a form that triggers the vulnerability.

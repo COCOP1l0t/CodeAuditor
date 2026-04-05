@@ -13,7 +13,7 @@ DEFAULT_THREAT_MODEL = (
 class AuditConfig:
     target: str
     output_dir: str
-    max_parallel: int = 4
+    max_parallel: int = 2
     threat_model: str = DEFAULT_THREAT_MODEL
     scope: str = ""
     skip_stages: list[int] = field(default_factory=list)

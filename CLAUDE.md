@@ -4,7 +4,7 @@ Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target
 
 ## Quick reference
 
-- **Language**: Python 3.14
+- **Language**: Python >=3.12
 - **Package manager**: pip (uses `pyproject.toml`, hatchling backend)
 - **Entry point**: `code-auditor` CLI → `code_auditor/__main__.py:main`
 - **Agent backend**: `claude-code-sdk` async `query()` API
@@ -16,18 +16,21 @@ Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target
 pip install -e .
 
 # Run an audit
-code-auditor --target /path/to/project [--output-dir DIR] [--max-parallel 4] [--resume] [--skip-stages 0,4] [--log-level DEBUG]
+code-auditor --target /path/to/project [--output-dir DIR] [--max-parallel 2] [--resume] [--skip-stages 0,4] [--log-level DEBUG]
 
 # Required args
-#   --target        Root directory of project to audit
+#   --target           Root directory of project to audit
 # Optional args
-#   --output-dir    Defaults to {target}/audit-output
-#   --max-parallel  Concurrent agents (default 4)
-#   --resume        Resume from checkpoint markers
-#   --threat-model  Override default threat model text
-#   --scope         Additional scope instructions for stage 1
-#   --skip-stages   Comma-separated stage numbers to skip
-#   --log-level     DEBUG|INFO|WARNING|ERROR (default INFO)
+#   --output-dir       Defaults to {target}/audit-output
+#   --max-parallel     Concurrent agents (default 2)
+#   --resume           Resume from checkpoint markers
+#   --threat-model     Override default threat model text
+#   --scope            Additional scope instructions for stage 1
+#   --skip-stages      Comma-separated stage numbers to skip
+#   --only-stage       Run only this stage (+ stage 0); mutually exclusive with --skip-stages
+#   --model            Claude model to use (default claude-sonnet-4-6)
+#   --target-au-count  Target number of analysis units for stage 2 (default 30)
+#   --log-level        DEBUG|INFO|WARNING|ERROR (default INFO)
 ```
 
 ## Testing
@@ -45,7 +48,7 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py`. They cover parsers
 ```
 code_auditor/
 ├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
-├── config.py            # AuditConfig dataclass
+├── config.py            # AuditConfig, Module, AnalysisUnit, ValidationIssue dataclasses
 ├── orchestrator.py      # Sequential stage runner
 ├── agent.py             # claude-code-sdk wrapper + validation retry loop
 ├── prompts.py           # load_prompt() with __KEY__ substitution
@@ -53,7 +56,7 @@ code_auditor/
 ├── logger.py            # stdlib logging wrapper
 ├── utils.py             # run_parallel_limited, file helpers, severity sort
 ├── stages/              # stage0–stage4 (one file per stage)
-├── parsing/             # stage2.py, stage3.py — extract structured data from agent output
+├── parsing/             # stage2.py — extract structured data from agent output
 ├── validation/          # common.py + stage1–stage4 — validate agent output format
 └── tests/
 prompts/                 # stage1.md–stage4.md — prompt templates with __KEY__ placeholders
@@ -63,7 +66,7 @@ prompts/                 # stage1.md–stage4.md — prompt templates with __KEY
 
 | Stage | What it does | Parallelism |
 |-------|-------------|-------------|
-| 0 | Create output dirs | None (pure fs) |
+| 0 | Git pull + create output dirs | None (pure fs) |
 | 1 | Security context research (git, web, SECURITY.md) | Single agent |
 | 2 | Decompose project into analysis units (AUs) | Single agent |
 | 3 | Bug discovery per AU | 1 agent per AU |

@@ -46,8 +46,6 @@ class CheckpointManager:
             # Fall back to pending file for runs that predate marker-based tracking.
             filename = task_key[len("stage4:"):]
             return os.path.join(self._output_dir, "stage-4-details", "_pending", filename)
-        if task_key == "stage5":
-            return os.path.join(self._output_dir, "report.md")
         logger.warning("Unknown checkpoint task key: %s", task_key)
         return None
 

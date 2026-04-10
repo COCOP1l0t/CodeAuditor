@@ -11,13 +11,12 @@ from .stages.stage1 import Stage1Output, run_stage1
 from .stages.stage2 import run_stage2
 from .stages.stage3 import run_stage3
 from .stages.stage4 import run_stage4
-from .stages.stage5 import run_stage5
 from .utils import list_json_files
 
 logger = get_logger("orchestrator")
 
 
-async def run_audit(config: AuditConfig) -> str:
+async def run_audit(config: AuditConfig) -> None:
     checkpoint = CheckpointManager(config.output_dir, config.resume)
 
     if config.resume:
@@ -34,7 +33,7 @@ async def run_audit(config: AuditConfig) -> str:
 
     # Pause for user review before continuing (skip when resuming a completed stage 1)
     stage1_was_cached = config.resume and checkpoint.is_complete("stage1")
-    if not stage1_was_cached and 1 not in config.skip_stages and not all(s in config.skip_stages for s in range(2, 6)):
+    if not stage1_was_cached and 1 not in config.skip_stages and not all(s in config.skip_stages for s in range(2, 5)):
         details_dir_preview = os.path.join(config.output_dir, "stage-1-details")
         logger.info(
             "Stage 1 complete. Review generated files in: %s", details_dir_preview
@@ -81,12 +80,4 @@ async def run_audit(config: AuditConfig) -> str:
     else:
         logger.info("Stage 4 skipped.")
 
-    # Stage 5: generate report
-    report_path = ""
-    if 5 not in config.skip_stages:
-        report_path = await run_stage5(config, checkpoint)
-    else:
-        logger.info("Stage 5 skipped.")
-
-    logger.info("Audit complete. Report: %s", report_path)
-    return report_path
+    logger.info("Audit complete.")

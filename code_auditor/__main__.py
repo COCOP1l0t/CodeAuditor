@@ -12,7 +12,7 @@ from .orchestrator import run_audit
 logger = get_logger("main")
 
 
-_ALL_STAGES = list(range(6))  # 0–5
+_ALL_STAGES = list(range(5))  # 0–4
 
 
 def _parse_skip_stages(raw: str | None) -> list[int]:
@@ -82,8 +82,8 @@ def main() -> None:
     logger.info("Starting audit of %s", config.target)
 
     try:
-        report_path = asyncio.run(run_audit(config))
-        print(f"\nAudit complete. Report: {report_path}")
+        asyncio.run(run_audit(config))
+        print("\nAudit complete.")
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         sys.exit(1)

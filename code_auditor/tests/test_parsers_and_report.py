@@ -5,7 +5,6 @@ import os
 import tempfile
 
 from code_auditor.parsing.stage2 import parse_au_files, parse_auditing_focus
-from code_auditor.report.generate import generate_report
 from code_auditor.validation.stage2 import (
     DEFAULT_MAX_ANALYSIS_UNITS,
     validate_stage2_au_file,
@@ -148,53 +147,9 @@ def test_parse_auditing_focus_handles_missing_file():
     assert hot_spots == ""
 
 
-def test_stage4_validator_and_report_generator_accept_json():
+def test_stage4_validator_accepts_valid_finding():
     with tempfile.TemporaryDirectory() as tmp:
-        stage1_dir = os.path.join(tmp, "stage-1-details")
-        os.makedirs(stage1_dir)
-        research_record_path = os.path.join(stage1_dir, "stage-1-security-context.json")
-        findings_dir = os.path.join(tmp, "stage-4-details")
-        report_path = os.path.join(tmp, "report.md")
-        finding_path = os.path.join(findings_dir, "H-01.json")
-
-        os.makedirs(findings_dir)
-        with open(research_record_path, "w") as f:
-            json.dump({
-                "project": {
-                    "name": "Example Protocol",
-                    "path": "/tmp/example",
-                    "language": "C",
-                    "description": "Example protocol implementation.",
-                    "deployment_model": "Network daemon",
-                },
-                "sources_consulted": [],
-                "scope_announcements": {
-                    "in_scope_modules": [],
-                    "out_of_scope_modules": [],
-                    "in_scope_issue_types": ["memory corruption"],
-                    "out_of_scope_issue_types": ["test code"],
-                },
-                "historical_vulnerabilities": [
-                    {
-                        "cve_id": "CVE-2024-1234",
-                        "date": "2024-01-15",
-                        "affected_component": "parser",
-                        "vulnerability_class": "buffer overflow",
-                        "root_cause": "Missing bounds check",
-                        "impact": "RCE",
-                        "severity": "Critical",
-                        "attacker_profile": "Network attacker",
-                        "summary": "Heap buffer overflow in protocol parser.",
-                    },
-                ],
-                "severity_guidance": {
-                    "source": "SECURITY.md",
-                    "raw_quotes": [],
-                    "notes": "Memory corruption in parsers is Critical.",
-                },
-                "fuzzing_targets": [],
-                "notes": "",
-            }, f)
+        finding_path = os.path.join(tmp, "H-01.json")
         with open(finding_path, "w") as f:
             json.dump({
                 "id": "H-01",
@@ -220,18 +175,6 @@ def test_stage4_validator_and_report_generator_accept_json():
             }, f)
 
         assert validate_stage4_file(finding_path) == []
-
-        summary = generate_report(research_record_path, findings_dir, report_path)
-        report_content = open(report_path).read()
-
-        assert summary.total_findings == 1
-        assert "H-01: Length underflow reaches memcpy" in report_content
-        assert "Example Protocol" in report_content
-        assert "CVE-2024-1234" in report_content
-        assert "Data Flow" in report_content
-        assert "net/recv()" in report_content
-        assert "parse_packet() reads 2-byte length field" in report_content
-        assert "Sink" in report_content
 
 
 def test_stage4_validator_rejects_missing_data_flow_trace():
@@ -316,35 +259,3 @@ def test_stage4_validator_rejects_non_array_propagation_chain():
         assert len(chain_issues) == 1
 
 
-def test_report_graceful_without_data_flow_trace():
-    """Report generator should not crash when data_flow_trace is absent (old findings)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        stage1_dir = os.path.join(tmp, "stage-1-details")
-        os.makedirs(stage1_dir)
-        research_path = os.path.join(stage1_dir, "stage-1-security-context.json")
-        findings_dir = os.path.join(tmp, "stage-4-details")
-        os.makedirs(findings_dir)
-        report_path = os.path.join(tmp, "report.md")
-
-        with open(research_path, "w") as f:
-            json.dump({"project": {"name": "Test"}, "historical_vulnerabilities": []}, f)
-
-        with open(os.path.join(findings_dir, "M-01.json"), "w") as f:
-            json.dump({
-                "id": "M-01",
-                "title": "Old finding without trace",
-                "location": "src/foo.c:bar()",
-                "cwe_id": ["CWE-120"],
-                "vulnerability_class": ["buffer overflow"],
-                "cvss_score": "5.0",
-                "severity": "Medium",
-                "impact": "DoS",
-                "code_snippet": "foo()",
-            }, f)
-
-        summary = generate_report(research_path, findings_dir, report_path)
-        report_content = open(report_path).read()
-
-        assert summary.total_findings == 1
-        assert "M-01: Old finding without trace" in report_content
-        assert "Data Flow" not in report_content

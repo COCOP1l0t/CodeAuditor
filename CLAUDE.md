@@ -1,6 +1,6 @@
 # CodeAuditor
 
-Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target project, it researches security context → decomposes the codebase into analysis units → findings → vulnerabilities → final report.
+Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target project, it researches security context → decomposes the codebase into analysis units → findings → vulnerabilities.
 
 ## Quick reference
 
@@ -38,7 +38,7 @@ pytest code_auditor/tests/            # same thing
 pytest -k test_stage2                     # filter by name
 ```
 
-Tests are in `code_auditor/tests/test_parsers_and_report.py`. They cover parsers, validators, and report generation — no agent calls needed.
+Tests are in `code_auditor/tests/test_parsers_and_report.py`. They cover parsers and validators — no agent calls needed.
 
 ## Project layout
 
@@ -52,10 +52,9 @@ code_auditor/
 ├── checkpoint.py        # File/marker-based checkpoint/resume
 ├── logger.py            # stdlib logging wrapper
 ├── utils.py             # run_parallel_limited, file helpers, severity sort
-├── stages/              # stage0–stage5 (one file per stage)
+├── stages/              # stage0–stage4 (one file per stage)
 ├── parsing/             # stage2.py, stage3.py — extract structured data from agent output
 ├── validation/          # common.py + stage1–stage4 — validate agent output format
-├── report/              # generate.py, helpers.py — deterministic report assembly
 └── tests/
 prompts/                 # stage1.md–stage4.md — prompt templates with __KEY__ placeholders
 ```
@@ -69,7 +68,6 @@ prompts/                 # stage1.md–stage4.md — prompt templates with __KEY
 | 2 | Decompose project into analysis units (AUs) | Single agent |
 | 3 | Bug discovery per AU | 1 agent per AU |
 | 4 | Evaluate findings: real vuln? severity? | 1 agent per finding |
-| 5 | Generate final report.md | No agent (deterministic) |
 
 ## Key patterns
 
@@ -78,4 +76,4 @@ prompts/                 # stage1.md–stage4.md — prompt templates with __KEY
 - **Validation + retry**: Each agent output is validated; on failure, a repair prompt is sent (up to `max_retries`)
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
-- **Output dir layout**: `{output}/stage-N-details/`, `.markers/`, `report.md`
+- **Output dir layout**: `{output}/stage-N-details/`, `.markers/`

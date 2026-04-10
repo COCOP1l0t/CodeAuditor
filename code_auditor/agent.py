@@ -47,15 +47,21 @@ _original_read_messages_impl = _transport.SubprocessCLITransport._read_messages_
 async def _patched_connect(self):  # type: ignore[no-untyped-def]
     """Patched connect that forces stderr=PIPE so we can read error output."""
     orig_debug_stderr = self._options.debug_stderr
-
-    # Capture stderr for error reporting, but do NOT enable debug-to-stderr
-    # to avoid flooding output with Claude Code CLI debug messages.
+    # The SDK only captures stderr when BOTH debug_stderr is set AND
+    # "debug-to-stderr" is in extra_args.  We inject both temporarily
+    # so the subprocess is launched with stderr=PIPE, then restore the
+    # original values to avoid side-effects.
     self._options.debug_stderr = subprocess.PIPE
+    had_debug_flag = "debug-to-stderr" in self._options.extra_args
+    if not had_debug_flag:
+        self._options.extra_args["debug-to-stderr"] = None
 
     try:
         await _original_connect(self)
     finally:
         self._options.debug_stderr = orig_debug_stderr
+        if not had_debug_flag:
+            self._options.extra_args.pop("debug-to-stderr", None)
 
 
 async def _patched_read_messages_impl(self):  # type: ignore[no-untyped-def]
@@ -115,6 +121,12 @@ async def run_agent(
         model=config.model,
         cwd=cwd,
         add_dirs=add_dirs,
+        extra_args={
+            # Run sub-agents like a clean Claude Code install: no user/project
+            # settings, no plugins, no hooks, no CLAUDE.md, no slash commands.
+            "setting-sources": "",
+            "disable-slash-commands": None,
+        },
     )
 
     last_exc: Exception | None = None

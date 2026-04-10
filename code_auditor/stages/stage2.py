@@ -74,7 +74,7 @@ async def run_stage2(
         "target_au_count": str(config.target_au_count),
     })
 
-    await run_agent(prompt, config, cwd=config.target)
+    await run_agent(prompt, config, cwd=config.target, max_turns=200)
 
     logger.info("Stage 2: Agent finished. Validating output.")
     issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)

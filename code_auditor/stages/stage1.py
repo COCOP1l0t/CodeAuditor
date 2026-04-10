@@ -59,6 +59,7 @@ async def run_stage1(
         cwd=config.target,
         output_path=research_record_path,
         validator=validate_stage1_file,
+        max_turns=200,
     )
 
     if not passed:

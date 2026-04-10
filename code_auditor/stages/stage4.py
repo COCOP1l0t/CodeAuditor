@@ -100,7 +100,7 @@ async def _run_finding(
         "vuln_criteria_path": vuln_criteria_path,
     })
 
-    await run_agent(prompt, config, cwd=config.target)
+    await run_agent(prompt, config, cwd=config.target, max_turns=100)
 
     confirmed = os.path.exists(pending_path)
     if confirmed:

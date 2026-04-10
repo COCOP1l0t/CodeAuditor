@@ -46,7 +46,7 @@ async def _run_unit(
         "vuln_criteria_path": vuln_criteria_path,
     })
 
-    await run_agent(prompt, config, cwd=config.target)
+    await run_agent(prompt, config, cwd=config.target, max_turns=200)
 
     logger.info("Stage 3 %s: Agent finished for %s. Validating findings.", progress, unit.id)
     finding_files = list_matching_files(result_dir, finding_pattern)

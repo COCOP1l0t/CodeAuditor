@@ -12,7 +12,7 @@ from .orchestrator import run_audit
 logger = get_logger("main")
 
 
-_ALL_STAGES = list(range(6))  # 0–5
+_ALL_STAGES = list(range(7))  # 0–6
 
 
 def _parse_skip_stages(raw: str | None) -> list[int]:
@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scope", default="", help="Additional scope instructions for stage 1")
     parser.add_argument("--skip-stages", default=None, help="Comma-separated list of stages to skip")
     parser.add_argument("--only-stage", type=int, choices=_ALL_STAGES, default=None,
-                        help="Run only this stage (stage 0 always runs for setup); 0-5")
+                        help="Run only this stage (stage 0 always runs for setup); 0-6")
     parser.add_argument("--model", default="claude-sonnet-4-6", help="Claude model to use (default: claude-sonnet-4-6)")
     parser.add_argument("--target-au-count", type=int, default=30, help="Target number of analysis units for stage 2 (default: 30)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

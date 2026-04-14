@@ -27,7 +27,7 @@ async def run_stage1(
     config: AuditConfig,
     checkpoint: CheckpointManager,
 ) -> Stage1Output:
-    details_dir = os.path.join(config.output_dir, "stage-1-details")
+    details_dir = os.path.join(config.output_dir, "stage1-security-context")
     research_record_path = os.path.join(details_dir, "stage-1-security-context.json")
     auditing_focus_path = os.path.join(details_dir, "auditing-focus.md")
     vuln_criteria_path = os.path.join(details_dir, "vulnerability-criteria.md")

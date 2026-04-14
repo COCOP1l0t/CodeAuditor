@@ -34,7 +34,7 @@ class CheckpointManager:
 
     def _resolve(self, task_key: str) -> str | None:
         if task_key == "stage1":
-            return os.path.join(self._output_dir, "stage-1-details", "stage-1-security-context.json")
+            return os.path.join(self._output_dir, "stage1-security-context", "stage-1-security-context.json")
         if task_key == "stage2":
             return self._marker_path(task_key)
         if task_key.startswith("stage3:"):
@@ -45,7 +45,7 @@ class CheckpointManager:
                 return marker
             # Fall back to pending file for runs that predate marker-based tracking.
             filename = task_key[len("stage4:"):]
-            return os.path.join(self._output_dir, "stage-4-details", "_pending", filename)
+            return os.path.join(self._output_dir, "stage4-vulnerabilities", "_pending", filename)
         if task_key.startswith("stage5:"):
             return self._marker_path(task_key)
         if task_key.startswith("stage6:"):

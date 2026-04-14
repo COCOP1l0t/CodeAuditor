@@ -20,7 +20,7 @@ async def run_stage2(
     checkpoint: CheckpointManager,
     auditing_focus_path: str,
 ) -> list[AnalysisUnit]:
-    result_dir = os.path.join(config.output_dir, "stage-2-details")
+    result_dir = os.path.join(config.output_dir, "stage2-analysis-units")
     os.makedirs(result_dir, exist_ok=True)
 
     if checkpoint.is_complete(_TASK_KEY):

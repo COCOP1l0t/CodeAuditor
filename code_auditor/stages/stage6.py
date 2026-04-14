@@ -28,7 +28,7 @@ def _task_key(vuln_id: str) -> str:
 def _vuln_id_from_report(report_path: str) -> str | None:
     """Extract vulnerability ID from a stage 5 report path.
 
-    Expects paths like .../stage-5-details/{vuln_id}/report.md
+    Expects paths like .../stage5-pocs/{vuln_id}/report.md
     """
     parent = Path(report_path).parent
     name = parent.name
@@ -39,7 +39,7 @@ def _vuln_id_from_report(report_path: str) -> str | None:
 
 def _find_finding_file(vuln_id: str, output_dir: str) -> str | None:
     """Locate the stage 4 evaluated finding JSON for a vulnerability ID."""
-    path = os.path.join(output_dir, "stage-4-details", f"{vuln_id}.json")
+    path = os.path.join(output_dir, "stage4-vulnerabilities", f"{vuln_id}.json")
     return path if os.path.exists(path) else None
 
 
@@ -60,7 +60,7 @@ async def _run_disclosure(
         return None
 
     key = _task_key(vuln_id)
-    stage6_vuln_dir = os.path.join(config.output_dir, "stage-6-details", vuln_id)
+    stage6_vuln_dir = os.path.join(config.output_dir, "stage6-disclosures", vuln_id)
     disclosure_dir = os.path.join(stage6_vuln_dir, "disclosure")
     disclosure_report = os.path.join(disclosure_dir, "report.md")
 

@@ -48,7 +48,7 @@ async def _run_reproduce(
         return None
 
     key = _task_key(vuln_id)
-    poc_dir = os.path.join(config.output_dir, "stage-5-details", vuln_id)
+    poc_dir = os.path.join(config.output_dir, "stage5-pocs", vuln_id)
     report_path = os.path.join(poc_dir, "report.md")
 
     fp_report_path = os.path.join(poc_dir + "_fp", "report.md")

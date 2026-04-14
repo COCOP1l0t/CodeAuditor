@@ -48,15 +48,12 @@ code-auditor --target /path/to/project [options]
 |------|-------------|
 | `--target` | **Required.** Root directory of the project to audit. |
 | `--output-dir` | Output directory (default: `{target}/audit-output`). |
-| `--max-parallel` | Max concurrent agents (default: `2`). |
-| `--resume` | Resume from checkpoint markers. |
-| `--threat-model` | Override the default threat model text. |
-| `--scope` | Extra scope instructions for Stage 1. |
-| `--skip-stages` | Comma-separated stage numbers to skip (0–6). |
-| `--only-stage` | Run only this stage (plus Stage 0). Mutually exclusive with `--skip-stages`. |
+| `--max-parallel` | Max concurrent agents (default: `1`). |
 | `--model` | Claude model to use (default: `claude-sonnet-4-6`). |
-| `--target-au-count` | Target number of analysis units for Stage 2 (default: `30`). |
+| `--target-au-count` | Target number of analysis units for Stage 2 (default: `10`). |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` (default: `INFO`). |
+
+Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
 ### Example
 
@@ -72,12 +69,12 @@ code-auditor \
 
 ```
 {output-dir}/
-├── stage-1-details/   # context research
-├── stage-2-details/   # analysis unit decomposition
-├── stage-3-details/   # per-AU findings
-├── stage-4-details/   # vulnerability evaluations
-├── stage-5-details/   # PoCs + evidence
-├── stage-6-details/   # disclosure reports, emails, zipped PoCs
+├── stage1-security-context/  # context research + auditing focus + vuln criteria
+├── stage2-analysis-units/    # codebase decomposition
+├── stage3-findings/          # per-AU bug findings
+├── stage4-vulnerabilities/   # evaluated, confirmed vulnerabilities
+├── stage5-pocs/              # PoCs + evidence
+├── stage6-disclosures/       # disclosure reports, emails, zipped PoCs
 └── .markers/          # checkpoint markers for --resume
 ```
 

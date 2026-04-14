@@ -53,13 +53,13 @@ async def run_setup(config: AuditConfig) -> None:
     directories = [
         config.output_dir,
         os.path.join(config.output_dir, ".markers"),
-        os.path.join(config.output_dir, "stage-1-details"),
-        os.path.join(config.output_dir, "stage-2-details"),
-        os.path.join(config.output_dir, "stage-3-details"),
-        os.path.join(config.output_dir, "stage-4-details"),
-        os.path.join(config.output_dir, "stage-4-details", "_pending"),
-        os.path.join(config.output_dir, "stage-5-details"),
-        os.path.join(config.output_dir, "stage-6-details"),
+        os.path.join(config.output_dir, "stage1-security-context"),
+        os.path.join(config.output_dir, "stage2-analysis-units"),
+        os.path.join(config.output_dir, "stage3-findings"),
+        os.path.join(config.output_dir, "stage4-vulnerabilities"),
+        os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending"),
+        os.path.join(config.output_dir, "stage5-pocs"),
+        os.path.join(config.output_dir, "stage6-disclosures"),
     ]
 
     for directory in directories:

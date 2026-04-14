@@ -86,7 +86,7 @@ async def _run_finding(
 ) -> str | None:
     stage3_filename = os.path.basename(stage3_file_path)
     key = _task_key(stage3_filename)
-    pending_dir = os.path.join(config.output_dir, "stage-4-details", "_pending")
+    pending_dir = os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending")
     pending_path = os.path.join(pending_dir, stage3_filename)
 
     if checkpoint.is_complete(key):
@@ -122,7 +122,7 @@ async def _run_finding(
 
 
 def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> list[str]:
-    stage4_dir = os.path.join(config.output_dir, "stage-4-details")
+    stage4_dir = os.path.join(config.output_dir, "stage4-vulnerabilities")
     existing_final_files = _list_existing_final_files(stage4_dir)
 
     counters: dict[str, int] = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
@@ -181,7 +181,7 @@ def _backfill_stage4_markers(
     and create markers for every input finding whose AU number is <= that
     value, since those AUs must have been reached by the previous run.
     """
-    pending_dir = os.path.join(config.output_dir, "stage-4-details", "_pending")
+    pending_dir = os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending")
     if not os.path.isdir(pending_dir):
         return
 
@@ -224,7 +224,7 @@ async def run_stage4(
 ) -> list[str]:
     if not finding_files:
         logger.info("Stage 4: No findings to evaluate.")
-        return _list_existing_final_files(os.path.join(config.output_dir, "stage-4-details"))
+        return _list_existing_final_files(os.path.join(config.output_dir, "stage4-vulnerabilities"))
 
     if config.resume:
         _backfill_stage4_markers(finding_files, config, checkpoint)

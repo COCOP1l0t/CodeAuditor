@@ -13,14 +13,14 @@ DEFAULT_THREAT_MODEL = (
 class AuditConfig:
     target: str
     output_dir: str
-    max_parallel: int = 2
+    max_parallel: int = 1
     threat_model: str = DEFAULT_THREAT_MODEL
     scope: str = ""
     skip_stages: list[int] = field(default_factory=list)
-    resume: bool = False
+    resume: bool = True
     log_level: str = "INFO"
     model: str = "claude-sonnet-4-6"
-    target_au_count: int = 30
+    target_au_count: int = 10
 
 
 @dataclass

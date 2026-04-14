@@ -34,7 +34,7 @@ async def run_audit(config: AuditConfig) -> None:
         stage1_out = await run_stage1(config, checkpoint)
 
     # Resolve directive paths (from stage1 output or default locations)
-    details_dir = os.path.join(config.output_dir, "stage-1-details")
+    details_dir = os.path.join(config.output_dir, "stage1-security-context")
     auditing_focus_path = (
         stage1_out.auditing_focus_path if stage1_out
         else os.path.join(details_dir, "auditing-focus.md")
@@ -50,7 +50,7 @@ async def run_audit(config: AuditConfig) -> None:
         analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
     else:
         logger.info("Stage 2 skipped. Loading existing analysis units.")
-        stage2_dir = os.path.join(config.output_dir, "stage-2-details")
+        stage2_dir = os.path.join(config.output_dir, "stage2-analysis-units")
         analysis_units = parse_au_files(stage2_dir)
 
     if not analysis_units and 3 not in config.skip_stages:
@@ -65,7 +65,7 @@ async def run_audit(config: AuditConfig) -> None:
         )
     else:
         logger.info("Stage 3 skipped.")
-        bug_files = list_json_files(os.path.join(config.output_dir, "stage-3-details"))
+        bug_files = list_json_files(os.path.join(config.output_dir, "stage3-findings"))
 
     # Stage 4: evaluate findings
     vuln_files: list[str] = []
@@ -73,7 +73,7 @@ async def run_audit(config: AuditConfig) -> None:
         vuln_files = await run_stage4(bug_files, config, checkpoint, vuln_criteria_path)
     else:
         logger.info("Stage 4 skipped.")
-        stage4_dir = os.path.join(config.output_dir, "stage-4-details")
+        stage4_dir = os.path.join(config.output_dir, "stage4-vulnerabilities")
         vuln_files = [f for f in list_json_files(stage4_dir) if "_pending" not in f]
 
     # Stage 5: PoC reproduction per verified vulnerability
@@ -82,7 +82,7 @@ async def run_audit(config: AuditConfig) -> None:
         stage5_reports = await run_stage5(vuln_files, config, checkpoint)
     else:
         logger.info("Stage 5 skipped. Loading existing reports.")
-        stage5_dir = os.path.join(config.output_dir, "stage-5-details")
+        stage5_dir = os.path.join(config.output_dir, "stage5-pocs")
         if os.path.isdir(stage5_dir):
             for name in sorted(os.listdir(stage5_dir)):
                 entry = os.path.join(stage5_dir, name)

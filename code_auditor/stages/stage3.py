@@ -28,7 +28,7 @@ async def _run_unit(
     total_units: int = 0,
 ) -> list[str]:
     key = _task_key(unit)
-    result_dir = os.path.join(config.output_dir, "stage-3-details")
+    result_dir = os.path.join(config.output_dir, "stage3-findings")
     escaped_id = re.escape(unit.id)
     finding_pattern = re.compile(rf"^{escaped_id}-F-\d+\.json$")
     progress = f"[{unit_index}/{total_units}]" if total_units else ""

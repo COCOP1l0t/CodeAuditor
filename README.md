@@ -10,4 +10,5 @@ CVE-2026-40312
 
 ## [libexif](https://github.com/libexif/libexif)
 CVE-2026-40385
+
 CVE-2026-40386

@@ -138,6 +138,10 @@ Detail any non-default compile-time or run-time configuration required to trigge
 
 Describe the concrete security impact: what an attacker could achieve by exploiting this vulnerability (e.g., remote code execution, information disclosure, denial of service, privilege escalation) and under what conditions.
 
+#### Trigger
+
+How the attacker would interact with the vulnerable code to trigger the vulnerability: what malicious file they build, or what network packet they send, or what API call they make, etc.
+
 #### Root Cause
 
 Annotate the relevant code snippets to trace how attacker-controlled data enters the vulnerable code path and leads to the security impact — and where validation is missing or insufficient. The analysis should be clear and concise, giving a security researcher or project maintainer enough insight to locate, verify, and fix the vulnerability.

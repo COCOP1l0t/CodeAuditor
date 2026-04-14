@@ -37,9 +37,12 @@ Before scoring severity, determine if there are non-default configurations requi
 - **Runtime configuration**: Does triggering the vulnerability require a non-default configuration option that is unlikely to be enabled in real-world deployments?
 - **Environment assumptions**: Does exploitation depend on an atypical deployment topology, hardware, or operating mode?
 
-**how the attacker crafts malicious input is not included as a pre-requisite**
+**how the attacker crafts malicious input is not a pre-requisite**
 
 **IMPORTANT:** If the vulnerability requires a non-default compile flag or non-default runtime configuration, cap its severity at **Medium** regardless of the theoretical impact. Document this constraint explicitly in the prerequisites field.
+
+**IMPORTANT:** If the vulnerability can only be triggered in an unrealistic atypical environment, e.g. missing NULL check after memory allocation which can only be triggered when the system is under extreme memory pressure, you should deem it a false positive.
+
 
 ### Step 4: Analyze Attacker Trigger
 

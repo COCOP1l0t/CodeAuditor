@@ -139,7 +139,10 @@ async def run_agent(
     log_fh = None
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        log_fh = open(log_file, "w")  # noqa: SIM115
+        log_fh = open(log_file, "a")  # noqa: SIM115
+        if log_fh.tell() > 0:
+            log_fh.write("\n--- new agent invocation ---\n\n")
+            log_fh.flush()
 
     last_exc: Exception | None = None
     try:
@@ -191,9 +194,10 @@ async def run_with_validation(
     skip_if_missing: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    log_file: str | None = None,
 ) -> tuple[bool, str]:
     """Run agent then validate output, retrying on failure. Returns (passed, result)."""
-    result = await run_agent(prompt, config, cwd, allowed_tools, max_turns, model=model, effort=effort)
+    result = await run_agent(prompt, config, cwd, allowed_tools, max_turns, model=model, effort=effort, log_file=log_file)
 
     for attempt in range(max_retries + 1):
         if skip_if_missing and not os.path.exists(output_path):
@@ -213,6 +217,6 @@ async def run_with_validation(
             "Please fix all issues listed below, then save the corrected file.\n\n"
             f"Validation output:\n```\n{format_validation_issues(issues)}\n```"
         )
-        result = await run_agent(repair_prompt, config, cwd, allowed_tools, max_turns=10)
+        result = await run_agent(repair_prompt, config, cwd, allowed_tools, max_turns=10, log_file=log_file)
 
     return False, result

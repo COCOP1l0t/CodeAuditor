@@ -29,6 +29,7 @@ async def _run_unit(
 ) -> list[str]:
     key = _task_key(unit)
     result_dir = os.path.join(config.output_dir, "stage3-findings")
+    log_file = os.path.join(result_dir, "logs", f"{unit.id}.log")
     escaped_id = re.escape(unit.id)
     finding_pattern = re.compile(rf"^{escaped_id}-F-\d+\.json$")
     progress = f"[{unit_index}/{total_units}]" if total_units else ""
@@ -46,7 +47,7 @@ async def _run_unit(
         "vuln_criteria_path": vuln_criteria_path,
     })
 
-    await run_agent(prompt, config, cwd=config.target, max_turns=200)
+    await run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)
 
     logger.info("Stage 3 %s: Agent finished for %s. Validating findings.", progress, unit.id)
     finding_files = list_matching_files(result_dir, finding_pattern)
@@ -60,7 +61,7 @@ async def _run_unit(
             f"The finding file at `{finding_file}` failed validation. "
             f"Please fix all issues listed below:\n\n```\n{format_validation_issues(issues)}\n```"
         )
-        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10)
+        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
 
         issues = validate_stage3_file(finding_file)
         if issues:

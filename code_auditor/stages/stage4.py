@@ -88,6 +88,10 @@ async def _run_finding(
     key = _task_key(stage3_filename)
     pending_dir = os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending")
     pending_path = os.path.join(pending_dir, stage3_filename)
+    log_file = os.path.join(
+        config.output_dir, "stage4-vulnerabilities", "logs",
+        f"{os.path.splitext(stage3_filename)[0]}.log",
+    )
 
     if checkpoint.is_complete(key):
         logger.info("Stage 4: %s already complete, skipping.", stage3_filename)
@@ -100,7 +104,7 @@ async def _run_finding(
         "vuln_criteria_path": vuln_criteria_path,
     })
 
-    await run_agent(prompt, config, cwd=config.target, max_turns=100)
+    await run_agent(prompt, config, cwd=config.target, max_turns=100, log_file=log_file)
 
     confirmed = os.path.exists(pending_path)
     if confirmed:
@@ -111,7 +115,7 @@ async def _run_finding(
                 f"The evaluation file at `{pending_path}` failed validation. "
                 f"Please fix all issues below:\n\n```\n{format_validation_issues(issues)}\n```"
             )
-            await run_agent(repair_prompt, config, cwd=config.target, max_turns=10)
+            await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
             issues = validate_stage4_file(pending_path)
             if issues:
                 logger.warning("Stage 4: Repair failed for %s\n%s", pending_path, format_validation_issues(issues))

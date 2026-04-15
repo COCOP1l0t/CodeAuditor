@@ -22,6 +22,7 @@ async def run_stage2(
 ) -> list[AnalysisUnit]:
     result_dir = os.path.join(config.output_dir, "stage2-analysis-units")
     os.makedirs(result_dir, exist_ok=True)
+    log_file = os.path.join(result_dir, "agent.log")
 
     if checkpoint.is_complete(_TASK_KEY):
         logger.info("Stage 2 already complete, loading existing output.")
@@ -48,7 +49,7 @@ async def run_stage2(
             "Please fix all issues listed below:\n\n"
             f"```\n{format_validation_issues(issues)}\n```"
         )
-        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10)
+        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
         issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
         if not issues:
             checkpoint.mark_complete(_TASK_KEY)
@@ -74,7 +75,7 @@ async def run_stage2(
         "target_au_count": str(config.target_au_count),
     })
 
-    await run_agent(prompt, config, cwd=config.target, max_turns=200)
+    await run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)
 
     logger.info("Stage 2: Agent finished. Validating output.")
     issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
@@ -88,7 +89,7 @@ async def run_stage2(
             "Please fix all issues listed below:\n\n"
             f"```\n{format_validation_issues(issues)}\n```"
         )
-        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10)
+        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
 
         issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
         if issues:

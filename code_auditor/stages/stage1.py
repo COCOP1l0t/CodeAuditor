@@ -60,6 +60,7 @@ async def run_stage1(
         output_path=research_record_path,
         validator=validate_stage1_file,
         max_turns=200,
+        log_file=os.path.join(details_dir, "agent.log"),
     )
 
     if not passed:

@@ -51,10 +51,16 @@ async def run_audit(config: AuditConfig) -> None:
         stage2_out.deployment_summary_path if stage2_out
         else os.path.join(deployments_dir, "deployment-summary.md")
     )
-    deployment_manifest_path = (
-        stage2_out.manifest_path if stage2_out
-        else os.path.join(deployments_dir, "manifest.json")
-    )
+    if stage2_out:
+        deployment_manifest_path = stage2_out.manifest_path
+    else:
+        candidate = os.path.join(deployments_dir, "manifest.json")
+        deployment_manifest_path = candidate if os.path.exists(candidate) else ""
+        if not deployment_manifest_path:
+            logger.info(
+                "Stage 2 skipped and no manifest at %s; Stage 6 will fall back to ad-hoc build per finding.",
+                candidate,
+            )
 
     analysis_units: list[AnalysisUnit] = []
     if 3 not in config.skip_stages:

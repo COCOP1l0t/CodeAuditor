@@ -10,7 +10,6 @@ from ..checkpoint import CheckpointManager
 from ..config import AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
-from ..utils import run_parallel_limited
 
 logger = get_logger("stage6")
 
@@ -147,31 +146,31 @@ async def run_stage6(
     deployment_manifest_path: str,
     deployments_dir: str,
 ) -> list[str]:
-    """Run PoC reproduction for each verified vulnerability in parallel."""
+    """Run PoC reproduction for each verified vulnerability, one at a time.
+
+    Stage 6 is intentionally serial: each PoC agent launches the selected
+    pre-built deployment and drives real input through it. Running two
+    agents concurrently would collide on ports, PID files, and the shared
+    on-disk artifact, so `config.max_parallel` is ignored here.
+    """
     if not vuln_files:
         logger.info("Stage 6: No verified vulnerabilities to reproduce.")
         return []
 
-    logger.info("Stage 6: Reproducing %d verified vulnerabilities.", len(vuln_files))
-
-    results = await run_parallel_limited(
-        vuln_files,
-        config.max_parallel,
-        lambda vf, _: _run_reproduce(
-            vf, config, checkpoint,
-            deployment_manifest_path, deployments_dir,
-        ),
-    )
+    logger.info("Stage 6: Reproducing %d verified vulnerabilities serially.", len(vuln_files))
 
     reports: list[str] = []
-    for i, (status, value, error) in enumerate(results):
-        if i >= len(vuln_files):
+    for vuln_file in vuln_files:
+        try:
+            report = await _run_reproduce(
+                vuln_file, config, checkpoint,
+                deployment_manifest_path, deployments_dir,
+            )
+        except Exception as exc:
+            logger.error("Stage 6: %s failed: %s", os.path.basename(vuln_file), exc)
             continue
-        if status == "rejected":
-            logger.error("Stage 6: %s failed: %s", os.path.basename(vuln_files[i]), error)
-            continue
-        if value:
-            reports.append(value)
+        if report:
+            reports.append(report)
 
     logger.info("Stage 6 complete. %d reports generated (from %d vulnerabilities).", len(reports), len(vuln_files))
     return reports

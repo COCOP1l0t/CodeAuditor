@@ -38,8 +38,6 @@ For each archetype, write `__CONFIGS_DIR__/<id>/deployment-mode.md` describing:
 - The kinds of inputs it processes from the outside world.
 - A behavioral contract the smoke test must satisfy: "when this deployment is launched, sending input X to interface Y must produce response Z." Be specific enough that Phase B's smoke test can mechanically verify it.
 
-**Do not write any of `build.sh`, `launch.sh`, `smoke-test.sh`** — those belong to Phase B.
-
 ### Step 4: Write the Manifest
 
 Write `__MANIFEST_PATH__` with this schema:
@@ -83,4 +81,3 @@ Write `__SUMMARY_PATH__` — one short paragraph per archetype covering: role, e
 - [ ] `__MANIFEST_PATH__` written with all build fields null
 - [ ] `__SUMMARY_PATH__` written
 - [ ] Each archetype has a non-empty `deployment-mode.md`
-- [ ] No `build.sh`, `launch.sh`, or `smoke-test.sh` written (those are Phase B's job)

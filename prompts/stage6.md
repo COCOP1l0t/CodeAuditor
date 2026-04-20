@@ -18,6 +18,9 @@ All PoC artifacts (scripts, build outputs, evidence, report) must be written und
 
 `__POC_DIR__`
 
+- **Deployment manifest** (pre-built artifacts to choose from): `__DEPLOYMENT_MANIFEST_PATH__`
+- **Deployments directory** (for reading per-config deployment-mode.md if needed): `__DEPLOYMENTS_DIR__`
+
 Start by reading the vulnerability JSON file to understand the finding details, then proceed to designing the reproduction strategy.
 
 ---
@@ -40,6 +43,12 @@ If any of these thoughts cross your mind, you are about to violate the methodolo
 ---
 
 ## Workflow
+
+### Step 0: Select a Pre-Built Deployment
+
+Read `__DEPLOYMENT_MANIFEST_PATH__`. From entries with `build_status == "ok"`, pick the single config whose `exposed_surface` and `modules_exercised` best match this finding's location and trigger. State your choice and one-sentence reasoning. Use the config's `launch_cmd` to start the artifact under `__POC_DIR__`. Do not rebuild — the artifact is already instrumented.
+
+If no entry has `build_status == "ok"`, fall back to building from source per the original instructions in Step 1 and note this fallback in the report.
 
 ### Step 1: Design the Reproduction Strategy
 
@@ -112,22 +121,7 @@ If the PoC does not trigger as expected, iterate:
 3. Revisit build configuration if needed — rebuild with different flags or instrumentation.
 4. Continue until the vulnerability triggers with clear evidence, or conclude it cannot be reproduced.
 
-### Step 4: Real-World Exploitability Assessment
-
-**Goal**: After the PoC triggers the vulnerability, critically assess whether the attack scenario is realistic under the default deployment of the target:
-
-- **Timing / race windows**: Does the attack require hitting a window so small it is impractical without co-located privileged access?
-- **Input size / shape**: Does the attack require inputs that a default deployment would reject or never accept (e.g., a multi-GB request body against a server with a 1 MB default limit, a filename longer than the OS permits)?
-- **Non-default configuration**: Does triggering require flags, options, or build settings that are off by default and rarely enabled in production?
-- **Privileged precondition**: Does the attacker need capabilities (local code execution, filesystem write, elevated privileges) that already exceed the impact of the bug?
-- **Environmental assumptions**: Does the PoC rely on specific heap layouts, debug builds, disabled mitigations (ASLR/NX/stack canaries), memory pressure, or unusual toolchains?
-- **User interaction**: Does the attack require an implausible sequence of victim actions?
-
-If **any** such unrealistic requirement is load-bearing for the exploit, mark the finding as a **false-positive** and set `Reproduction Status: false-positive` in the report. Document the specific unrealistic requirement(s) in the report's Observed Result / Pre-requisites sections so the reasoning is transparent.
-
-If the attack remains realistic under default deployment (even if it requires crafted but plausible input), proceed to Step 5 with `reproduced` or `partially-reproduced`.
-
-### Step 5: Generate the Report
+### Step 4: Generate the Report
 
 **Goal**: Produce a working-level report capturing findings and evidence.
 
@@ -147,7 +141,7 @@ Write `__POC_DIR__/report.md` containing:
 
 The report must be accurate. Every claim must be supported by evidence. Do not extrapolate or speculate beyond what the evidence shows.
 
-### Step 6: Handle Failed Reproduction
+### Step 5: Handle Failed Reproduction
 
 If your final reproduction status is `not-reproduced` or `false-positive`, rename the PoC artifacts directory by appending a `_fp` suffix. For example, if your artifacts are in `__POC_DIR__`, run:
 

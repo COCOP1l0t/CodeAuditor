@@ -40,6 +40,8 @@ async def _run_reproduce(
     vuln_file_path: str,
     config: AuditConfig,
     checkpoint: CheckpointManager,
+    deployment_manifest_path: str,
+    deployments_dir: str,
 ) -> str | None:
     """Reproduce a single verified vulnerability and develop a PoC."""
     vuln_id = _read_vuln_id(vuln_file_path)
@@ -69,6 +71,8 @@ async def _run_reproduce(
         "target_path": config.target,
         "poc_dir": poc_dir,
         "finding_id": vuln_id,
+        "deployment_manifest_path": deployment_manifest_path,
+        "deployments_dir": deployments_dir,
     })
 
     log_file = os.path.join(poc_dir, "agent.log")
@@ -140,6 +144,8 @@ async def run_stage6(
     vuln_files: list[str],
     config: AuditConfig,
     checkpoint: CheckpointManager,
+    deployment_manifest_path: str,
+    deployments_dir: str,
 ) -> list[str]:
     """Run PoC reproduction for each verified vulnerability in parallel."""
     if not vuln_files:
@@ -151,7 +157,10 @@ async def run_stage6(
     results = await run_parallel_limited(
         vuln_files,
         config.max_parallel,
-        lambda vf, _: _run_reproduce(vf, config, checkpoint),
+        lambda vf, _: _run_reproduce(
+            vf, config, checkpoint,
+            deployment_manifest_path, deployments_dir,
+        ),
     )
 
     reports: list[str] = []

@@ -89,7 +89,10 @@ async def run_audit(config: AuditConfig) -> None:
 
     stage6_reports: list[str] = []
     if 6 not in config.skip_stages:
-        stage6_reports = await run_stage6(vuln_files, config, checkpoint)
+        stage6_reports = await run_stage6(
+            vuln_files, config, checkpoint,
+            deployment_manifest_path, deployments_dir,
+        )
     else:
         logger.info("Stage 6 skipped. Loading existing reports.")
         stage6_dir = os.path.join(config.output_dir, "stage6-pocs")

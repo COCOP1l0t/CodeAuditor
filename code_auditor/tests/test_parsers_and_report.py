@@ -4,14 +4,14 @@ import json
 import os
 import tempfile
 
-from code_auditor.parsing.stage2 import parse_au_files, parse_auditing_focus
-from code_auditor.validation.stage2 import (
+from code_auditor.parsing.stage3 import parse_au_files, parse_auditing_focus
+from code_auditor.validation.stage3 import (
     DEFAULT_MAX_ANALYSIS_UNITS,
-    validate_stage2_au_file,
-    validate_stage2_dir,
+    validate_stage3_au_file,
+    validate_stage3_dir,
     validate_triage_file,
 )
-from code_auditor.validation.stage4 import validate_stage4_file
+from code_auditor.validation.stage5 import validate_stage5_file
 
 
 def _write_au(path: str, desc: str, files: list[str], focus: str) -> None:
@@ -50,7 +50,7 @@ def test_stage2_validator_accepts_valid_au_file():
         path = os.path.join(tmp, "AU-1.json")
         _write_au(path, "Parses raw DHCP packets from the network", ["src/parser/parse.c", "src/parser/options.c"], "Trace the len field from the packet header through parse_options().")
 
-        assert validate_stage2_au_file(path) == []
+        assert validate_stage3_au_file(path) == []
 
 
 def test_stage2_validator_rejects_empty_fields():
@@ -59,7 +59,7 @@ def test_stage2_validator_rejects_empty_fields():
         with open(path, "w") as f:
             json.dump({"description": "", "files": [], "focus": ""}, f)
 
-        issues = validate_stage2_au_file(path)
+        issues = validate_stage3_au_file(path)
         assert len(issues) == 3  # description, files, focus all blank
 
 
@@ -70,7 +70,7 @@ def test_stage2_dir_validator_checks_sequential_ids():
         for n in (1, 3):
             _write_au(os.path.join(tmp, f"AU-{n}.json"), "d", ["a.c"], "f")
 
-        issues = validate_stage2_dir(tmp)
+        issues = validate_stage3_dir(tmp)
         seq_issues = [i for i in issues if "Non-sequential" in i.description]
         assert len(seq_issues) == 1
 
@@ -85,7 +85,7 @@ def test_stage2_dir_validator_rejects_too_many_aus():
         for n in range(1, count + 1):
             _write_au(os.path.join(tmp, f"AU-{n}.json"), "d", ["a.c"], "f")
 
-        issues = validate_stage2_dir(tmp, max_aus=max_aus)
+        issues = validate_stage3_dir(tmp, max_aus=max_aus)
         too_many_au = [i for i in issues if "Too many analysis units" in i.description]
         too_many_triage = [i for i in issues if "too many areas selected" in i.description]
         assert len(too_many_au) == 1
@@ -96,7 +96,7 @@ def test_stage2_dir_validator_checks_triage_json():
     with tempfile.TemporaryDirectory() as tmp:
         _write_au(os.path.join(tmp, "AU-1.json"), "d", ["a.c"], "f")
         # No triage.json — should produce a validation issue
-        issues = validate_stage2_dir(tmp)
+        issues = validate_stage3_dir(tmp)
         triage_issues = [i for i in issues if "triage.json" in i.description]
         assert len(triage_issues) == 1
 
@@ -175,7 +175,7 @@ def test_stage4_validator_accepts_valid_finding():
                 "code_snippet": "memcpy(...)",
             }, f)
 
-        assert validate_stage4_file(finding_path) == []
+        assert validate_stage5_file(finding_path) == []
 
 
 def test_stage4_validator_rejects_missing_data_flow_trace():
@@ -191,7 +191,7 @@ def test_stage4_validator_rejects_missing_data_flow_trace():
                 "cvss_score": "7.5",
             }, f)
 
-        issues = validate_stage4_file(path)
+        issues = validate_stage5_file(path)
         missing = [i for i in issues if "data_flow_trace" in i.description]
         assert len(missing) == 1
 
@@ -211,7 +211,7 @@ def test_stage4_validator_rejects_malformed_data_flow_trace():
                 "cvss_score": "7.5",
             }, f)
 
-        issues = validate_stage4_file(path)
+        issues = validate_stage5_file(path)
         type_issues = [i for i in issues if "must be a JSON object" in i.description]
         assert len(type_issues) == 1
 
@@ -231,7 +231,7 @@ def test_stage4_validator_rejects_missing_trace_subfields():
                 "cvss_score": "7.5",
             }, f)
 
-        issues = validate_stage4_file(path)
+        issues = validate_stage5_file(path)
         subfield_issues = [i for i in issues if "data_flow_trace" in i.description and "missing" in i.description]
         assert len(subfield_issues) == 4  # entry_point, propagation_chain, neutralizing_checks, sink
 
@@ -255,7 +255,7 @@ def test_stage4_validator_rejects_non_array_propagation_chain():
                 "cvss_score": "7.5",
             }, f)
 
-        issues = validate_stage4_file(path)
+        issues = validate_stage5_file(path)
         chain_issues = [i for i in issues if "propagation_chain" in i.description and "array" in i.description]
         assert len(chain_issues) == 1
 

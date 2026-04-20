@@ -1,64 +1,40 @@
 from __future__ import annotations
 
-import os
-
 from ..config import ValidationIssue
-from .common import read_file_or_issues
+from .common import file_missing_issue, read_file_or_issues
 
 
-_REQUIRED_REPORT_SECTIONS = [
+_REQUIRED_SECTIONS = [
+    "Title",
     "Summary",
-    "Severity Assessment",
-    "Security Impact",
-    "Root Cause",
-    "Reproduction",
+    "Reproduction Status",
 ]
 
 
-def validate_stage6_disclosure(disclosure_dir: str) -> list[ValidationIssue]:
-    """Validate Stage 6 disclosure artifacts."""
-    issues: list[ValidationIssue] = []
+def validate_stage6_report(path: str) -> list[ValidationIssue]:
+    """Validate a Stage 6 PoC report.md file."""
+    if not path:
+        return [file_missing_issue("stage6 report")]
 
-    report_path = os.path.join(disclosure_dir, "report.md")
-    email_path = os.path.join(disclosure_dir, "email.txt")
-    zip_path = os.path.join(disclosure_dir, "disclosure.zip")
+    content, issues = read_file_or_issues(path)
+    if issues:
+        return issues
 
-    for path, name in [
-        (report_path, "report.md"),
-        (email_path, "email.txt"),
-        (zip_path, "disclosure.zip"),
-    ]:
-        if not os.path.exists(path):
+    for section in _REQUIRED_SECTIONS:
+        if section.lower() not in content.lower():
             issues.append(ValidationIssue(
-                description=f"Missing required disclosure artifact: {name}",
-                expected=f"'{name}' should exist in the disclosure directory.",
-                fix=f"Create '{name}' in {disclosure_dir}.",
+                description=f"Missing required section: {section}",
+                expected=f"Report must contain a '{section}' section.",
+                fix=f"Add a '## {section}' or '**{section}**' section to the report.",
             ))
 
-    # Validate report content
-    if os.path.exists(report_path):
-        content, read_issues = read_file_or_issues(report_path)
-        if read_issues:
-            issues.extend(read_issues)
-        else:
-            for section in _REQUIRED_REPORT_SECTIONS:
-                if section.lower() not in content.lower():
-                    issues.append(ValidationIssue(
-                        description=f"Missing required section in disclosure report: {section}",
-                        expected=f"Disclosure report must contain a '{section}' section.",
-                        fix=f"Add a '{section}' section to disclosure/report.md.",
-                    ))
-
-    # Validate email content
-    if os.path.exists(email_path):
-        content, read_issues = read_file_or_issues(email_path)
-        if read_issues:
-            issues.extend(read_issues)
-        elif "subject:" not in content.lower():
-            issues.append(ValidationIssue(
-                description="Missing Subject line in disclosure email",
-                expected="Email must contain a 'Subject:' line.",
-                fix="Add a 'Subject: [Security] ...' line at the top of email.txt.",
-            ))
+    valid_statuses = ["reproduced", "partially-reproduced", "not-reproduced", "false-positive"]
+    status_found = any(s in content.lower() for s in valid_statuses)
+    if not status_found:
+        issues.append(ValidationIssue(
+            description="Missing reproduction status value",
+            expected=f"Report must contain one of: {', '.join(valid_statuses)}",
+            fix="Add a Reproduction Status section with one of the valid status values.",
+        ))
 
     return issues

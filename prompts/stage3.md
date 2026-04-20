@@ -1,47 +1,110 @@
-# Stage 3: Vulnerability Analysis
+# Stage 3: Codebase Decomposition into Analysis Units
 
-You are performing **Stage 3** of an orchestrated software security audit. Write your findings to disk; do not print them in your response.
+You are performing **Stage 3** of an orchestrated software security audit. Write your output to disk; do not print it in your response.
 
-## Your Assignment
+## Your Task
 
-Before starting analysis, read the auditing focus at `__AUDITING_FOCUS_PATH__` and the vulnerability criteria at `__VULN_CRITERIA_PATH__`. The auditing focus tells you which components deserve the closest scrutiny. The vulnerability criteria define what distinguishes a vulnerability from a bug. Use this context to focus your analysis on reachable, exploitable issues.
+Analyze the project at **__TARGET_PATH__** and decompose it into **analysis units** — self-contained work packages that will each be assigned to an independent sub-agent for in-depth security analysis.
 
-Read your analysis unit file at `__AU_FILE_PATH__`. It describes the codebase you are assigned to and provides the context you need to start your analysis.
+This is a targeted vulnerability hunt, not a comprehensive audit. Your goal is to identify the code areas most likely to contain impactful vulnerabilities and create analysis units only for those areas. Code that is unlikely to be bug-productive should be excluded entirely.
 
-### Scope of Your Analysis
+- **Result directory**: `__RESULT_DIR__`
 
-The files listed in your analysis unit are your **starting point**, not a hard boundary. Begin your analysis there, but follow cross-file dependencies whenever your analysis requires it — for example, to understand a called function's behavior, verify whether input is sanitized upstream, trace data flow into a downstream consumer, or check assumptions about a dependency's contract.
+## User Instructions
 
-Your primary focus remains the code and concerns described in the analysis unit. Do not exhaustively read unrelated modules — but do not stop at AU boundaries when tracing a relevant code path.
+__USER_INSTRUCTIONS__
 
-Your task: discover security bugs and vulnerabilities in the assigned codebase.
+## Auditing Focus
 
-## Output
+### Explicit In-Scope and Out-of-Scope Modules
 
-For each confirmed vulnerability, write one JSON file to `__RESULT_DIR__/` named `__FINDING_PREFIX__-F-{NN}.json` (zero-padded: F-01, F-02, ...).
+__SCOPE_MODULES__
 
-**Each finding file must contain a single JSON object with this exact structure:**
+### Historical Hot Spots
+
+__HISTORICAL_HOT_SPOTS__
+
+## Workflow
+
+### Step 1: Enumerate and Understand
+
+List all source files in **__TARGET_PATH__**. Focus on implementation files (`.c`, `.cpp`, `.go`, `.rs`, `.py`, `.java`, `.ts`, etc.). Exclude: build artifacts, test files (`*_test.*`, `*.test.*`, `test/`, `tests/`), generated code, and third-party vendored dependencies.
+
+Read key project files to understand the project's purpose and architecture:
+- `README*`, build files (`Makefile`, `CMakeLists.txt`, `go.mod`, `Cargo.toml`, `package.json`, etc.)
+- Directory structure and naming conventions
+- Top-level source files that define the main entry points or architecture
+
+### Step 2: Triage
+
+Group the source files into **functional areas** — coarse groupings based on what the code does (e.g. "protocol parsing", "session management", "authentication", "configuration loading"). Count the approximate lines of code in each area.
+
+For each functional area, assess its value for bug hunting. Use the **Auditing Focus** section above as your primary guide:
+- **Respect scope boundaries.** Code explicitly marked out of scope should be excluded. In-scope modules should be prioritized.
+- **Reflect hot spots.** Areas with historical vulnerabilities or known vulnerability patterns are high-priority targets.
+- When the Auditing Focus is empty or states no data is available, use your own judgment based on the code's exposure to untrusted input, complexity, and security sensitivity.
+
+Write a triage manifest to `__RESULT_DIR__/triage.json` — a JSON array where each entry represents one functional area:
+
+```json
+[
+  {
+    "area": "DHCP packet parsing",
+    "files": ["src/parser/parse.c", "src/parser/options.c"],
+    "loc": 1200,
+    "rationale": "Parses untrusted network input; historical CVE-2024-1234 in this component.",
+    "selected": true
+  },
+  {
+    "area": "Configuration file loading",
+    "files": ["src/config.c"],
+    "loc": 300,
+    "rationale": "Reads local config only, no external input handling.",
+    "selected": false
+  }
+]
+```
+
+**Selection rules:**
+- At most **__TARGET_AU_COUNT__** areas may have `selected` set to `true`.
+- __TARGET_AU_COUNT__ is a hard ceiling, not a target. Select only areas that are most vulnerability-prone according to the Auditing Focus and genuinely warrant deep security analysis — this could be 5, 15, or __TARGET_AU_COUNT__ depending on the project.
+- Every selected area will consume one or more sub-agent slots for deep analysis. Be selective: prefer fewer, well-targeted areas over broad but shallow coverage.
+- **Exclude modules not in default compilation or default runtime configuration.** If a module is only compiled when a non-default build flag, feature gate, or `./configure` option is enabled, or only loaded/activated through non-default runtime configuration, mark it `selected: false`.
+- Every area must have a `rationale` explaining why it was selected or excluded.
+
+### Step 3: Create Analysis Units
+
+For each **selected** area in the triage, create one or more analysis units. If a selected area is too large for a single sub-agent to analyze with sufficient depth, split it into multiple units along natural code boundaries. If it is small enough, one AU per area is fine.
+
+Write **one JSON file per analysis unit** to the result directory:
+- `__RESULT_DIR__/AU-1.json`
+- `__RESULT_DIR__/AU-2.json`
+- etc.
+
+Each file is a self-contained work package:
 
 ```json
 {
-  "finding_id": "F-01",
-  "title": "Short descriptive title",
-  "location": "file:function (lines X-Y)",
-  "vulnerability_class": "e.g. buffer overflow, integer underflow, use-after-free",
-  "root_cause": "Brief description",
-  "preliminary_severity": "Critical|High|Medium|Low",
-  "code_snippet": "5-30 lines of annotated code showing the vulnerability",
-  "reachability_notes": "How an attacker reaches this, prerequisites"
+  "description": "Short description of what this unit covers",
+  "files": ["relative/path/to/file1.c", "relative/path/to/file2.c"],
+  "focus": "Concrete analysis guidance: which functions or subsystems are most complex, which code paths handle external input, what data structures are central, which operations are dangerous (memory copies, size arithmetic, state transitions). Be specific enough that a sub-agent can start analysis immediately."
 }
 ```
 
-**Format rules** (enforced by validator):
-1. The file must contain valid JSON (no trailing commas, no comments).
-2. Required keys: `finding_id`, `title`, `location`, `vulnerability_class`, `root_cause`, `preliminary_severity`, `code_snippet`.
-3. `preliminary_severity` must be exactly one of: `Critical`, `High`, `Medium`, `Low`.
-4. `finding_id` must match the `F-{NN}` pattern from the filename.
-5. One finding per file.
+Do not create analysis units for areas that were not selected in the triage.
 
-**Do not report issues that require non-default configuration.** If a potential vulnerability can only be triggered when the software is compiled with a non-default build flag (32-bit compilation is considered a non-default configuration), feature gate, or `./configure` option, or when a non-default runtime configuration option is enabled, it is out of scope. Only report vulnerabilities that are reachable under default compilation and default runtime configuration.
+**Rules:**
 
-If no vulnerabilities are found, write no files.
+1. **Actionable focus.** Name concrete functions, data flows, or code patterns — not generic phrases like "look for bugs" or "check for vulnerabilities".
+2. **Sequential IDs.** Units must be numbered `AU-1`, `AU-2`, `AU-3`, ... matching their filenames.
+3. **Valid JSON.** No trailing commas, no comments, properly quoted strings. The `files` field must be a JSON array of relative file path strings.
+
+## Completion Checklist
+
+- [ ] All source files enumerated (excluding tests, generated code, third-party deps)
+- [ ] Code grouped into functional areas with approximate LOC counts
+- [ ] Each area assessed for bug-hunting value using the Auditing Focus
+- [ ] Triage manifest written to `__RESULT_DIR__/triage.json` with rationale for each area
+- [ ] No more than __TARGET_AU_COUNT__ areas selected; only areas that genuinely warrant deep analysis
+- [ ] AU files created only for selected areas, written as `AU-{N}.json`
+- [ ] Each AU has a clear description and specific, actionable focus

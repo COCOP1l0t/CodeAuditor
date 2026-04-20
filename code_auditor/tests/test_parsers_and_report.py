@@ -13,6 +13,11 @@ from code_auditor.validation.stage3 import (
     validate_stage3_dir,
     validate_triage_file,
 )
+from code_auditor.validation.stage2 import (
+    validate_stage2_phase_a,
+    validate_stage2_phase_b_entry,
+    validate_stage2_manifest_final,
+)
 from code_auditor.validation.stage5 import validate_stage5_file
 
 
@@ -279,4 +284,304 @@ def test_audit_config_has_deployment_build_fields():
     assert config.deployment_build_parallel == 1
     assert config.deployment_build_timeout_sec == 1800
 
+
+def _make_phase_a_layout(tmp: str, configs: list[dict]) -> None:
+    """Create a deployments_dir layout matching what Phase A would produce."""
+    os.makedirs(os.path.join(tmp, "configs"), exist_ok=True)
+    with open(os.path.join(tmp, "deployment-summary.md"), "w") as f:
+        f.write("# Deployment Summary\n\nA non-empty summary.\n")
+    for cfg in configs:
+        cfg_dir = os.path.join(tmp, "configs", cfg["id"])
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "deployment-mode.md"), "w") as f:
+            f.write(f"# {cfg['name']}\n\nNon-empty deployment-mode body.\n")
+    manifest = {"configs": configs}
+    with open(os.path.join(tmp, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+
+
+def _phase_a_config(cfg_id: str = "httpd-static-tls") -> dict:
+    return {
+        "id": cfg_id,
+        "name": "Static web server with TLS",
+        "deployment_mode_path": f"configs/{cfg_id}/deployment-mode.md",
+        "exposed_surface": ["http parser", "tls handshake"],
+        "modules_exercised": ["server/", "modules/ssl/"],
+        "build_status": None,
+        "artifact_path": None,
+        "launch_cmd": None,
+        "build_failure_reason": None,
+        "attempts_summary": None,
+    }
+
+
+def test_validate_stage2_phase_a_accepts_valid_layout():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_phase_a_layout(tmp, [_phase_a_config()])
+        assert validate_stage2_phase_a(tmp) == []
+
+
+def test_validate_stage2_phase_a_rejects_missing_manifest():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "deployment-summary.md"), "w") as f:
+            f.write("x\n")
+        issues = validate_stage2_phase_a(tmp)
+        assert any("manifest.json" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_empty_configs():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "configs"), exist_ok=True)
+        with open(os.path.join(tmp, "deployment-summary.md"), "w") as f:
+            f.write("x\n")
+        with open(os.path.join(tmp, "manifest.json"), "w") as f:
+            json.dump({"configs": []}, f)
+        issues = validate_stage2_phase_a(tmp)
+        assert any("at least one" in i.description.lower() for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_non_kebab_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _phase_a_config("HttpdStaticTLS")  # camel/pascal case, not kebab
+        cfg["deployment_mode_path"] = "configs/HttpdStaticTLS/deployment-mode.md"
+        _make_phase_a_layout(tmp, [cfg])
+        issues = validate_stage2_phase_a(tmp)
+        assert any("kebab" in i.description.lower() for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_duplicate_ids():
+    with tempfile.TemporaryDirectory() as tmp:
+        a = _phase_a_config("dup")
+        b = _phase_a_config("dup")
+        _make_phase_a_layout(tmp, [a, b])
+        issues = validate_stage2_phase_a(tmp)
+        assert any("duplicate" in i.description.lower() for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_empty_exposed_surface():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _phase_a_config()
+        cfg["exposed_surface"] = []
+        _make_phase_a_layout(tmp, [cfg])
+        issues = validate_stage2_phase_a(tmp)
+        assert any("exposed_surface" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_empty_modules_exercised():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _phase_a_config()
+        cfg["modules_exercised"] = []
+        _make_phase_a_layout(tmp, [cfg])
+        issues = validate_stage2_phase_a(tmp)
+        assert any("modules_exercised" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_missing_deployment_mode_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_phase_a_layout(tmp, [_phase_a_config()])
+        os.remove(os.path.join(tmp, "configs", "httpd-static-tls", "deployment-mode.md"))
+        issues = validate_stage2_phase_a(tmp)
+        assert any("deployment-mode.md" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_empty_deployment_mode_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_phase_a_layout(tmp, [_phase_a_config()])
+        with open(os.path.join(tmp, "configs", "httpd-static-tls", "deployment-mode.md"), "w") as f:
+            f.write("")
+        issues = validate_stage2_phase_a(tmp)
+        assert any("deployment-mode.md" in i.description and "empty" in i.description.lower() for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_missing_summary():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_phase_a_layout(tmp, [_phase_a_config()])
+        os.remove(os.path.join(tmp, "deployment-summary.md"))
+        issues = validate_stage2_phase_a(tmp)
+        assert any("deployment-summary.md" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_a_rejects_prematurely_set_build_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _phase_a_config()
+        cfg["build_status"] = "ok"
+        _make_phase_a_layout(tmp, [cfg])
+        issues = validate_stage2_phase_a(tmp)
+        assert any("build_status" in i.description and "null" in i.description.lower() for i in issues)
+
+
+def _make_phase_b_layout(cfg_dir: str, result: dict, scripts: bool = True, artifact: bool = True) -> None:
+    os.makedirs(cfg_dir, exist_ok=True)
+    with open(os.path.join(cfg_dir, "result.json"), "w") as f:
+        json.dump(result, f)
+    if scripts:
+        for name in ("build.sh", "launch.sh", "smoke-test.sh"):
+            path = os.path.join(cfg_dir, name)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(path, 0o755)
+    if artifact and result.get("artifact_path"):
+        artifact_path = result["artifact_path"]
+        os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+        with open(artifact_path, "w") as f:
+            f.write("binary")
+
+
+def test_validate_stage2_phase_b_entry_accepts_ok():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "httpd-static-tls")
+        artifact = os.path.join(cfg_dir, "build", "httpd")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "httpd-static-tls",
+            "build_status": "ok",
+            "artifact_path": artifact,
+            "launch_cmd": f"{cfg_dir}/launch.sh",
+            "build_failure_reason": None,
+            "attempts_summary": None,
+        })
+        assert validate_stage2_phase_b_entry(cfg_dir) == []
+
+
+def test_validate_stage2_phase_b_entry_accepts_infeasible():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "exotic")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "exotic",
+            "build_status": "infeasible",
+            "artifact_path": None,
+            "launch_cmd": None,
+            "build_failure_reason": "requires RDMA hardware not present in this environment",
+            "attempts_summary": "tried installing libibverbs; kernel module missing.",
+        }, scripts=False, artifact=False)
+        assert validate_stage2_phase_b_entry(cfg_dir) == []
+
+
+def test_validate_stage2_phase_b_entry_rejects_id_mismatch():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "expected-id")
+        artifact = os.path.join(cfg_dir, "build", "x")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "different-id",
+            "build_status": "ok",
+            "artifact_path": artifact,
+            "launch_cmd": "x",
+            "build_failure_reason": None,
+            "attempts_summary": None,
+        })
+        issues = validate_stage2_phase_b_entry(cfg_dir)
+        assert any("id" in i.description and "match" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_b_entry_rejects_unknown_status():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "x")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "x",
+            "build_status": "weird",
+            "artifact_path": None,
+            "launch_cmd": None,
+            "build_failure_reason": None,
+            "attempts_summary": None,
+        }, scripts=False, artifact=False)
+        issues = validate_stage2_phase_b_entry(cfg_dir)
+        assert any("build_status" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_b_entry_ok_requires_artifact_on_disk():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "x")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "x",
+            "build_status": "ok",
+            "artifact_path": "/nonexistent/path/binary",
+            "launch_cmd": "x",
+            "build_failure_reason": None,
+            "attempts_summary": None,
+        }, artifact=False)
+        issues = validate_stage2_phase_b_entry(cfg_dir)
+        assert any("artifact_path" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_b_entry_ok_requires_executable_scripts():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "x")
+        artifact = os.path.join(cfg_dir, "build", "x")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "x",
+            "build_status": "ok",
+            "artifact_path": artifact,
+            "launch_cmd": "x",
+            "build_failure_reason": None,
+            "attempts_summary": None,
+        })
+        # Strip exec bit on launch.sh
+        os.chmod(os.path.join(cfg_dir, "launch.sh"), 0o644)
+        issues = validate_stage2_phase_b_entry(cfg_dir)
+        assert any("launch.sh" in i.description and "executable" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_b_entry_infeasible_rejects_vacuous_reason():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "x")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "x",
+            "build_status": "infeasible",
+            "artifact_path": None,
+            "launch_cmd": None,
+            "build_failure_reason": "build failed",
+            "attempts_summary": "tried.",
+        }, scripts=False, artifact=False)
+        issues = validate_stage2_phase_b_entry(cfg_dir)
+        assert any("build_failure_reason" in i.description and "vacuous" in i.description.lower() for i in issues)
+
+
+def test_validate_stage2_phase_b_entry_infeasible_requires_attempts_summary():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "x")
+        _make_phase_b_layout(cfg_dir, {
+            "id": "x",
+            "build_status": "infeasible",
+            "artifact_path": None,
+            "launch_cmd": None,
+            "build_failure_reason": "missing libfoo, no apt package available",
+            "attempts_summary": "",
+        }, scripts=False, artifact=False)
+        issues = validate_stage2_phase_b_entry(cfg_dir)
+        assert any("attempts_summary" in i.description for i in issues)
+
+
+def test_validate_stage2_phase_b_entry_missing_result_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_dir = os.path.join(tmp, "configs", "x")
+        os.makedirs(cfg_dir, exist_ok=True)
+        issues = validate_stage2_phase_b_entry(cfg_dir)
+        assert any("result.json" in i.description for i in issues)
+
+
+def test_validate_stage2_manifest_final_accepts_one_ok():
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest_path = os.path.join(tmp, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump({"configs": [
+                {"id": "a", "build_status": "ok"},
+                {"id": "b", "build_status": "infeasible"},
+            ]}, f)
+        assert validate_stage2_manifest_final(manifest_path) == []
+
+
+def test_validate_stage2_manifest_final_warns_on_zero_ok():
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest_path = os.path.join(tmp, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump({"configs": [
+                {"id": "a", "build_status": "infeasible"},
+                {"id": "b", "build_status": "timeout"},
+            ]}, f)
+        issues = validate_stage2_manifest_final(manifest_path)
+        assert any("no entries" in i.description.lower() and "ok" in i.description.lower() for i in issues)
+
+
+def test_validate_stage2_manifest_final_missing_file():
+    issues = validate_stage2_manifest_final("/nonexistent/manifest.json")
+    assert any("manifest.json" in i.description.lower() for i in issues)
 

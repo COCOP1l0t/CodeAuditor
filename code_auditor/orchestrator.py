@@ -8,6 +8,7 @@ from .logger import get_logger
 from .parsing.stage3 import parse_au_files
 from .stages.stage0 import run_setup
 from .stages.stage1 import Stage1Output, run_stage1
+from .stages.stage2_deployments import Stage2Output, run_stage2_deployments
 from .stages.stage3 import run_stage3
 from .stages.stage4 import run_stage4
 from .stages.stage5 import run_stage5
@@ -41,7 +42,19 @@ async def run_audit(config: AuditConfig) -> None:
         else os.path.join(details_dir, "vulnerability-criteria.md")
     )
 
-    # Stage 2 (deployment realization) is wired in Task 11.
+    stage2_out: Stage2Output | None = None
+    if 2 not in config.skip_stages:
+        stage2_out = await run_stage2_deployments(config, checkpoint, auditing_focus_path)
+
+    deployments_dir = os.path.join(config.output_dir, "stage2-deployments")
+    deployment_summary_path = (
+        stage2_out.deployment_summary_path if stage2_out
+        else os.path.join(deployments_dir, "deployment-summary.md")
+    )
+    deployment_manifest_path = (
+        stage2_out.manifest_path if stage2_out
+        else os.path.join(deployments_dir, "manifest.json")
+    )
 
     analysis_units: list[AnalysisUnit] = []
     if 3 not in config.skip_stages:

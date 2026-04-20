@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import shutil
 from dataclasses import dataclass
 
 from ..agent import run_agent
@@ -9,7 +11,7 @@ from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, ValidationIssue
 from ..logger import get_logger
 from ..prompts import load_prompt
-from ..utils import format_validation_issues
+from ..utils import format_validation_issues, run_parallel_limited
 from ..validation.stage2 import (
     validate_stage2_manifest_final,
     validate_stage2_phase_a,
@@ -21,6 +23,10 @@ logger = get_logger("stage2")
 
 _PHASE_A_TASK_KEY = "stage2:research"
 _PHASE_A_MAX_TURNS = 200
+
+_PHASE_B_MAX_TURNS = 500
+_PHASE_B_MODEL = "claude-opus-4-6"
+_PHASE_B_EFFORT = "medium"
 
 
 def _phase_b_task_key(cfg_id: str) -> str:
@@ -200,3 +206,144 @@ async def _run_phase_a(
 
     checkpoint.mark_complete(_PHASE_A_TASK_KEY)
     logger.info("Stage 2 Phase A: complete.")
+
+
+def _write_timeout_result(cfg_dir: str, cfg_id: str, timeout_sec: int, log_path: str) -> None:
+    """Write a result.json when a build agent timed out without producing one."""
+    result = {
+        "id": cfg_id,
+        "build_status": "timeout",
+        "artifact_path": None,
+        "launch_cmd": None,
+        "build_failure_reason": (
+            f"Wall-clock timeout: build did not complete within {timeout_sec // 60} minutes."
+        ),
+        "attempts_summary": (
+            "Build agent was cancelled by the runner after the timeout. "
+            "See build.log for what was attempted."
+        ),
+    }
+    os.makedirs(cfg_dir, exist_ok=True)
+    with open(os.path.join(cfg_dir, "result.json"), "w") as f:
+        json.dump(result, f, indent=2)
+    if os.path.exists(log_path):
+        try:
+            shutil.copy2(log_path, os.path.join(cfg_dir, "build.log"))
+        except OSError:
+            pass
+
+
+async def _run_one_build(
+    entry: dict,
+    config: AuditConfig,
+    checkpoint: CheckpointManager,
+    deployments_dir: str,
+) -> None:
+    cfg_id = entry["id"]
+    key = _phase_b_task_key(cfg_id)
+    cfg_dir = os.path.join(deployments_dir, "configs", cfg_id)
+    deployment_mode_path = os.path.join(deployments_dir, entry["deployment_mode_path"])
+    log_file = os.path.join(cfg_dir, "build.log")
+
+    if checkpoint.is_complete(key):
+        logger.info("Stage 2 Phase B: %s already complete, skipping.", cfg_id)
+        return
+
+    os.makedirs(cfg_dir, exist_ok=True)
+    logger.info("Stage 2 Phase B: starting build for %s.", cfg_id)
+
+    prompt = load_prompt("stage2-build.md", {
+        "config_id": cfg_id,
+        "deployment_mode_path": deployment_mode_path,
+        "target_path": config.target,
+        "config_dir": cfg_dir,
+        "result_path": os.path.join(cfg_dir, "result.json"),
+    })
+
+    timed_out = False
+    task = asyncio.create_task(
+        run_agent(
+            prompt, config, cwd=config.target,
+            max_turns=_PHASE_B_MAX_TURNS,
+            model=_PHASE_B_MODEL,
+            effort=_PHASE_B_EFFORT,
+            log_file=log_file,
+        )
+    )
+    done, _ = await asyncio.wait({task}, timeout=config.deployment_build_timeout_sec)
+
+    if not done:
+        timed_out = True
+        task.cancel()
+        grace_done, _ = await asyncio.wait({task}, timeout=30)
+        if not grace_done:
+            logger.warning(
+                "Stage 2 Phase B: %s agent task did not exit after cancel, moving on.",
+                cfg_id,
+            )
+        logger.warning(
+            "Stage 2 Phase B: %s timed out after %d minutes.",
+            cfg_id, config.deployment_build_timeout_sec // 60,
+        )
+    else:
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+    result_path = os.path.join(cfg_dir, "result.json")
+    if timed_out and not os.path.exists(result_path):
+        _write_timeout_result(cfg_dir, cfg_id, config.deployment_build_timeout_sec, log_file)
+
+    checkpoint.mark_complete(key)
+    logger.info("Stage 2 Phase B: %s complete (timed_out=%s).", cfg_id, timed_out)
+
+
+async def _run_phase_b(
+    config: AuditConfig,
+    checkpoint: CheckpointManager,
+    deployments_dir: str,
+) -> None:
+    """Run one build agent per archetype, capped by deployment_build_parallel."""
+    manifest = _load_manifest(os.path.join(deployments_dir, "manifest.json"))
+    entries = list(manifest.get("configs", []))
+    if not entries:
+        logger.warning("Stage 2 Phase B: manifest has no configs; nothing to build.")
+        return
+
+    logger.info(
+        "Stage 2 Phase B: launching %d build agents (parallel cap: %d).",
+        len(entries), config.deployment_build_parallel,
+    )
+    await run_parallel_limited(
+        entries,
+        config.deployment_build_parallel,
+        lambda entry, _idx: _run_one_build(entry, config, checkpoint, deployments_dir),
+    )
+
+
+async def run_stage2_deployments(
+    config: AuditConfig,
+    checkpoint: CheckpointManager,
+    auditing_focus_path: str,
+) -> Stage2Output:
+    deployments_dir = os.path.join(config.output_dir, "stage2-deployments")
+    os.makedirs(deployments_dir, exist_ok=True)
+    os.makedirs(os.path.join(deployments_dir, "configs"), exist_ok=True)
+
+    await _run_phase_a(config, checkpoint, deployments_dir, auditing_focus_path)
+    await _run_phase_b(config, checkpoint, deployments_dir)
+
+    merge_results_into_manifest(deployments_dir)
+
+    final_issues = validate_stage2_manifest_final(
+        os.path.join(deployments_dir, "manifest.json"),
+    )
+    for issue in final_issues:
+        logger.warning("Stage 2 final manifest: %s", issue.description)
+
+    output = load_stage2_output(deployments_dir)
+    logger.info(
+        "Stage 2 complete. %d archetype(s) with build_status='ok'.",
+        len(output.configs),
+    )
+    return output

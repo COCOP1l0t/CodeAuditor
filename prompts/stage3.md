@@ -24,6 +24,12 @@ __SCOPE_MODULES__
 
 __HISTORICAL_HOT_SPOTS__
 
+## Real-World Deployment Surfaces
+
+The following deployment archetypes were identified for this project. When decomposing into analysis units, prioritize modules that are exercised in these deployments and on the externally exposed surface. Modules unreachable in any of these archetypes can be deprioritized or grouped into lower-priority AUs.
+
+__DEPLOYMENT_SUMMARY__
+
 ## Workflow
 
 ### Step 1: Enumerate and Understand

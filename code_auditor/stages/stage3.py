@@ -19,6 +19,7 @@ async def run_stage3(
     config: AuditConfig,
     checkpoint: CheckpointManager,
     auditing_focus_path: str,
+    deployment_summary_path: str,
 ) -> list[AnalysisUnit]:
     result_dir = os.path.join(config.output_dir, "stage3-analysis-units")
     os.makedirs(result_dir, exist_ok=True)
@@ -63,6 +64,11 @@ async def run_stage3(
 
     scope_modules, hot_spots = parse_auditing_focus(auditing_focus_path)
 
+    deployment_summary = ""
+    if os.path.exists(deployment_summary_path):
+        with open(deployment_summary_path) as f:
+            deployment_summary = f.read().strip()
+
     logger.info("Stage 3: Running agent to enumerate, triage, and create analysis units.")
     prompt = load_prompt("stage3.md", {
         "target_path": config.target,
@@ -71,6 +77,7 @@ async def run_stage3(
         "scope_modules": scope_modules or "No scope information available.",
         "historical_hot_spots": hot_spots or "No historical data available.",
         "target_au_count": str(config.target_au_count),
+        "deployment_summary": deployment_summary or "No deployment summary available.",
     })
 
     await run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)

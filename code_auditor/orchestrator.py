@@ -58,7 +58,9 @@ async def run_audit(config: AuditConfig) -> None:
 
     analysis_units: list[AnalysisUnit] = []
     if 3 not in config.skip_stages:
-        analysis_units = await run_stage3(config, checkpoint, auditing_focus_path)
+        analysis_units = await run_stage3(
+            config, checkpoint, auditing_focus_path, deployment_summary_path,
+        )
     else:
         logger.info("Stage 3 skipped. Loading existing analysis units.")
         stage3_dir = os.path.join(config.output_dir, "stage3-analysis-units")

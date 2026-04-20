@@ -23,6 +23,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="claude-sonnet-4-6", help="Claude model to use (default: claude-sonnet-4-6)")
     parser.add_argument("--target-au-count", type=int, default=10, help="Target number of analysis units for stage 2 (default: 10)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="Run only stages 1-4 (skip PoC reproduction and disclosure stages 5-6)",
+    )
     return parser
 
 
@@ -37,6 +42,8 @@ def main() -> None:
 
     output_dir = os.path.realpath(args.output_dir or os.path.join(target, "audit-output"))
 
+    skip_stages = [5, 6] if args.audit_only else []
+
     config = AuditConfig(
         target=target,
         output_dir=output_dir,
@@ -45,6 +52,7 @@ def main() -> None:
         log_level=args.log_level.upper(),
         model=args.model,
         target_au_count=args.target_au_count,
+        skip_stages=skip_stages,
     )
 
     configure_logging(config.log_level)

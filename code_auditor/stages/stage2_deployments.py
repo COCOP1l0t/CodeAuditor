@@ -4,14 +4,27 @@ import json
 import os
 from dataclasses import dataclass
 
-from ..config import ValidationIssue
+from ..agent import run_agent
+from ..checkpoint import CheckpointManager
+from ..config import AuditConfig, ValidationIssue
 from ..logger import get_logger
+from ..prompts import load_prompt
 from ..utils import format_validation_issues
 from ..validation.stage2 import (
+    validate_stage2_manifest_final,
+    validate_stage2_phase_a,
     validate_stage2_phase_b_entry,
 )
 
 logger = get_logger("stage2")
+
+
+_PHASE_A_TASK_KEY = "stage2:research"
+_PHASE_A_MAX_TURNS = 200
+
+
+def _phase_b_task_key(cfg_id: str) -> str:
+    return f"stage2:build:{cfg_id}"
 
 
 @dataclass
@@ -123,3 +136,67 @@ def load_stage2_output(deployments_dir: str) -> Stage2Output:
         deployment_summary_path=summary_path,
         configs=configs,
     )
+
+
+async def _run_phase_a(
+    config: AuditConfig,
+    checkpoint: CheckpointManager,
+    deployments_dir: str,
+    auditing_focus_path: str,
+) -> None:
+    """Run the deployment research agent and validate its output."""
+    if checkpoint.is_complete(_PHASE_A_TASK_KEY):
+        logger.info("Stage 2 Phase A: already complete, skipping.")
+        return
+
+    os.makedirs(os.path.join(deployments_dir, "configs"), exist_ok=True)
+    log_file = os.path.join(deployments_dir, "agent.log")
+
+    research_record_path = os.path.join(
+        config.output_dir, "stage1-security-context", "stage-1-security-context.json",
+    )
+    auditing_focus_str = auditing_focus_path
+
+    prompt = load_prompt("stage2.md", {
+        "target_path": config.target,
+        "deployments_dir": deployments_dir,
+        "configs_dir": os.path.join(deployments_dir, "configs"),
+        "manifest_path": os.path.join(deployments_dir, "manifest.json"),
+        "summary_path": os.path.join(deployments_dir, "deployment-summary.md"),
+        "auditing_focus_path": auditing_focus_str,
+        "research_record_path": research_record_path,
+    })
+
+    logger.info("Stage 2 Phase A: starting deployment research.")
+    await run_agent(
+        prompt,
+        config,
+        cwd=config.target,
+        max_turns=_PHASE_A_MAX_TURNS,
+        log_file=log_file,
+    )
+
+    issues = validate_stage2_phase_a(deployments_dir)
+    if issues:
+        logger.warning(
+            "Stage 2 Phase A: validation issues:\n%s",
+            format_validation_issues(issues),
+        )
+        repair_prompt = (
+            f"The deployment manifest at `{deployments_dir}` failed validation. "
+            "Please fix all issues listed below:\n\n"
+            f"```\n{format_validation_issues(issues)}\n```"
+        )
+        await run_agent(
+            repair_prompt, config, cwd=config.target,
+            max_turns=10, log_file=log_file,
+        )
+        issues = validate_stage2_phase_a(deployments_dir)
+        if issues:
+            logger.warning(
+                "Stage 2 Phase A: validation still failing after repair:\n%s",
+                format_validation_issues(issues),
+            )
+
+    checkpoint.mark_complete(_PHASE_A_TASK_KEY)
+    logger.info("Stage 2 Phase A: complete.")

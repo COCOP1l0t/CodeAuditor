@@ -21,7 +21,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", help="Output directory (default: {target}/audit-output)")
     parser.add_argument("--max-parallel", type=int, default=1, help="Maximum concurrent agents (default: 1)")
     parser.add_argument("--model", default="claude-sonnet-4-6", help="Claude model to use (default: claude-sonnet-4-6)")
-    parser.add_argument("--target-au-count", type=int, default=10, help="Target number of analysis units for stage 2 (default: 10)")
+    parser.add_argument("--target-au-count", type=int, default=10, help="Target number of analysis units for stage 3 (default: 10)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 

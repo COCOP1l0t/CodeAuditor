@@ -13,6 +13,7 @@ from .stages.stage3 import run_stage3
 from .stages.stage4 import run_stage4
 from .stages.stage5 import run_stage5
 from .stages.stage6 import run_stage6
+from .stages.stage7 import run_stage7
 from .utils import list_json_files
 
 logger = get_logger("orchestrator")
@@ -91,10 +92,18 @@ async def run_audit(config: AuditConfig) -> None:
                     if os.path.exists(report):
                         stage5_reports.append(report)
 
-    # Stage 6: disclosure preparation per reproduced vulnerability
+    # Stage 6: API-misuse check on reproduced PoCs
+    cleared_reports: list[str] = []
     if 6 not in config.skip_stages:
-        await run_stage6(stage5_reports, config, checkpoint)
+        cleared_reports = await run_stage6(stage5_reports, config, checkpoint)
     else:
-        logger.info("Stage 6 skipped.")
+        logger.info("Stage 6 skipped. Passing Stage 5 reports straight to Stage 7.")
+        cleared_reports = stage5_reports
+
+    # Stage 7: disclosure preparation per cleared vulnerability
+    if 7 not in config.skip_stages:
+        await run_stage7(cleared_reports, config, checkpoint)
+    else:
+        logger.info("Stage 7 skipped.")
 
     logger.info("Audit complete.")

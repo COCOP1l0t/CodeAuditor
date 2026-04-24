@@ -12,6 +12,7 @@ from code_auditor.validation.stage2 import (
     validate_triage_file,
 )
 from code_auditor.validation.stage4 import validate_stage4_file
+from code_auditor.validation.stage6 import validate_stage6_verdict
 
 
 def _write_au(path: str, desc: str, files: list[str], focus: str) -> None:
@@ -258,5 +259,80 @@ def test_stage4_validator_rejects_non_array_propagation_chain():
         issues = validate_stage4_file(path)
         chain_issues = [i for i in issues if "propagation_chain" in i.description and "array" in i.description]
         assert len(chain_issues) == 1
+
+
+_STAGE6_GOOD_VERDICT = """# Verdict: H-01
+
+## Verdict
+
+real-vulnerability
+
+## Summary
+
+Test summary.
+
+## PoC Behavior
+
+Test.
+
+## Documentation References
+
+- Source: README.md
+- Quote: Silent on this topic.
+
+## Analysis
+
+Test.
+
+## Justification
+
+Test.
+"""
+
+
+def test_stage6_verdict_validator_accepts_valid():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "verdict.md")
+        with open(path, "w") as f:
+            f.write(_STAGE6_GOOD_VERDICT)
+
+        assert validate_stage6_verdict(path) == []
+
+
+def test_stage6_verdict_validator_rejects_missing_section():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "verdict.md")
+        with open(path, "w") as f:
+            f.write(_STAGE6_GOOD_VERDICT.replace("## Justification", "## NotJustification"))
+
+        issues = validate_stage6_verdict(path)
+        missing = [i for i in issues if "Justification" in i.description]
+        assert len(missing) == 1
+
+
+def test_stage6_verdict_validator_rejects_invalid_verdict_value():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "verdict.md")
+        with open(path, "w") as f:
+            f.write(_STAGE6_GOOD_VERDICT.replace("real-vulnerability", "totally-fine"))
+
+        issues = validate_stage6_verdict(path)
+        verdict_issues = [i for i in issues if "verdict value" in i.description.lower()]
+        assert len(verdict_issues) == 1
+
+
+def test_stage6_verdict_validator_accepts_api_misuse_and_uncertain():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "verdict.md")
+        for value in ("api-misuse", "uncertain"):
+            with open(path, "w") as f:
+                f.write(_STAGE6_GOOD_VERDICT.replace("real-vulnerability", value))
+            assert validate_stage6_verdict(path) == []
+
+
+def test_stage6_verdict_validator_reports_missing_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        issues = validate_stage6_verdict(os.path.join(tmp, "nope.md"))
+        assert len(issues) == 1
 
 

@@ -9,16 +9,18 @@ from ..checkpoint import CheckpointManager
 from ..config import AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
-from ..utils import run_parallel_limited
+from ..utils import format_validation_issues, run_parallel_limited
+from ..validation.stage6 import validate_stage6_verdict
 
 logger = get_logger("stage6")
 
-# Stage 6 agents verify reproduction, create minimal PoCs, and write
-# polished disclosure artifacts — similar complexity to Stage 5.
-_MAX_TURNS = 500
-_DEFAULT_MODEL = "claude-opus-4-6"
-_DEFAULT_EFFORT = "medium"
-_DISCLOSURE_TIMEOUT = 20 * 60  # 20 minutes
+_MAX_TURNS = 200
+_CHECK_TIMEOUT = 15 * 60  # 15 minutes
+
+# Stage 6 may need to consult upstream / third-party documentation on the web
+# in addition to in-repo docs, so it gets WebFetch / WebSearch on top of the
+# default tools.
+_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit", "Bash", "WebFetch", "WebSearch"]
 
 
 def _task_key(vuln_id: str) -> str:
@@ -26,9 +28,10 @@ def _task_key(vuln_id: str) -> str:
 
 
 def _vuln_id_from_report(report_path: str) -> str | None:
-    """Extract vulnerability ID from a stage 5 report path.
+    """Extract the vuln id from a stage5 report path .../stage5-pocs/{id}/report.md.
 
-    Expects paths like .../stage5-pocs/{vuln_id}/report.md
+    Returns None for ``_fp``-suffixed directories (failed reproduction) — those
+    should be skipped by Stage 6.
     """
     parent = Path(report_path).parent
     name = parent.name
@@ -38,54 +41,63 @@ def _vuln_id_from_report(report_path: str) -> str | None:
 
 
 def _find_finding_file(vuln_id: str, output_dir: str) -> str | None:
-    """Locate the stage 4 evaluated finding JSON for a vulnerability ID."""
     path = os.path.join(output_dir, "stage4-vulnerabilities", f"{vuln_id}.json")
     return path if os.path.exists(path) else None
 
 
 def _filter_reproduced(stage5_reports: list[str]) -> list[str]:
-    """Keep only stage 5 reports from successful reproductions (no _fp suffix)."""
+    """Keep only Stage 5 reports from successful reproductions (no ``_fp`` suffix)."""
     return [r for r in stage5_reports if not Path(r).parent.name.endswith("_fp")]
 
 
-async def _run_disclosure(
+async def _run_check(
     report_path: str,
     config: AuditConfig,
     checkpoint: CheckpointManager,
 ) -> str | None:
-    """Prepare disclosure artifacts for a single reproduced vulnerability."""
+    """Run the API-misuse check on one reproduced PoC.
+
+    Returns the original ``report_path`` if the PoC was classified as a real
+    vulnerability or uncertain (i.e. should proceed to disclosure), or
+    ``None`` if it was classified as API misuse.
+    """
     vuln_id = _vuln_id_from_report(report_path)
     if not vuln_id:
-        logger.warning("Stage 6: Cannot extract vuln ID from %s, skipping.", report_path)
+        logger.warning("Stage 6: Cannot extract vuln id from %s, skipping.", report_path)
         return None
 
     key = _task_key(vuln_id)
-    stage6_vuln_dir = os.path.join(config.output_dir, "stage6-disclosures", vuln_id)
-    disclosure_dir = os.path.join(stage6_vuln_dir, "disclosure")
-    disclosure_report = os.path.join(disclosure_dir, "report.md")
+    verdict_root = os.path.join(config.output_dir, "stage6-api-check")
+    real_dir = os.path.join(verdict_root, vuln_id)
+    misuse_dir = os.path.join(verdict_root, f"{vuln_id}_misuse")
 
     if checkpoint.is_complete(key):
-        logger.info("Stage 6: %s already complete, skipping.", vuln_id)
-        return disclosure_report if os.path.exists(disclosure_report) else None
+        if os.path.isdir(misuse_dir):
+            logger.info("Stage 6: %s already complete (api-misuse), skipping disclosure.", vuln_id)
+            return None
+        if os.path.isdir(real_dir):
+            logger.info("Stage 6: %s already complete (real/uncertain), will proceed to disclosure.", vuln_id)
+            return report_path
+        logger.warning(
+            "Stage 6: %s marked complete but no verdict dir found — passing through to disclosure.",
+            vuln_id,
+        )
+        return report_path
 
-    logger.info("Stage 6: Starting disclosure preparation for %s.", vuln_id)
-    os.makedirs(disclosure_dir, exist_ok=True)
+    logger.info("Stage 6: Checking %s for API misuse.", vuln_id)
+    os.makedirs(verdict_root, exist_ok=True)
 
-    # Locate inputs
     poc_dir = str(Path(report_path).parent)
     finding_file = _find_finding_file(vuln_id, config.output_dir)
-
     if finding_file:
         finding_reference = (
-            "The evaluated finding with detailed data-flow trace, CWE, "
-            "and CVSS analysis is at:\n\n"
+            "The evaluated finding with data-flow trace, CWE, and CVSS analysis is at:\n\n"
             f"`{finding_file}`\n\n"
             "Read this file for additional context on the vulnerability."
         )
     else:
         finding_reference = (
-            "No evaluated finding file is available. "
-            "Use the vulnerability report for all details."
+            "No evaluated finding file is available; use the Stage 5 report for context."
         )
 
     prompt = load_prompt("stage6.md", {
@@ -93,11 +105,11 @@ async def _run_disclosure(
         "poc_dir": poc_dir,
         "finding_reference": finding_reference,
         "target_path": config.target,
-        "disclosure_dir": disclosure_dir,
+        "verdict_dir": verdict_root,
         "vuln_id": vuln_id,
     })
 
-    log_file = os.path.join(stage6_vuln_dir, "agent.log")
+    log_file = os.path.join(verdict_root, "logs", f"{vuln_id}.log")
 
     timed_out = False
     task = asyncio.create_task(
@@ -105,23 +117,22 @@ async def _run_disclosure(
             prompt,
             config,
             cwd=config.target,
+            allowed_tools=_ALLOWED_TOOLS,
             max_turns=_MAX_TURNS,
-            model=_DEFAULT_MODEL,
-            effort=_DEFAULT_EFFORT,
             log_file=log_file,
         )
     )
-    done, _ = await asyncio.wait({task}, timeout=_DISCLOSURE_TIMEOUT)
+    done, _ = await asyncio.wait({task}, timeout=_CHECK_TIMEOUT)
 
     if not done:
         timed_out = True
         task.cancel()
         grace_done, _ = await asyncio.wait({task}, timeout=30)
         if not grace_done:
-            logger.warning("Stage 6: %s agent task did not exit after cancel, moving on.", vuln_id)
+            logger.warning("Stage 6: %s agent did not exit after cancel, moving on.", vuln_id)
         logger.warning(
-            "Stage 6: %s timed out after %d minutes.",
-            vuln_id, _DISCLOSURE_TIMEOUT // 60,
+            "Stage 6: %s timed out after %d minutes — defaulting to real-vulnerability.",
+            vuln_id, _CHECK_TIMEOUT // 60,
         )
     else:
         exc = task.exception()
@@ -130,9 +141,52 @@ async def _run_disclosure(
 
     checkpoint.mark_complete(key)
 
-    has_report = os.path.exists(disclosure_report)
-    logger.info("Stage 6: %s complete (report=%s, timed_out=%s)", vuln_id, has_report, timed_out)
-    return disclosure_report if has_report else None
+    # Agent produced an api-misuse verdict.
+    if os.path.isdir(misuse_dir):
+        verdict_file = os.path.join(misuse_dir, "verdict.md")
+        vissues = validate_stage6_verdict(verdict_file)
+        if vissues:
+            logger.warning(
+                "Stage 6: %s misuse verdict validation failed:\n%s",
+                vuln_id, format_validation_issues(vissues),
+            )
+        logger.info("Stage 6: %s classified as api-misuse.", vuln_id)
+        return None
+
+    # Agent produced a real-vulnerability or uncertain verdict.
+    if os.path.isdir(real_dir):
+        verdict_file = os.path.join(real_dir, "verdict.md")
+        vissues = validate_stage6_verdict(verdict_file)
+        if vissues:
+            logger.warning(
+                "Stage 6: %s verdict validation failed:\n%s",
+                vuln_id, format_validation_issues(vissues),
+            )
+        logger.info("Stage 6: %s classified as real-vulnerability or uncertain.", vuln_id)
+        return report_path
+
+    # Agent produced no verdict directory (timeout or other failure) —
+    # default to pass-through so a real bug is not silently dropped.
+    if timed_out:
+        os.makedirs(real_dir, exist_ok=True)
+        with open(os.path.join(real_dir, "verdict.md"), "w") as f:
+            f.write(
+                f"# Verdict: {vuln_id}\n\n"
+                "## Verdict\n\nuncertain\n\n"
+                "## Summary\n\n"
+                f"API-misuse check timed out after {_CHECK_TIMEOUT // 60} minutes; "
+                "defaulting to `uncertain` so the finding proceeds to disclosure.\n\n"
+                "## PoC Behavior\n\n(Not analyzed — check timed out.)\n\n"
+                "## Documentation References\n\n(Not collected — check timed out.)\n\n"
+                "## Analysis\n\n(Not performed — check timed out.)\n\n"
+                "## Justification\n\n"
+                "Pass-through default applies because the check did not complete.\n"
+            )
+    logger.warning(
+        "Stage 6: %s produced no verdict directory — passing through to disclosure.",
+        vuln_id,
+    )
+    return report_path
 
 
 async def run_stage6(
@@ -140,32 +194,38 @@ async def run_stage6(
     config: AuditConfig,
     checkpoint: CheckpointManager,
 ) -> list[str]:
-    """Prepare disclosure artifacts for each reproduced vulnerability in parallel."""
+    """Check each reproduced PoC for API misuse in parallel.
+
+    Returns the subset of input reports that were NOT classified as API misuse
+    (i.e. should continue to Stage 7 disclosure).
+    """
     reproduced = _filter_reproduced(stage5_reports)
     if not reproduced:
-        logger.info("Stage 6: No reproduced vulnerabilities to prepare disclosures for.")
+        logger.info("Stage 6: No reproduced PoCs to check.")
         return []
 
-    logger.info("Stage 6: Preparing disclosures for %d reproduced vulnerabilities.", len(reproduced))
+    logger.info("Stage 6: Checking %d reproduced PoCs for API misuse.", len(reproduced))
 
     results = await run_parallel_limited(
         reproduced,
         config.max_parallel,
-        lambda report, _: _run_disclosure(report, config, checkpoint),
+        lambda report, _: _run_check(report, config, checkpoint),
     )
 
-    disclosure_reports: list[str] = []
+    cleared: list[str] = []
     for i, (status, value, error) in enumerate(results):
         if i >= len(reproduced):
             continue
         if status == "rejected":
-            logger.error("Stage 6: %s failed: %s", os.path.basename(reproduced[i]), error)
+            vuln_id = Path(reproduced[i]).parent.name
+            logger.error("Stage 6: %s failed: %s — passing through to disclosure.", vuln_id, error)
+            cleared.append(reproduced[i])
             continue
         if value:
-            disclosure_reports.append(value)
+            cleared.append(value)
 
     logger.info(
-        "Stage 6 complete. %d disclosure packages prepared (from %d reproduced vulnerabilities).",
-        len(disclosure_reports), len(reproduced),
+        "Stage 6 complete. %d of %d PoCs cleared the API-misuse check.",
+        len(cleared), len(reproduced),
     )
-    return disclosure_reports
+    return cleared

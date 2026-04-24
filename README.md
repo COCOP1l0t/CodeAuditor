@@ -6,7 +6,7 @@ CodeAuditor has discovered several CVEs in widely used open-source projects — 
 
 ## How it works
 
-The audit runs as seven sequential stages. Each stage is driven by a prompt template in `prompts/` and executed by one or more Claude Code agents. Outputs are validated, and on validation failure a repair prompt is sent (up to `max_retries`). Intermediate artifacts are written under the output directory; a `.markers/` folder tracks completed sub-tasks so runs can be resumed.
+The audit runs as eight sequential stages. Each stage is driven by a prompt template in `prompts/` and executed by one or more Claude Code agents. Outputs are validated, and on validation failure a repair prompt is sent (up to `max_retries`). Intermediate artifacts are written under the output directory; a `.markers/` folder tracks completed sub-tasks so runs can be resumed.
 
 | Stage | What it does | Parallelism |
 |-------|--------------|-------------|
@@ -16,7 +16,8 @@ The audit runs as seven sequential stages. Each stage is driven by a prompt temp
 | 3 | Bug discovery per analysis unit | 1 agent per AU |
 | 4 | Evaluate findings: real vulnerability? severity? | 1 agent per finding |
 | 5 | PoC reproduction: build, exploit, capture evidence | 1 agent per vulnerability |
-| 6 | Disclosure: technical report, email, minimal PoC, zipped package | 1 agent per vulnerability |
+| 6 | API-misuse check: compare the PoC against the project's official usage documentation | 1 agent per reproduced PoC |
+| 7 | Disclosure: technical report, email, minimal PoC, zipped package | 1 agent per cleared vulnerability |
 
 Stage 1 produces two directives — an *auditing focus* and *vulnerability criteria* — that are injected into later stages so the whole pipeline stays aligned with the project's actual threat model.
 
@@ -74,7 +75,8 @@ code-auditor \
 ├── stage3-findings/          # per-AU bug findings
 ├── stage4-vulnerabilities/   # evaluated, confirmed vulnerabilities
 ├── stage5-pocs/              # PoCs + evidence
-├── stage6-disclosures/       # disclosure reports, emails, zipped PoCs
+├── stage6-api-check/         # API-misuse verdicts ({id}/ real, {id}_misuse/ misuse)
+├── stage7-disclosures/       # disclosure reports, emails, zipped PoCs
 └── .markers/          # checkpoint markers for --resume
 ```
 
@@ -90,11 +92,11 @@ code_auditor/
 ├── checkpoint.py        # Marker-based checkpoint/resume
 ├── logger.py            # Logging helper
 ├── utils.py             # Parallelism + file helpers
-├── stages/              # stage0 – stage6
+├── stages/              # stage0 – stage7
 ├── parsing/             # Structured extraction from agent output
 ├── validation/          # Per-stage output validators
 └── tests/
-prompts/                 # stage1.md – stage6.md prompt templates
+prompts/                 # stage1.md – stage7.md prompt templates
 ```
 
 ## Development

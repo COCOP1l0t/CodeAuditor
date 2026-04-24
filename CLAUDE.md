@@ -26,7 +26,7 @@ code-auditor --target /path/to/project [--output-dir DIR] [--max-parallel 2] [--
 #   --resume           Resume from checkpoint markers
 #   --threat-model     Override default threat model text
 #   --scope            Additional scope instructions for stage 1
-#   --skip-stages      Comma-separated stage numbers to skip (0–6)
+#   --skip-stages      Comma-separated stage numbers to skip (0–7)
 #   --only-stage       Run only this stage (+ stage 0); mutually exclusive with --skip-stages
 #   --model            Claude model to use (default claude-sonnet-4-6)
 #   --target-au-count  Target number of analysis units for stage 2 (default 30)
@@ -55,14 +55,14 @@ code_auditor/
 ├── checkpoint.py        # File/marker-based checkpoint/resume
 ├── logger.py            # stdlib logging wrapper
 ├── utils.py             # run_parallel_limited, file helpers, severity sort
-├── stages/              # stage0–stage6 (one file per stage)
+├── stages/              # stage0–stage7 (one file per stage)
 ├── parsing/             # stage2.py — extract structured data from agent output
-├── validation/          # common.py + stage1–stage6 — validate agent output format
+├── validation/          # common.py + stage1–stage7 — validate agent output format
 └── tests/
-prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
+prompts/                 # stage1.md–stage7.md — prompt templates with __KEY__ placeholders
 ```
 
-## Architecture (7 stages)
+## Architecture (8 stages)
 
 | Stage | What it does | Parallelism |
 |-------|-------------|-------------|
@@ -72,7 +72,8 @@ prompts/                 # stage1.md–stage6.md — prompt templates with __KEY
 | 3 | Bug discovery per AU | 1 agent per AU |
 | 4 | Evaluate findings: real vuln? severity? | 1 agent per finding |
 | 5 | PoC reproduction: build, exploit, capture evidence | 1 agent per vuln |
-| 6 | Disclosure: report, email, minimal PoC, zip package | 1 agent per vuln |
+| 6 | API-misuse check: compare PoC vs. official usage docs (in-repo + upstream via WebFetch) | 1 agent per reproduced PoC |
+| 7 | Disclosure: report, email, minimal PoC, zip package | 1 agent per cleared vuln |
 
 ## Key patterns
 
@@ -81,4 +82,5 @@ prompts/                 # stage1.md–stage6.md — prompt templates with __KEY
 - **Validation + retry**: Each agent output is validated; on failure, a repair prompt is sent (up to `max_retries`)
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
-- **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
+- **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-api-check,7-disclosures}/`, `.markers/`
+- **Stage 6 verdict convention**: agent creates either `stage6-api-check/{id}/verdict.md` (real / uncertain → flows to Stage 7) or `stage6-api-check/{id}_misuse/verdict.md` (API misuse → filtered out before Stage 7). Stage 7 also independently re-filters by checking for a `_misuse` dir, so skipping Stage 6 does not lose the filter on resumed runs.

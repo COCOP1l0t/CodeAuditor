@@ -59,7 +59,8 @@ async def run_setup(config: AuditConfig) -> None:
         os.path.join(config.output_dir, "stage4-vulnerabilities"),
         os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending"),
         os.path.join(config.output_dir, "stage5-pocs"),
-        os.path.join(config.output_dir, "stage6-disclosures"),
+        os.path.join(config.output_dir, "stage6-api-check"),
+        os.path.join(config.output_dir, "stage7-disclosures"),
     ]
 
     for directory in directories:

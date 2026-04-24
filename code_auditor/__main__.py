@@ -26,7 +26,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audit-only",
         action="store_true",
-        help="Run only stages 1-4 (skip PoC reproduction and disclosure stages 5-6)",
+        help="Run only stages 1-4 (skip PoC reproduction, API-misuse check, and disclosure stages 5-7)",
     )
     return parser
 
@@ -42,7 +42,7 @@ def main() -> None:
 
     output_dir = os.path.realpath(args.output_dir or os.path.join(target, "audit-output"))
 
-    skip_stages = [5, 6] if args.audit_only else []
+    skip_stages = [5, 6, 7] if args.audit_only else []
 
     config = AuditConfig(
         target=target,

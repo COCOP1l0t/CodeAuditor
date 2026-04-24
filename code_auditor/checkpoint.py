@@ -50,11 +50,20 @@ class CheckpointManager:
             return self._marker_path(task_key)
         if task_key.startswith("stage6:"):
             return self._marker_path(task_key)
+        if task_key.startswith("stage7:"):
+            return self._marker_path(task_key)
         logger.warning("Unknown checkpoint task key: %s", task_key)
         return None
 
     def _needs_marker(self, task_key: str) -> bool:
-        return task_key == "stage2" or task_key.startswith("stage3:") or task_key.startswith("stage4:") or task_key.startswith("stage5:") or task_key.startswith("stage6:")
+        return (
+            task_key == "stage2"
+            or task_key.startswith("stage3:")
+            or task_key.startswith("stage4:")
+            or task_key.startswith("stage5:")
+            or task_key.startswith("stage6:")
+            or task_key.startswith("stage7:")
+        )
 
     def _marker_path(self, task_key: str) -> str:
         return os.path.join(self._markers_dir, task_key.replace(":", "-"))

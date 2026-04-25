@@ -7,7 +7,7 @@ import shutil
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
-from ..config import AuditConfig
+from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..utils import run_parallel_limited
@@ -17,7 +17,6 @@ logger = get_logger("stage5")
 # Stage 5 agents need generous turn budgets — PoC development involves
 # building projects, writing exploit code, running/debugging, and iterating.
 _MAX_TURNS = 500
-_DEFAULT_MODEL = "claude-opus-4-6"
 _DEFAULT_EFFORT = "medium"
 _POC_TIMEOUT = 20 * 60  # 20 minutes
 
@@ -80,7 +79,7 @@ async def _run_reproduce(
             config,
             cwd=config.target,
             max_turns=_MAX_TURNS,
-            model=_DEFAULT_MODEL,
+            model=DEFAULT_CLAUDE_POC_MODEL if config.backend == "claude" else config.model,
             effort=_DEFAULT_EFFORT,
             log_file=log_file,
         )

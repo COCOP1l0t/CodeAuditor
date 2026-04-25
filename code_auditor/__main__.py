@@ -5,7 +5,7 @@ import asyncio
 import os
 import sys
 
-from .config import AuditConfig
+from .config import DEFAULT_BACKEND, DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, AuditConfig
 from .logger import configure_logging, get_logger
 from .orchestrator import run_audit
 
@@ -20,7 +20,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", required=True, help="Root directory of the project to audit")
     parser.add_argument("--output-dir", help="Output directory (default: {target}/audit-output)")
     parser.add_argument("--max-parallel", type=int, default=1, help="Maximum concurrent agents (default: 1)")
-    parser.add_argument("--model", default="claude-sonnet-4-6", help="Claude model to use (default: claude-sonnet-4-6)")
+    parser.add_argument(
+        "--backend",
+        choices=["claude", "codex"],
+        default=DEFAULT_BACKEND,
+        help="Agent backend to use (default: claude)",
+    )
+    parser.add_argument(
+        "--model",
+        help=f"Backend model override (Claude default: {DEFAULT_CLAUDE_MODEL}; Codex default: {DEFAULT_CODEX_MODEL})",
+    )
     parser.add_argument("--target-au-count", type=int, default=10, help="Target number of analysis units for stage 2 (default: 10)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument(
@@ -50,6 +59,7 @@ def main() -> None:
         max_parallel=args.max_parallel,
         resume=True,
         log_level=args.log_level.upper(),
+        backend=args.backend,
         model=args.model,
         target_au_count=args.target_au_count,
         skip_stages=skip_stages,

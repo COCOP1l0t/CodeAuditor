@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
-from ..config import AuditConfig
+from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..utils import run_parallel_limited
@@ -16,7 +16,6 @@ logger = get_logger("stage6")
 # Stage 6 agents verify reproduction, create minimal PoCs, and write
 # polished disclosure artifacts — similar complexity to Stage 5.
 _MAX_TURNS = 500
-_DEFAULT_MODEL = "claude-opus-4-6"
 _DEFAULT_EFFORT = "medium"
 _DISCLOSURE_TIMEOUT = 20 * 60  # 20 minutes
 
@@ -106,7 +105,7 @@ async def _run_disclosure(
             config,
             cwd=config.target,
             max_turns=_MAX_TURNS,
-            model=_DEFAULT_MODEL,
+            model=DEFAULT_CLAUDE_POC_MODEL if config.backend == "claude" else config.model,
             effort=_DEFAULT_EFFORT,
             log_file=log_file,
         )

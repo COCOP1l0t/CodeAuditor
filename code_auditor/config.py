@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
+
+AgentBackend = Literal["claude", "codex"]
+
+DEFAULT_BACKEND: AgentBackend = "claude"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CLAUDE_POC_MODEL = "claude-opus-4-6"
+DEFAULT_CODEX_MODEL = "gpt-5.4"
 
 DEFAULT_THREAT_MODEL = (
     "Network attacker with full control over protocol messages. "
@@ -19,7 +27,8 @@ class AuditConfig:
     skip_stages: list[int] = field(default_factory=list)
     resume: bool = True
     log_level: str = "INFO"
-    model: str = "claude-sonnet-4-6"
+    backend: AgentBackend = DEFAULT_BACKEND
+    model: str | None = None
     target_au_count: int = 10
 
 

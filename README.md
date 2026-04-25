@@ -1,12 +1,12 @@
 # CodeAuditor
 
-A multi-stage, agentic code auditing pipeline built on the [Claude Code SDK](https://github.com/anthropics/claude-code-sdk-python). Given a target source tree, CodeAuditor researches project context, decomposes the codebase into analysis units, hunts for bugs, evaluates them as security vulnerabilities, reproduces them with a working PoC, and finally prepares a disclosure-ready report package.
+A multi-stage, agentic code auditing pipeline with pluggable agent backends. CodeAuditor can run with the [Claude Code SDK](https://github.com/anthropics/claude-code-sdk-python) or the experimental Codex app-server Python SDK. Given a target source tree, it researches project context, decomposes the codebase into analysis units, hunts for bugs, evaluates them as security vulnerabilities, reproduces them with a working PoC, and finally prepares a disclosure-ready report package.
 
 CodeAuditor has discovered several CVEs in widely used open-source projects — see [Vulnerabilities found](#vulnerabilities-found) below.
 
 ## How it works
 
-The audit runs as seven sequential stages. Each stage is driven by a prompt template in `prompts/` and executed by one or more Claude Code agents. Outputs are validated, and on validation failure a repair prompt is sent (up to `max_retries`). Intermediate artifacts are written under the output directory; a `.markers/` folder tracks completed sub-tasks so runs can be resumed.
+The audit runs as seven sequential stages. Each stage is driven by a prompt template in `prompts/` and executed by one or more agent backend sessions. Outputs are validated, and on validation failure a repair prompt is sent (up to `max_retries`). Intermediate artifacts are written under the output directory; a `.markers/` folder tracks completed sub-tasks so runs can be resumed.
 
 | Stage | What it does | Parallelism |
 |-------|--------------|-------------|
@@ -23,7 +23,8 @@ Stage 1 produces two directives — an *auditing focus* and *vulnerability crite
 ## Requirements
 
 - Python **3.12+**
-- A working [Claude Code](https://docs.claude.com/en/docs/claude-code) install (the SDK reuses its authentication)
+- For the default backend: a working [Claude Code](https://docs.claude.com/en/docs/claude-code) install (the SDK reuses its authentication)
+- For the Codex backend: a working `codex` binary and `codex-app-server-sdk` installation, or a local `codex-main/sdk/python` checkout passed with `--codex-sdk-path`
 - Git, plus whatever build tools the target project needs for Stage 5 reproduction
 
 ## Installation
@@ -35,6 +36,19 @@ pip install -e .
 ```
 
 This exposes the `code-auditor` CLI entry point.
+
+For local Codex SDK development, install both projects into the same environment:
+
+```bash
+uv venv
+uv pip install -e . -e ../codex-main/sdk/python
+```
+
+Or install the optional Codex dependency directly from the OpenAI Codex repository:
+
+```bash
+pip install -e ".[codex]"
+```
 
 ## Usage
 
@@ -49,13 +63,16 @@ code-auditor --target /path/to/project [options]
 | `--target` | **Required.** Root directory of the project to audit. |
 | `--output-dir` | Output directory (default: `{target}/audit-output`). |
 | `--max-parallel` | Max concurrent agents (default: `1`). |
-| `--model` | Claude model to use (default: `claude-sonnet-4-6`). |
+| `--agent-backend` | Agent runtime backend: `claude-code` or `codex` (default: `claude-code`). |
+| `--model` | Agent model to use (default: `claude-sonnet-4-6` for Claude Code, `gpt-5.4` for Codex). |
 | `--target-au-count` | Target number of analysis units for Stage 2 (default: `10`). |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` (default: `INFO`). |
 
 Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
-### Example
+Run `code-auditor --help` for backend-specific options, including Codex binary, SDK path, sandbox, network, and writable-root controls.
+
+### Claude Code example
 
 ```bash
 code-auditor \
@@ -64,6 +81,23 @@ code-auditor \
   --max-parallel 4 \
   --log-level DEBUG
 ```
+
+### Codex example
+
+```bash
+code-auditor \
+  --target ~/projects/libfoo \
+  --output-dir ~/audits/libfoo \
+  --agent-backend codex \
+  --codex-bin /usr/local/bin/codex \
+  --audit-only \
+  --max-parallel 1 \
+  --log-level DEBUG
+```
+
+The Codex backend starts a Codex app-server session per agent task. Transient stream, TLS, timeout, and network disconnect failures are retried. If a Codex turn finally completes with a failed status, the backend raises an error instead of silently treating the missing output as a filtered vulnerability; this prevents failed Stage 4 evaluations from being checkpointed as complete.
+
+Codex currently works best from an ASCII-only workspace path. Some Codex stream metadata paths may fail when the repository path contains non-ASCII characters.
 
 ## Output layout
 
@@ -85,7 +119,8 @@ code_auditor/
 ├── __main__.py          # CLI entry point
 ├── config.py            # AuditConfig and dataclasses
 ├── orchestrator.py      # Sequential stage runner
-├── agent.py             # claude-code-sdk wrapper + validation retry loop
+├── agent.py             # Backend selection + validation retry loop
+├── agent_backends/      # Claude Code and Codex agent runtime adapters
 ├── prompts.py           # Prompt loader with __KEY__ substitution
 ├── checkpoint.py        # Marker-based checkpoint/resume
 ├── logger.py            # Logging helper
@@ -105,7 +140,7 @@ pytest code_auditor/tests    # same thing
 pytest -k stage2             # filter by name
 ```
 
-Tests cover parsers and validators; they do not make real agent calls.
+Tests cover parsers, validators, and backend selection helpers; they do not make real agent calls.
 
 ## Vulnerabilities found
 

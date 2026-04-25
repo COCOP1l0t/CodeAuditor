@@ -48,6 +48,10 @@ def _filter_reproduced(stage5_reports: list[str]) -> list[str]:
     return [r for r in stage5_reports if not Path(r).parent.name.endswith("_fp")]
 
 
+def _stage_model(config: AuditConfig) -> str | None:
+    return _DEFAULT_MODEL if config.agent_backend == "claude-code" else None
+
+
 async def _run_disclosure(
     report_path: str,
     config: AuditConfig,
@@ -106,7 +110,7 @@ async def _run_disclosure(
             config,
             cwd=config.target,
             max_turns=_MAX_TURNS,
-            model=_DEFAULT_MODEL,
+            model=_stage_model(config),
             effort=_DEFAULT_EFFORT,
             log_file=log_file,
         )

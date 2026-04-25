@@ -36,6 +36,10 @@ def _read_vuln_id(file_path: str) -> str | None:
         return None
 
 
+def _stage_model(config: AuditConfig) -> str | None:
+    return _DEFAULT_MODEL if config.agent_backend == "claude-code" else None
+
+
 async def _run_reproduce(
     vuln_file_path: str,
     config: AuditConfig,
@@ -80,7 +84,7 @@ async def _run_reproduce(
             config,
             cwd=config.target,
             max_turns=_MAX_TURNS,
-            model=_DEFAULT_MODEL,
+            model=_stage_model(config),
             effort=_DEFAULT_EFFORT,
             log_file=log_file,
         )

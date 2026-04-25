@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CODEX_MODEL = "gpt-5.4"
+
 DEFAULT_THREAT_MODEL = (
     "Network attacker with full control over protocol messages. "
     "The attacker can send arbitrary bytes, malformed messages, "
@@ -19,8 +22,15 @@ class AuditConfig:
     skip_stages: list[int] = field(default_factory=list)
     resume: bool = True
     log_level: str = "INFO"
-    model: str = "claude-sonnet-4-6"
+    model: str = DEFAULT_CLAUDE_MODEL
     target_au_count: int = 10
+    agent_backend: str = "claude-code"
+    codex_bin: str | None = None
+    codex_sdk_path: str | None = None
+    codex_sandbox: str = "workspace-write"
+    codex_approval_policy: str = "never"
+    codex_network_access: bool = False
+    codex_extra_writable_roots: list[str] = field(default_factory=list)
 
 
 @dataclass

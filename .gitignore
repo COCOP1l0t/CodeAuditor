@@ -27,3 +27,5 @@ audit-output/
 
 bak/
 working/
+.omx/
+.omc/

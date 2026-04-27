@@ -124,6 +124,9 @@ Vulnerabilities CodeAuditor has helped discover and disclose:
 - CVE-2026-40385
 - CVE-2026-40386
 
+### [QEMU](https://gitlab.com/qemu-project/qemu)
+- CVE-2026-7180
+
 ## Responsible use
 
 CodeAuditor is intended for auditing code you own or have explicit permission to test, and for coordinated disclosure to upstream maintainers. Do not use it to target systems or projects without authorization.

@@ -157,9 +157,8 @@ async def _run_claude_agent(
     add_dirs = _additional_directories(config, cwd)
 
     extra_args: dict[str, str | None] = {
-        # Run sub-agents like a clean Claude Code install: no user/project
-        # settings, no plugins, no hooks, no CLAUDE.md, no slash commands.
-        "setting-sources": "",
+        # Keep Claude Code settings sources enabled so provider/auth
+        # configuration from ~/.claude/settings.json is honored.
         "disable-slash-commands": None,
     }
     if effort:

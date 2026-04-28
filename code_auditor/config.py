@@ -9,6 +9,7 @@ DEFAULT_BACKEND: AgentBackend = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CLAUDE_POC_MODEL = "claude-opus-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
+DEFAULT_CODEX_POC_MODEL = "gpt-5.5"
 
 DEFAULT_THREAT_MODEL = (
     "Network attacker with full control over protocol messages. "
@@ -30,6 +31,14 @@ class AuditConfig:
     backend: AgentBackend = DEFAULT_BACKEND
     model: str | None = None
     target_au_count: int = 10
+
+
+def select_poc_model(config: AuditConfig) -> str:
+    if config.model:
+        return config.model
+    if config.backend == "claude":
+        return DEFAULT_CLAUDE_POC_MODEL
+    return DEFAULT_CODEX_POC_MODEL
 
 
 @dataclass

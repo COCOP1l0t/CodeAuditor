@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
-from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
+from ..config import AuditConfig, select_poc_model
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..utils import run_parallel_limited
@@ -105,7 +105,7 @@ async def _run_disclosure(
             config,
             cwd=config.target,
             max_turns=_MAX_TURNS,
-            model=DEFAULT_CLAUDE_POC_MODEL if config.backend == "claude" else config.model,
+            model=select_poc_model(config),
             effort=_DEFAULT_EFFORT,
             log_file=log_file,
         )

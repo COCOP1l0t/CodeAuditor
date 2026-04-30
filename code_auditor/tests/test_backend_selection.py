@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
+from code_auditor import __main__ as main_module
 from code_auditor import agent
 from code_auditor.__main__ import _build_parser
 from code_auditor.config import DEFAULT_BACKEND, AuditConfig
@@ -26,6 +29,93 @@ def test_cli_accepts_codex_backend_and_model_override() -> None:
 
     assert args.backend == "codex"
     assert args.model == "gpt-5.4"
+
+
+def test_cli_accepts_wiki_path() -> None:
+    args = _build_parser().parse_args([
+        "--target",
+        ".",
+        "--wiki",
+        "/tmp/wiki",
+    ])
+
+    assert args.wiki == "/tmp/wiki"
+
+
+def test_main_maps_wiki_path_to_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, AuditConfig] = {}
+    target = tmp_path / "target"
+    wiki = tmp_path / "wiki"
+    target.mkdir()
+    wiki.mkdir()
+
+    async def fake_run_audit(config: AuditConfig) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--wiki",
+        str(wiki),
+    ])
+
+    main_module.main()
+
+    assert captured["config"].wiki_path == str(wiki.resolve())
+
+
+def test_main_rejects_missing_wiki_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "target"
+    missing_wiki = tmp_path / "missing-wiki"
+    target.mkdir()
+
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--wiki",
+        str(missing_wiki),
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.main()
+
+    assert exc.value.code == 1
+    assert f"Error: Wiki directory not found: {missing_wiki.resolve()}" in capsys.readouterr().err
+
+
+def test_main_rejects_wiki_file_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "target"
+    wiki_file = tmp_path / "wiki.md"
+    target.mkdir()
+    wiki_file.write_text("# Not a directory\n")
+
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--wiki",
+        str(wiki_file),
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.main()
+
+    assert exc.value.code == 1
+    assert f"Error: Wiki path is not a directory: {wiki_file.resolve()}" in capsys.readouterr().err
 
 
 def test_resolve_codex_bin_uses_default_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]

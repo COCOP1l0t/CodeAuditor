@@ -14,6 +14,10 @@ This is a targeted vulnerability hunt, not a comprehensive audit. Your goal is t
 
 __USER_INSTRUCTIONS__
 
+## Wiki Knowledge Base
+
+__WIKI_CONTEXT__
+
 ## Auditing Focus
 
 ### Explicit In-Scope and Out-of-Scope Modules

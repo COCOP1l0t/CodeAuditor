@@ -10,6 +10,10 @@ Evaluate one vulnerability finding from Stage 3.
 - **Output file**: `__OUTPUT_PATH__` (write here ONLY if the vulnerability is confirmed and CVSS >= 4.0)
 - **Vulnerability criteria** (bug vs. vulnerability boundary + historical calibration): `__VULN_CRITERIA_PATH__`
 
+## Wiki Knowledge Base
+
+__WIKI_CONTEXT__
+
 ## Workflow
 
 ### Step 1: Read the Finding File

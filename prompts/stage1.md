@@ -19,6 +19,10 @@ Research the project at **__TARGET_PATH__** and produce three documents:
 
 __USER_INSTRUCTIONS__
 
+## Wiki Knowledge Base
+
+__WIKI_CONTEXT__
+
 ## Workflow
 
 ### Step 1: Security Context Research

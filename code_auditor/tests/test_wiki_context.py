@@ -1,7 +1,36 @@
 from __future__ import annotations
 
+import pytest
+
 from code_auditor.config import AuditConfig
+from code_auditor.prompts import PROMPTS_DIR
 from code_auditor.wiki import build_wiki_context
+
+
+@pytest.mark.parametrize("prompt_name", [
+    "stage1.md",
+    "stage2.md",
+    "stage3.md",
+    "stage4.md",
+    "stage5.md",
+    "stage6.md",
+])
+def test_stage_prompt_templates_have_wiki_context_token(prompt_name: str) -> None:
+    text = (PROMPTS_DIR / prompt_name).read_text()
+
+    assert "## Wiki Knowledge Base" in text
+    assert "__WIKI_CONTEXT__" in text
+
+
+def test_stage3_wiki_context_does_not_parent_scope_or_task_sections() -> None:
+    text = (PROMPTS_DIR / "stage3.md").read_text()
+
+    scope_index = text.index("### Scope of Your Analysis")
+    task_index = text.index("Your task: discover security bugs and vulnerabilities")
+    wiki_index = text.index("## Wiki Knowledge Base")
+    output_index = text.index("## Output")
+
+    assert scope_index < task_index < wiki_index < output_index
 
 
 def test_build_wiki_context_returns_neutral_message_without_wiki() -> None:

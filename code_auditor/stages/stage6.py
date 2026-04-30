@@ -10,6 +10,7 @@ from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..utils import run_parallel_limited
+from ..wiki import build_wiki_context
 
 logger = get_logger("stage6")
 
@@ -94,6 +95,7 @@ async def _run_disclosure(
         "target_path": config.target,
         "disclosure_dir": disclosure_dir,
         "vuln_id": vuln_id,
+        "wiki_context": build_wiki_context(config, stage=6),
     })
 
     log_file = os.path.join(stage6_vuln_dir, "agent.log")

@@ -20,6 +20,10 @@ All PoC artifacts (scripts, build outputs, evidence, report) must be written und
 
 Start by reading the vulnerability JSON file to understand the finding details, then proceed to designing the reproduction strategy.
 
+## Wiki Knowledge Base
+
+__WIKI_CONTEXT__
+
 ---
 
 ## Red Flags — STOP If You Catch Yourself Doing These

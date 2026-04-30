@@ -16,6 +16,7 @@ from ..utils import (
     run_parallel_limited,
 )
 from ..validation.stage4 import validate_stage4_file
+from ..wiki import build_wiki_context
 
 logger = get_logger("stage4")
 
@@ -102,6 +103,7 @@ async def _run_finding(
         "finding_file_path": stage3_file_path,
         "output_path": pending_path,
         "vuln_criteria_path": vuln_criteria_path,
+        "wiki_context": build_wiki_context(config, stage=4),
     })
 
     await run_agent(prompt, config, cwd=config.target, max_turns=100, log_file=log_file)

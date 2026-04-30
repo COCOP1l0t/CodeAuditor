@@ -10,6 +10,7 @@ from ..parsing.stage2 import parse_au_files, parse_auditing_focus
 from ..prompts import load_prompt
 from ..utils import format_validation_issues
 from ..validation.stage2 import validate_stage2_dir
+from ..wiki import build_wiki_context
 
 logger = get_logger("stage2")
 _TASK_KEY = "stage2"
@@ -73,6 +74,7 @@ async def run_stage2(
         "scope_modules": scope_modules or "No scope information available.",
         "historical_hot_spots": hot_spots or "No historical data available.",
         "target_au_count": str(config.target_au_count),
+        "wiki_context": build_wiki_context(config, stage=2),
     })
 
     await run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)

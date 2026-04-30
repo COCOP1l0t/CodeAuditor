@@ -113,7 +113,9 @@ DEFAULT_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit", "Bash"]
 def _additional_directories(config: AuditConfig, cwd: str) -> list[str]:
     resolved_cwd = os.path.realpath(cwd)
     dirs: list[str] = []
-    for candidate in [config.output_dir]:
+    for candidate in [config.output_dir, config.wiki_path]:
+        if not candidate:
+            continue
         resolved = os.path.realpath(candidate)
         if resolved != resolved_cwd and os.path.isdir(resolved) and resolved not in dirs:
             dirs.append(resolved)

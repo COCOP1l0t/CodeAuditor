@@ -118,6 +118,39 @@ def test_main_rejects_wiki_file_path(
     assert f"Error: Wiki path is not a directory: {wiki_file.resolve()}" in capsys.readouterr().err
 
 
+def test_additional_directories_includes_existing_wiki_path(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    target = tmp_path / "target"
+    output = tmp_path / "output"
+    wiki = tmp_path / "wiki"
+    target.mkdir()
+    output.mkdir()
+    wiki.mkdir()
+    config = AuditConfig(
+        target=str(target),
+        output_dir=str(output),
+        wiki_path=str(wiki),
+    )
+
+    assert agent._additional_directories(config, str(target)) == [
+        str(output.resolve()),
+        str(wiki.resolve()),
+    ]
+
+
+def test_additional_directories_skips_wiki_when_it_is_cwd(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    target = tmp_path / "target"
+    output = tmp_path / "output"
+    target.mkdir()
+    output.mkdir()
+    config = AuditConfig(
+        target=str(target),
+        output_dir=str(output),
+        wiki_path=str(target),
+    )
+
+    assert agent._additional_directories(config, str(target)) == [str(output.resolve())]
+
+
 def test_resolve_codex_bin_uses_default_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     codex_bin = tmp_path / "codex"
     codex_bin.write_text("#!/bin/sh\n")

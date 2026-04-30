@@ -85,11 +85,37 @@ code-auditor --target /path/to/project [options]
 |------|-------------|
 | `--target` | **Required.** Root directory of the project to audit. |
 | `--output-dir` | Output directory (default: `{target}/audit-output`). |
+| `--wiki` | LLM wiki knowledge base directory. CodeAuditor treats it as read-only and gives agents stage-specific wiki search guidance. |
 | `--max-parallel` | Max concurrent agents (default: `1`). |
 | `--backend` | Agent backend: `claude` or `codex` (default: `claude`). |
 | `--model` | Backend model override. Claude defaults to `claude-sonnet-4-6`; Codex uses the local Codex config default unless specified. |
 | `--target-au-count` | Target number of analysis units for Stage 2 (default: `10`). |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` (default: `INFO`). |
+
+### Wiki knowledge base
+
+`--wiki /path/to/wiki` lets CodeAuditor use an existing LLM wiki knowledge base during the audit. CodeAuditor treats the wiki as read-only and instructs agents not to create, edit, or update wiki files. Enforce filesystem permissions externally if write prevention is required.
+
+Recommended structure:
+
+```text
+wiki/
+|-- index.md
+|-- overview.md
+|-- attack-surface.md
+|-- auditing-guide.md
+|-- exploit-patterns.md
+|-- reproduction-workflow.md
+|-- vulnerability-timeline.md
+|-- entities/
+|   `-- <component>.md
+|-- concepts/
+|   `-- <vulnerability-class>.md
+`-- sources/
+    `-- <cve-or-case-study>.md
+```
+
+`index.md` is recommended as the navigation entry point. Partial wikis are supported; stages skip absent files and use the pages that exist.
 
 Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
@@ -99,6 +125,7 @@ Runs resume from checkpoint markers automatically — delete the output director
 code-auditor \
   --target ~/projects/libfoo \
   --output-dir ~/audits/libfoo \
+  --wiki ~/knowledge/libfoo-wiki \
   --max-parallel 4 \
   --log-level DEBUG
 ```

@@ -22,6 +22,7 @@ code-auditor --target /path/to/project [--output-dir DIR] [--max-parallel 2] [--
 #   --target           Root directory of project to audit
 # Optional args
 #   --output-dir       Defaults to {target}/audit-output
+#   --wiki            LLM wiki knowledge base directory (treated as read-only)
 #   --max-parallel     Concurrent agents (default 2)
 #   --resume           Resume from checkpoint markers
 #   --threat-model     Override default threat model text

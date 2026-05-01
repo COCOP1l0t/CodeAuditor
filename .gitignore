@@ -29,3 +29,6 @@ bak/
 working/
 .omx/
 .omc/
+
+# Worktrees
+.worktrees/

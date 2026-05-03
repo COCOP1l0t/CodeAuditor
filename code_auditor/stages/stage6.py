@@ -9,6 +9,7 @@ from ..checkpoint import CheckpointManager
 from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
+from ..reproduction_status import is_failed_status, is_reproduced_status, read_reproduction_status
 from ..utils import run_parallel_limited
 
 logger = get_logger("stage6")
@@ -43,8 +44,33 @@ def _find_finding_file(vuln_id: str, output_dir: str) -> str | None:
 
 
 def _filter_reproduced(stage5_reports: list[str]) -> list[str]:
-    """Keep only stage 5 reports from successful reproductions (no _fp suffix)."""
-    return [r for r in stage5_reports if not Path(r).parent.name.endswith("_fp")]
+    """Keep only Stage 5 reports from successful reproductions."""
+    reproduced: list[str] = []
+    for report_path in stage5_reports:
+        report_dir = Path(report_path).parent
+        if report_dir.name.endswith("_fp"):
+            logger.info("Stage 6: Skipping false-positive Stage 5 report: %s", report_path)
+            continue
+
+        status = read_reproduction_status(report_path)
+        if is_failed_status(status):
+            logger.info(
+                "Stage 6: Skipping Stage 5 report with reproduction status %s: %s",
+                status,
+                report_path,
+            )
+            continue
+
+        if not is_reproduced_status(status):
+            logger.warning(
+                "Stage 6: Skipping Stage 5 report with missing or unknown reproduction status: %s",
+                report_path,
+            )
+            continue
+
+        reproduced.append(report_path)
+
+    return reproduced
 
 
 async def _run_disclosure(

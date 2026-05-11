@@ -85,11 +85,14 @@ code-auditor --target /path/to/project [options]
 |------|------|
 | `--target` | **必需。** 要审计的项目根目录。 |
 | `--output-dir` | 输出目录（默认：`{target}/audit-output`）。 |
+| `--discovered` | 阶段 6 使用的已复现漏洞 HTML 文件（默认：`{target}/reproduced-bugs.html`）。传入路径可覆盖这个跨运行记录的读取和更新位置。 |
 | `--max-parallel` | 最大并发智能体数（默认：`1`）。 |
 | `--backend` | 智能体后端：`claude` 或 `codex`（默认：`claude`）。 |
 | `--model` | 后端模型覆盖。Claude 默认为 `claude-sonnet-4-6`；Codex 使用本地 Codex 配置默认值，除非另行指定。 |
 | `--target-au-count` | 阶段 2 的目标分析单元数量（默认：`10`）。 |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR`（默认：`INFO`）。 |
+
+默认情况下，阶段 6 会创建或更新 `{target}/reproduced-bugs.html`。在生成披露材料前，阶段 6 会读取该文件，并跳过带有匹配去重元数据的已复现漏洞。阶段 6 成功写出新的已复现漏洞披露材料后，会把新的 HTML 条目追加到同一个文件。使用 `--discovered /path/to/reproduced-bugs.html` 可改为读取并更新其他 HTML 文件。
 
 运行会自动从检查点标记恢复 —— 删除输出目录（或其 `.markers/` 子目录）以开始全新的审计。
 
@@ -115,6 +118,8 @@ code-auditor \
 ├── stage6-disclosures/       # 披露报告、邮件、压缩 PoC
 └── .markers/          # --resume 的检查点标记
 ```
+
+阶段 6 默认还会创建或更新 `{target}/reproduced-bugs.html`。这个目标根目录下的文件不在 `{output-dir}` 中，除非您通过 `--discovered` 指向其他位置。
 
 ## 项目结构
 

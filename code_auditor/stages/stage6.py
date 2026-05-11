@@ -142,7 +142,7 @@ def _load_candidate(report_path: str, config: AuditConfig, repo_url: str) -> _Di
                     "Stage 6: Finding JSON for %s is not an object; using fallback dedupe metadata.",
                     vuln_id or report_path,
                 )
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             logger.warning(
                 "Stage 6: Could not read finding JSON for %s at %s: %s; using fallback dedupe metadata.",
                 vuln_id or report_path,

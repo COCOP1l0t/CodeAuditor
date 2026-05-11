@@ -219,6 +219,39 @@ def test_stage6_handles_missing_stage4_finding_without_crashing(
     assert len(discovered.read_discovered_keys(config.discovered_path)) == 1
 
 
+def test_stage6_handles_non_utf8_stage4_finding_without_crashing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, checkpoint, _target, output_dir = _config(tmp_path)
+    stage5_report = _write_stage5_report(output_dir, "H-01", "Fallback report title")
+    finding_path = output_dir / "stage4-vulnerabilities" / "H-01.json"
+    finding_path.parent.mkdir(parents=True, exist_ok=True)
+    finding_path.write_bytes(b"\xff")
+    calls: list[str] = []
+
+    async def fake_run_disclosure(report_path: str, config: AuditConfig, *_args: object) -> str:
+        calls.append(report_path)
+        disclosure_report = (
+            Path(config.output_dir) / "stage6-disclosures" / "H-01" / "disclosure" / "report.md"
+        )
+        disclosure_report.parent.mkdir(parents=True, exist_ok=True)
+        disclosure_report.write_text("# Disclosure\n", encoding="utf-8")
+        return str(disclosure_report)
+
+    monkeypatch.setattr(stage6, "_run_disclosure", fake_run_disclosure)
+
+    disclosure_reports = asyncio.run(stage6.run_stage6([str(stage5_report)], config, checkpoint))
+
+    assert calls == [str(stage5_report)]
+    assert disclosure_reports == [
+        str(output_dir / "stage6-disclosures" / "H-01" / "disclosure" / "report.md")
+    ]
+    content = Path(config.discovered_path).read_text(encoding="utf-8")
+    assert "## Fallback report title" in content
+    assert len(discovered.read_discovered_keys(config.discovered_path)) == 1
+
+
 def test_stage6_rereads_discovered_keys_before_append(
     tmp_path: Path,
     monkeypatch,

@@ -88,6 +88,70 @@ def test_append_entries_creates_parent_header_and_clean_spacing(tmp_path: Path) 
     assert content.endswith("Details\n")
 
 
+def test_read_discovered_keys_handles_comment_terminator_in_metadata_title(tmp_path: Path) -> None:
+    path = tmp_path / "reproduced-bugs.md"
+    finding = _finding(title="A --> B")
+    repo_snapshot = {
+        "target_path": str(tmp_path),
+        "repo_url": "https://example.test/repo.git",
+        "audited_commit": "abcdef123456",
+        "version": "",
+        "description": "",
+        "dirty_status": "clean",
+        "audit_finished_date": "2026-05-11",
+    }
+    entry = build_discovered_entry(finding, repo_snapshot)
+
+    append_entries(str(path), [entry])
+
+    assert read_discovered_keys(str(path)) == {build_dedupe_key(finding, repo_snapshot["repo_url"])}
+
+
+def test_build_discovered_entry_uses_relative_link_for_artifact_under_discovered_dir(tmp_path: Path) -> None:
+    discovered_path = tmp_path / "target" / "reproduced-bugs.md"
+    stage5 = tmp_path / "target" / "stage5" / "report.md"
+
+    entry = build_discovered_entry(
+        _finding(),
+        {
+            "target_path": str(tmp_path / "target"),
+            "repo_url": "",
+            "audited_commit": "",
+            "version": "",
+            "description": "",
+            "dirty_status": "unknown",
+            "audit_finished_date": "2026-05-11",
+        },
+        discovered_path=str(discovered_path),
+        stage5_report_path=str(stage5),
+    )
+
+    assert "[Stage 5 Report](stage5/report.md)" in entry
+
+
+def test_build_discovered_entry_uses_absolute_link_for_sibling_artifact_path(tmp_path: Path) -> None:
+    discovered_path = tmp_path / "target" / "reproduced-bugs.md"
+    sibling_stage5 = tmp_path / "target-sibling" / "stage5" / "report.md"
+
+    entry = build_discovered_entry(
+        _finding(),
+        {
+            "target_path": str(tmp_path / "target"),
+            "repo_url": "",
+            "audited_commit": "",
+            "version": "",
+            "description": "",
+            "dirty_status": "unknown",
+            "audit_finished_date": "2026-05-11",
+        },
+        discovered_path=str(discovered_path),
+        stage5_report_path=str(sibling_stage5),
+    )
+
+    assert f"[Stage 5 Report]({sibling_stage5.as_posix()})" in entry
+    assert "../target-sibling/stage5/report.md" not in entry
+
+
 def test_build_discovered_entry_includes_visible_fields_and_relative_links(tmp_path: Path) -> None:
     discovered_path = tmp_path / "target" / "reproduced-bugs.md"
     output_dir = tmp_path / "target" / "audit-output"

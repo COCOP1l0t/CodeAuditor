@@ -112,7 +112,7 @@ def build_discovered_entry(
         "audited_commit": audited_commit,
         "audit_finished_date": audit_finished_date,
     }
-    metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    metadata_json = _comment_safe_json(metadata)
 
     lines = [
         f"## {title}",
@@ -248,12 +248,17 @@ def _markdown_path(path: str, discovered_path: str | None) -> str:
     if discovered_path:
         try:
             base_dir = os.path.dirname(os.path.realpath(discovered_path))
-            common_path = os.path.commonpath([base_dir, target])
-            if common_path and common_path != Path(common_path).anchor:
+            if os.path.commonpath([base_dir, target]) == base_dir:
                 return os.path.relpath(target, base_dir).replace(os.sep, "/")
         except ValueError:
             pass
     return target.replace(os.sep, "/")
+
+
+def _comment_safe_json(metadata: dict[str, str]) -> str:
+    return json.dumps(metadata, sort_keys=True, separators=(",", ":")).replace(
+        ">", "\\u003e"
+    )
 
 
 def _severity_cvss(finding: dict[str, Any]) -> str:

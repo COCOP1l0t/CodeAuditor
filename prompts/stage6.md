@@ -188,8 +188,10 @@ Subject: [Security] <concise description of the vulnerability>
 Hi,
 
 <Opening paragraph: state that you are reporting a security
-vulnerability in [project name], and briefly describethe affected
-component. e.g., "I'm writing to report a ...">
+vulnerability in [project name], and briefly describe the affected
+component. Explain that the reported bug was discovered through
+AI-assisted static code auditing and passed human validation before
+disclosure. e.g., "I'm writing to report a ...">
 
 <Affected versions paragraph: state which versions and modules are
 known to be affected.>
@@ -215,6 +217,7 @@ Regards
 - [ ] Email written to `__DISCLOSURE_DIR__/email.txt`
 - [ ] Plain-text format with lines wrapped at 72 characters
 - [ ] Email communicates the security impact and references `disclosure.zip`
+- [ ] Email states the bug was discovered by AI-assisted static code auditing and passed human validation
 - [ ] No internal audit identifiers
 
 ### Step 5: Package Artifacts

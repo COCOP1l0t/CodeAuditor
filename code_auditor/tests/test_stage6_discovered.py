@@ -173,6 +173,45 @@ def test_stage6_appends_new_entry_to_configured_discovered_path(
     assert "disclosure.zip" in content
 
 
+def test_stage6_appends_to_default_discovered_path_when_config_path_empty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "target"
+    output_dir = target / "audit-output"
+    target.mkdir(parents=True)
+    output_dir.mkdir()
+    config = AuditConfig(
+        target=str(target),
+        output_dir=str(output_dir),
+        max_parallel=1,
+    )
+    checkpoint = CheckpointManager(str(output_dir), resume=True)
+    _write_stage4_finding(output_dir, "H-01", _finding())
+    stage5_report = _write_stage5_report(output_dir, "H-01", "Length underflow reaches memcpy")
+
+    async def fake_run_disclosure(report_path: str, config: AuditConfig, *_args: object) -> str:
+        disclosure_report = (
+            Path(config.output_dir) / "stage6-disclosures" / "H-01" / "disclosure" / "report.md"
+        )
+        disclosure_report.parent.mkdir(parents=True, exist_ok=True)
+        disclosure_report.write_text("# Disclosure\n", encoding="utf-8")
+        return str(disclosure_report)
+
+    monkeypatch.setattr(stage6, "_run_disclosure", fake_run_disclosure)
+
+    disclosure_reports = asyncio.run(stage6.run_stage6([str(stage5_report)], config, checkpoint))
+
+    assert disclosure_reports == [
+        str(output_dir / "stage6-disclosures" / "H-01" / "disclosure" / "report.md")
+    ]
+    discovered_path = target / "reproduced-bugs.md"
+    assert discovered_path.exists()
+    assert discovered.read_discovered_keys(str(discovered_path)) == {
+        discovered.build_dedupe_key(_finding(), "")
+    }
+
+
 def test_stage6_does_not_append_when_disclosure_returns_none(
     tmp_path: Path,
     monkeypatch,

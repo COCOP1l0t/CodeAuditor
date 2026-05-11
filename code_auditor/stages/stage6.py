@@ -10,7 +10,7 @@ from typing import Any
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
-from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
+from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig, resolve_discovered_path
 from ..discovered import (
     append_entries,
     build_dedupe_key,
@@ -179,8 +179,9 @@ def _filter_discovered_duplicates(
     stage5_reports: list[str],
     config: AuditConfig,
     repo_url: str,
+    discovered_path: str,
 ) -> list[_DisclosureCandidate]:
-    existing_keys = read_discovered_keys(config.discovered_path)
+    existing_keys = read_discovered_keys(discovered_path)
     seen_keys: set[str] = set()
     candidates: list[_DisclosureCandidate] = []
 
@@ -217,20 +218,20 @@ def _existing_artifact(disclosure_report: str, filename: str) -> str | None:
 
 def _append_discovered_entries(
     successes: list[tuple[_DisclosureCandidate, str]],
-    config: AuditConfig,
     repo_snapshot: dict[str, str],
+    discovered_path: str,
 ) -> None:
     if not successes:
         return
 
-    latest_keys = read_discovered_keys(config.discovered_path)
+    latest_keys = read_discovered_keys(discovered_path)
     entries: list[str] = []
     for candidate, disclosure_report in successes:
         if candidate.dedupe_key in latest_keys:
             logger.info(
                 "Stage 6: Not recording %s because it was already added to %s.",
                 _candidate_label(candidate),
-                config.discovered_path,
+                discovered_path,
             )
             continue
 
@@ -238,7 +239,7 @@ def _append_discovered_entries(
             build_discovered_entry(
                 candidate.finding,
                 repo_snapshot,
-                discovered_path=config.discovered_path,
+                discovered_path=discovered_path,
                 stage4_finding_path=candidate.finding_path,
                 stage5_report_path=candidate.report_path,
                 stage6_report_path=disclosure_report,
@@ -248,7 +249,7 @@ def _append_discovered_entries(
         )
         latest_keys.add(candidate.dedupe_key)
 
-    append_entries(config.discovered_path, entries)
+    append_entries(discovered_path, entries)
 
 
 def _filter_reproduced(stage5_reports: list[str]) -> list[str]:
@@ -381,7 +382,13 @@ async def run_stage6(
 
     repo_snapshot = collect_repo_snapshot(config.target)
     repo_url = repo_snapshot.get("repo_url", "")
-    candidates = _filter_discovered_duplicates(reproduced, config, repo_url)
+    discovered_path = resolve_discovered_path(config)
+    candidates = _filter_discovered_duplicates(
+        reproduced,
+        config,
+        repo_url,
+        discovered_path,
+    )
     if not candidates:
         logger.info(
             "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after discovered-bug dedupe."
@@ -408,7 +415,7 @@ async def run_stage6(
             disclosure_reports.append(value)
             successful_disclosures.append((candidates[i], value))
 
-    _append_discovered_entries(successful_disclosures, config, repo_snapshot)
+    _append_discovered_entries(successful_disclosures, repo_snapshot, discovered_path)
 
     logger.info(
         "Stage 6 complete. %d disclosure packages prepared (from %d reproduced vulnerabilities).",

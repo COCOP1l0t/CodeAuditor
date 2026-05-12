@@ -94,6 +94,8 @@ code-auditor --target /path/to/project [options]
 
 By default, Stage 6 creates or updates `{target}/reproduced-bugs.html`. Before generating disclosures, Stage 6 reads this file and skips reproduced bugs with matching dedupe metadata. After Stage 6 successfully writes disclosure output for a new reproduced bug, it appends a new HTML entry to the same file. Use `--discovered /path/to/reproduced-bugs.html` to read and update a different HTML file.
 
+The HTML record uses one collapsible section per reproduced bug. Each section carries a visible review status tag and matching machine-readable status fields for `unreviewed`, `reported`, `confirmed`, `rejected`, or `duplicated`.
+
 Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
 ### Example

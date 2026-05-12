@@ -94,6 +94,8 @@ code-auditor --target /path/to/project [options]
 
 默认情况下，阶段 6 会创建或更新 `{target}/reproduced-bugs.html`。在生成披露材料前，阶段 6 会读取该文件，并跳过带有匹配去重元数据的已复现漏洞。阶段 6 成功写出新的已复现漏洞披露材料后，会把新的 HTML 条目追加到同一个文件。使用 `--discovered /path/to/reproduced-bugs.html` 可改为读取并更新其他 HTML 文件。
 
+该 HTML 记录为每个已复现漏洞使用一个可折叠区块。每个区块都有可见的审核状态标签，并带有一致的机器可读状态字段，支持 `unreviewed`、`reported`、`confirmed`、`rejected`、`duplicated`。
+
 运行会自动从检查点标记恢复 —— 删除输出目录（或其 `.markers/` 子目录）以开始全新的审计。
 
 ### 示例

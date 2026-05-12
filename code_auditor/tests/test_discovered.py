@@ -146,6 +146,30 @@ def test_append_entries_creates_parent_header_and_clean_spacing(tmp_path: Path) 
     assert content.endswith("</main>\n</body>\n</html>\n")
 
 
+def test_append_entries_includes_status_json_load_and_export_controls(tmp_path: Path) -> None:
+    path = tmp_path / "reproduced-bugs.html"
+
+    append_entries(
+        str(path),
+        [
+            '<details class="reproduced-bug" data-dedupe-key="sha256:abc" data-review-status="unreviewed">'
+            '<summary><span class="bug-title">Bug One</span></summary></details>',
+        ],
+    )
+
+    content = path.read_text(encoding="utf-8")
+    assert 'class="load-status-json"' in content
+    assert 'Load status JSON' in content
+    assert 'class="export-status-json"' in content
+    assert 'Export status JSON' in content
+    assert 'class="status-json-input"' in content
+    assert 'accept="application/json,.json"' in content
+    assert "function currentStatusMap()" in content
+    assert "function exportStatusJson()" in content
+    assert "function loadSelectedStatusJson(file)" in content
+    assert 'download = statusJsonFileName' in content
+
+
 def test_read_discovered_keys_handles_comment_terminator_in_metadata_title(tmp_path: Path) -> None:
     path = tmp_path / "reproduced-bugs.html"
     finding = _finding(title="A --> B")

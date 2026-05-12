@@ -203,6 +203,43 @@ ul { padding-left: 1.4rem; }
     }
   }
 
+  function currentStatusMap() {
+    const statusMap = {};
+    reproducedBugs().forEach((details) => {
+      const dedupeKey = details.dataset.dedupeKey || "";
+      const status = details.dataset.reviewStatus || "unreviewed";
+      if (dedupeKey && statuses.has(status)) {
+        statusMap[dedupeKey] = status;
+      }
+    });
+    return statusMap;
+  }
+
+  function statusJsonText() {
+    const sortedStatusMap = {};
+    Object.entries(currentStatusMap()).sort(([leftKey], [rightKey]) => {
+      return leftKey.localeCompare(rightKey);
+    }).forEach(([dedupeKey, status]) => {
+      sortedStatusMap[dedupeKey] = status;
+    });
+    return JSON.stringify(sortedStatusMap, null, 2) + "\\n";
+  }
+
+  function exportStatusJson() {
+    const blob = new Blob([statusJsonText()], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = statusJsonFileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 0);
+    setSaveStatus("Exported " + statusJsonFileName + ".");
+  }
+
   function normalizeStatusMap(rawStatusMap) {
     const source = rawStatusMap && typeof rawStatusMap === "object" && rawStatusMap.statuses
       ? rawStatusMap.statuses
@@ -252,9 +289,36 @@ ul { padding-left: 1.4rem; }
     }
   }
 
+  function loadSelectedStatusJson(file) {
+    if (!file) {
+      return;
+    }
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      try {
+        const applied = applyStatusMap(JSON.parse(String(reader.result || "")));
+        setSaveStatus("Loaded " + applied + " statuses from " + file.name + ".");
+      } catch (_error) {
+        setSaveStatus("Could not load status JSON.");
+      }
+    });
+    reader.addEventListener("error", () => {
+      setSaveStatus("Could not load status JSON.");
+    });
+    reader.readAsText(file);
+  }
+
   document.addEventListener("change", (event) => {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || input.type !== "radio") {
+    if (!(input instanceof HTMLInputElement)) {
+      return;
+    }
+    if (input.classList.contains("status-json-input")) {
+      loadSelectedStatusJson(input.files ? input.files[0] : null);
+      input.value = "";
+      return;
+    }
+    if (input.type !== "radio") {
       return;
     }
     if (!input.name.startsWith("review-status-")) {
@@ -273,6 +337,18 @@ ul { padding-left: 1.4rem; }
     const button = event.target.closest(".status-filter button[data-status-filter]");
     if (button) {
       applyStatusFilter(button.dataset.statusFilter || "all");
+      return;
+    }
+    const loadButton = event.target.closest(".load-status-json");
+    if (loadButton) {
+      const input = document.querySelector(".status-json-input");
+      if (input) {
+        input.click();
+      }
+      return;
+    }
+    if (event.target.closest(".export-status-json")) {
+      exportStatusJson();
     }
   });
 
@@ -300,6 +376,9 @@ ul { padding-left: 1.4rem; }
 <button type="button" data-status-filter="duplicated" aria-pressed="false">Duplicated <span class="filter-count">0</span></button>
 </div>
 <div class="status-actions">
+<button type="button" class="load-status-json">Load status JSON</button>
+<button type="button" class="export-status-json">Export status JSON</button>
+<input type="file" class="status-json-input" accept="application/json,.json" hidden>
 <output class="save-status" aria-live="polite"></output>
 </div>
 </fieldset>

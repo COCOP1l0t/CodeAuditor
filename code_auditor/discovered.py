@@ -225,8 +225,8 @@ ul { padding-left: 1.4rem; }
     return JSON.stringify(sortedStatusMap, null, 2) + "\\n";
   }
 
-  function exportStatusJson() {
-    const blob = new Blob([statusJsonText()], { type: "application/json" });
+  function downloadStatusJson(text) {
+    const blob = new Blob([text], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -238,6 +238,35 @@ ul { padding-left: 1.4rem; }
       URL.revokeObjectURL(url);
     }, 0);
     setSaveStatus("Exported " + statusJsonFileName + ".");
+  }
+
+  async function exportStatusJson() {
+    const text = statusJsonText();
+    if (typeof window.showSaveFilePicker !== "function") {
+      downloadStatusJson(text);
+      return;
+    }
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: statusJsonFileName,
+        types: [
+          {
+            description: "JSON files",
+            accept: { "application/json": [".json"] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(text);
+      await writable.close();
+      setSaveStatus("Saved " + (handle.name || statusJsonFileName) + ".");
+    } catch (_error) {
+      if (_error && _error.name === "AbortError") {
+        setSaveStatus("Export canceled.");
+        return;
+      }
+      downloadStatusJson(text);
+    }
   }
 
   function normalizeStatusMap(rawStatusMap) {

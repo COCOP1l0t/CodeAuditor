@@ -166,6 +166,11 @@ def test_append_entries_includes_status_json_load_and_export_controls(tmp_path: 
     assert 'accept="application/json,.json"' in content
     assert "function currentStatusMap()" in content
     assert "function exportStatusJson()" in content
+    assert "function downloadStatusJson(text)" in content
+    assert "window.showSaveFilePicker" in content
+    assert "suggestedName: statusJsonFileName" in content
+    assert "const writable = await handle.createWritable()" in content
+    assert "await writable.write(text)" in content
     assert "function loadSelectedStatusJson(file)" in content
     assert 'download = statusJsonFileName' in content
 

@@ -52,7 +52,7 @@ async def _run_unit(
             progress,
             unit.id,
         )
-        for finding_file in invalid_files:
+        for finding_file in finding_files:
             with suppress(OSError):
                 os.remove(finding_file)
         checkpoint.clear(key)

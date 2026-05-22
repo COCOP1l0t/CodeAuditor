@@ -11,7 +11,7 @@ from ..config import AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..utils import (
-    _natural_sort_key,
+    natural_sort_key,
     format_validation_issues,
     list_json_files,
     run_parallel_limited,
@@ -200,7 +200,7 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
 
     finalized.sort(key=lambda a: (
         {"C": 0, "H": 1, "M": 2, "L": 3}.get(os.path.basename(a).split("-")[0], 99),
-        _natural_sort_key(a),
+        natural_sort_key(a),
     ))
     return finalized
 

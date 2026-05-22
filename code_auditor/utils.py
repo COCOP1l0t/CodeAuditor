@@ -35,7 +35,7 @@ async def run_parallel_limited(
     return results
 
 
-def _natural_sort_key(s: str) -> list:
+def natural_sort_key(s: str) -> list[int | str]:
     """Sort key for natural ordering of strings containing numbers.
 
     Ensures e.g. 'AU-2' sorts before 'AU-10' instead of after 'AU-1'.
@@ -47,14 +47,14 @@ def list_json_files(dir_path: str) -> list[str]:
     p = Path(dir_path)
     if not p.is_dir():
         return []
-    return sorted((str(f) for f in p.iterdir() if f.is_file() and f.suffix == ".json"), key=_natural_sort_key)
+    return sorted((str(f) for f in p.iterdir() if f.is_file() and f.suffix == ".json"), key=natural_sort_key)
 
 
 def list_matching_files(dir_path: str, pattern: re.Pattern[str]) -> list[str]:
     p = Path(dir_path)
     if not p.is_dir():
         return []
-    return sorted((str(f) for f in p.iterdir() if f.is_file() and pattern.search(f.name)), key=_natural_sort_key)
+    return sorted((str(f) for f in p.iterdir() if f.is_file() and pattern.search(f.name)), key=natural_sort_key)
 
 
 def format_validation_issues(issues: list[ValidationIssue]) -> str:

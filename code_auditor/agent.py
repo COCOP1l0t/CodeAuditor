@@ -103,8 +103,9 @@ async def _run_agent_attempt_with_stale_log_watch(
     *,
     log_file: str | None,
     run_control: _AgentRunControl,
+    enable_stale_watch: bool = True,
 ) -> str:
-    if not log_file:
+    if not log_file or not enable_stale_watch:
         return await attempt
 
     agent_task = asyncio.create_task(attempt)
@@ -544,6 +545,7 @@ async def _run_codex_agent(
                     run_codex_turn(),
                     log_file=log_file,
                     run_control=run_control,
+                    enable_stale_watch=False,
                 )
                 if log_fh:
                     log_fh.write(text)

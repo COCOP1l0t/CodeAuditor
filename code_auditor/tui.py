@@ -508,7 +508,7 @@ class TUIManager:
     Usage::
 
         tui = TUIManager()
-        tui.configure(target="/path", output_dir="...", backend="claude", ...)
+        tui.configure(target="/path", output_dir="...", discovered_path="...", wiki_path="...", backend="claude", ...)
         tui.start()
 
         # Inside orchestrator:

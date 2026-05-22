@@ -65,5 +65,6 @@ def build_wiki_context(config: AuditConfig, stage: int) -> str:
         "Prefer `index.md` for navigation when it exists.",
         stage_guidance,
     ])
-    logger.info("Injecting wiki context into stage %s prompt:\n%s", stage, context)
+    logger.info("Injecting wiki context into stage %s prompt (wiki root: %s)", stage, config.wiki_path)
+    logger.debug("Wiki context content:\n%s", context)
     return context

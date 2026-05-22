@@ -55,6 +55,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable per-stage agent timeouts",
     )
     parser.add_argument(
+        "--skip-stages",
+        type=int,
+        nargs="+",
+        default=[],
+        help="Skip the specified stage numbers (e.g., --skip-stages 5 6)",
+    )
+    parser.add_argument(
         "--tui",
         action="store_true",
         help="Launch the interactive TUI dashboard",
@@ -116,6 +123,7 @@ def main() -> None:
         model=args.model,
         target_au_count=args.target_au_count,
         agent_timeout_seconds=agent_timeout_seconds,
+        skip_stages=args.skip_stages,
     )
 
     if args.tui:

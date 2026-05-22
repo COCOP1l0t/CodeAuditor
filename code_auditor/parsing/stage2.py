@@ -5,7 +5,7 @@ import os
 import re
 
 from ..config import AnalysisUnit
-from ..utils import _natural_sort_key
+from ..utils import natural_sort_key
 
 
 def parse_au_files(result_dir: str) -> list[AnalysisUnit]:
@@ -16,7 +16,7 @@ def parse_au_files(result_dir: str) -> list[AnalysisUnit]:
     if not os.path.isdir(result_dir):
         return units
 
-    for name in sorted(os.listdir(result_dir), key=_natural_sort_key):
+    for name in sorted(os.listdir(result_dir), key=natural_sort_key):
         m = pattern.match(name)
         if not m:
             continue

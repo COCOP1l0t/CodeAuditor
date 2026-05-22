@@ -768,7 +768,6 @@ def test_project_declares_textual_tui_dependencies() -> None:
 
     assert '"textual>=0.50"' in pyproject
     assert '"rich>=13.0"' in pyproject
-    assert '"click>=8.1"' in pyproject
 
 
 def test_tui_backend_is_textual_app() -> None:

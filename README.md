@@ -56,6 +56,12 @@ Stage 1 produces two directives — an *auditing focus* and *vulnerability crite
                                                                         └─────────────┘
 ```
 
+## TUI Dashboard
+
+Run with `--tui` to launch the interactive terminal dashboard:
+
+![TUI Dashboard](docs/images/tui-dashboard.png)
+
 ## Requirements
 
 - Python **3.12+**

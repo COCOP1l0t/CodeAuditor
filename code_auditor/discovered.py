@@ -444,6 +444,31 @@ def read_discovered_keys(path: str) -> set[str]:
     return keys
 
 
+def read_discovered_entries(path: str) -> list[dict[str, Any]]:
+    """Read full metadata entries from embedded discovered-bug JSON comments."""
+    discovered_path = Path(path)
+    if not discovered_path.exists():
+        return []
+
+    try:
+        content = discovered_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for match in _COMMENT_RE.finditer(content):
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(payload, dict):
+            dedupe_key = payload.get("dedupe_key")
+            if isinstance(dedupe_key, str) and dedupe_key:
+                entries.append(payload)
+    return entries
+
+
 def build_dedupe_key(finding: dict[str, Any], repo_url: str | None) -> str:
     """Build a stable cross-run key for the same vulnerability shape."""
     trace = finding.get("data_flow_trace")
@@ -516,6 +541,11 @@ def build_discovered_entry(
         "audited_commit": audited_commit,
         "audit_finished_date": audit_finished_date,
         "review_status": review_status,
+        "location": _single_line(finding.get("location")),
+        "cwe": ", ".join(_display_list(finding.get("cwe_id") or finding.get("cwe"))),
+        "vulnerability_class": ", ".join(_display_list(finding.get("vulnerability_class"))),
+        "trigger": _single_line(finding.get("trigger")),
+        "summary": _single_line(finding.get("summary") or finding.get("description")),
     }
     metadata_json = _comment_safe_json(metadata)
 

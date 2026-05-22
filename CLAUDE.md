@@ -2,12 +2,19 @@
 
 Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target project, it researches security context → decomposes the codebase into analysis units → findings → vulnerabilities → PoC reproduction → disclosure preparation.
 
-## Quick reference
+## Codex SDK Guidance
 
-- **Language**: Python >=3.12
-- **Package manager**: pip (uses `pyproject.toml`, hatchling backend)
-- **Entry point**: `code-auditor` CLI → `code_auditor/__main__.py:main`
-- **Agent backend**: `claude-code-sdk` async `query()` API
+Rechecked against the upstream Codex Python SDK README on 2026-05-21:
+https://github.com/openai/codex/blob/main/sdk/python/README.md
+
+- The current upstream SDK package is `openai-codex`, imported as `openai_codex`.
+- Import the ergonomic client API from `openai_codex`, including `AsyncCodex`, `Codex`, `AppServerConfig`, and `ApprovalMode`.
+- Import app-server value/event types from `openai_codex.types`, including `ReasoningEffort` and `SandboxPolicy`.
+- `thread.run(...)` and `thread.turn(...).run()` return `TurnResult`; `final_response` can be `None`.
+- Service tier in the current SDK is a string field. Use `"fast"` or `"flex"`; do not pass stale `"priority"` values or rely on the old generated `ServiceTier` enum.
+- Published SDK builds pin an exact `openai-codex-cli-bin` runtime dependency with the same version as the SDK. Only pass `AppServerConfig(codex_bin=...)` when intentionally running a specific local `codex app-server` binary.
+
+This repo's backend should prefer `openai_codex` when available and keep the legacy `codex_app_server` fallback only for environments that cannot install the current SDK yet. Before replacing the project dependency with upstream `openai-codex`, verify installation with a dry run in the target Python environment; on this Linux environment, the upstream `main` SDK at `c07f66c9ecca61531b12958537c76d3b1fffde72` still required `openai-codex-cli-bin==0.131.0a4`, which pip could not resolve for this platform.
 
 ## Running
 
@@ -16,54 +23,31 @@ Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target
 pip install -e .
 
 # Run an audit
-code-auditor --target /path/to/project [--output-dir DIR] [--max-parallel 2] [--resume] [--skip-stages 0,4] [--log-level DEBUG]
+code-auditor --target /path/to/project [options]
 
-# Required args
-#   --target           Root directory of project to audit
-# Optional args
-#   --output-dir       Defaults to {target}/audit-output
-#   --wiki            LLM wiki knowledge base directory (treated as read-only)
-#   --max-parallel     Concurrent agents (default 2)
-#   --resume           Resume from checkpoint markers
-#   --threat-model     Override default threat model text
-#   --scope            Additional scope instructions for stage 1
-#   --skip-stages      Comma-separated stage numbers to skip (0–6)
-#   --only-stage       Run only this stage (+ stage 0); mutually exclusive with --skip-stages
-#   --model            Claude model to use (default claude-sonnet-4-6)
-#   --target-au-count  Target number of analysis units for stage 2 (default 30)
-#   --enable-timeout
-#                      Enable per-stage agent timeouts (default: disabled)
-#   --log-level        DEBUG|INFO|WARNING|ERROR (default INFO)
+# Required
+#   --target           Root directory of the project to audit
+
+# Common options
+#   --output-dir       Output directory (default: {target}/audit-output-YYYYMMDD)
+#   --discovered       Reproduced bugs HTML file (default: {target}/reproduced-bugs.html)
+#   --wiki             Read-only LLM wiki knowledge base directory
+#   --max-parallel     Max concurrent agents (default: 1)
+#   --backend          Agent backend: claude | codex (default: claude)
+#   --model            Model override (Claude default: claude-sonnet-4-6; Codex default: gpt-5.4)
+#   --target-au-count  Target number of analysis units for stage 2 (default: 10)
+#   --enable-timeout   Enable per-stage agent timeouts
+#   --tui              Launch the interactive TUI dashboard
+#   --log-level        DEBUG|INFO|WARNING|ERROR (default: INFO)
 ```
 
 ## Testing
 
 ```bash
-pytest                                    # run all tests
-pytest code_auditor/tests/            # same thing
-pytest -k test_stage2                     # filter by name
+pytest -q
 ```
 
-Tests are in `code_auditor/tests/test_parsers_and_report.py`. They cover parsers and validators — no agent calls needed.
-
-## Project layout
-
-```
-code_auditor/
-├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
-├── config.py            # AuditConfig, Module, AnalysisUnit, ValidationIssue dataclasses
-├── orchestrator.py      # Sequential stage runner
-├── agent.py             # claude-code-sdk wrapper + validation retry loop
-├── prompts.py           # load_prompt() with __KEY__ substitution
-├── checkpoint.py        # File/marker-based checkpoint/resume
-├── logger.py            # stdlib logging wrapper
-├── utils.py             # run_parallel_limited, file helpers, severity sort
-├── stages/              # stage0–stage6 (one file per stage)
-├── parsing/             # stage2.py — extract structured data from agent output
-├── validation/          # common.py + stage1–stage6 — validate agent output format
-└── tests/
-prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
-```
+Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and validators only, no agent calls.
 
 ## Architecture (7 stages)
 
@@ -85,3 +69,22 @@ prompts/                 # stage1.md–stage6.md — prompt templates with __KEY
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
 - **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
+
+## Project layout
+
+```
+code_auditor/
+├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
+├── config.py            # AuditConfig, Module, AnalysisUnit, ValidationIssue dataclasses
+├── orchestrator.py      # Sequential stage runner
+├── agent.py             # claude-code-sdk wrapper + validation retry loop
+├── prompts.py           # load_prompt() with __KEY__ substitution
+├── checkpoint.py        # File/marker-based checkpoint/resume
+├── logger.py            # stdlib logging wrapper
+├── utils.py             # run_parallel_limited, file helpers, severity sort
+├── stages/              # stage0–stage6 (one file per stage)
+├── parsing/             # stage2.py — extract structured data from agent output
+├── validation/          # common.py + stage1–stage6 — validate agent output format
+└── tests/
+prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
+```

@@ -16,6 +16,10 @@ Your primary focus remains the code and concerns described in the analysis unit.
 
 Your task: discover security bugs and vulnerabilities in the assigned codebase.
 
+## Wiki Knowledge Base
+
+__WIKI_CONTEXT__
+
 ## Output
 
 For each confirmed vulnerability, write one JSON file to `__RESULT_DIR__/` named `__FINDING_PREFIX__-F-{NN}.json` (zero-padded: F-01, F-02, ...).

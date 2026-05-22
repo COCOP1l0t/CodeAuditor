@@ -30,6 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--target", required=True, help="Root directory of the project to audit")
     parser.add_argument("--output-dir", help="Output directory (default: {target}/audit-output-YYYYMMDD)")
+    parser.add_argument("--wiki", help="Read-only LLM wiki knowledge base directory")
     parser.add_argument(
         "--discovered",
         help="Reproduced bugs HTML file (default: {target}/reproduced-bugs.html)",
@@ -60,6 +61,20 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_wiki_path(path: str | None) -> str | None:
+    if not path:
+        return None
+
+    resolved = os.path.realpath(path)
+    if not os.path.exists(resolved):
+        print(f"Error: Wiki directory not found: {resolved}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isdir(resolved):
+        print(f"Error: Wiki path is not a directory: {resolved}", file=sys.stderr)
+        sys.exit(1)
+    return resolved
+
+
 def _resolve_discovered_path(path: str | None, target: str) -> str:
     resolved = os.path.realpath(path or os.path.join(target, "reproduced-bugs.html"))
     if path is not None and os.path.isdir(resolved):
@@ -83,6 +98,7 @@ def main() -> None:
         sys.exit(1)
 
     output_dir = os.path.realpath(args.output_dir or _default_output_dir(target))
+    wiki_path = _resolve_wiki_path(args.wiki)
     discovered_path = _resolve_discovered_path(args.discovered, target)
 
     skip_stages = [5, 6] if args.audit_only else []
@@ -90,6 +106,7 @@ def main() -> None:
     config = AuditConfig(
         target=target,
         output_dir=output_dir,
+        wiki_path=wiki_path,
         discovered_path=discovered_path,
         max_parallel=args.max_parallel,
         resume=True,

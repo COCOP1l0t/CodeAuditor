@@ -26,6 +26,10 @@ All disclosure artifacts must be written under:
 
 Start by reading the vulnerability report and PoC artifacts to understand the finding, then proceed through the workflow.
 
+## Wiki Knowledge Base
+
+__WIKI_CONTEXT__
+
 ---
 
 ## Red Flags — STOP If You Catch Yourself Doing These

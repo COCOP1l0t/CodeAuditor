@@ -22,6 +22,7 @@ from ..logger import get_logger
 from ..prompts import load_prompt
 from ..reproduction_status import is_failed_status, is_reproduced_status, read_reproduction_status
 from ..utils import run_parallel_limited
+from ..wiki import build_wiki_context
 
 logger = get_logger("stage6")
 
@@ -329,6 +330,7 @@ async def _run_disclosure(
         "target_path": config.target,
         "disclosure_dir": disclosure_dir,
         "vuln_id": vuln_id,
+        "wiki_context": build_wiki_context(config, stage=6),
     })
 
     log_file = os.path.join(stage6_vuln_dir, "agent.log")

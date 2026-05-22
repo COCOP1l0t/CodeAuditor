@@ -12,6 +12,7 @@ from ..logger import get_logger
 from ..prompts import load_prompt
 from ..reproduction_status import is_failed_status, read_reproduction_status
 from ..utils import run_parallel_limited
+from ..wiki import build_wiki_context
 
 logger = get_logger("stage5")
 
@@ -97,6 +98,7 @@ async def _run_reproduce(
         "target_path": config.target,
         "poc_dir": poc_dir,
         "finding_id": vuln_id,
+        "wiki_context": build_wiki_context(config, stage=5),
     })
 
     log_file = os.path.join(poc_dir, "agent.log")

@@ -11,6 +11,7 @@ from ..config import AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..validation.stage1 import validate_stage1_file
+from ..wiki import build_wiki_context
 
 logger = get_logger("stage1")
 _TASK_KEY = "stage1"
@@ -51,6 +52,7 @@ async def run_stage1(
         "today": today,
         "start_date": start_date,
         "user_instructions": config.scope or "No additional scope constraints.",
+        "wiki_context": build_wiki_context(config, stage=1),
     })
 
     passed, _ = await run_with_validation(

@@ -38,6 +38,17 @@ def test_cli_accepts_codex_backend_and_model_override() -> None:
     assert args.model == "gpt-5.4"
 
 
+def test_cli_accepts_wiki_path() -> None:
+    args = _build_parser().parse_args([
+        "--target",
+        ".",
+        "--wiki",
+        "/tmp/wiki",
+    ])
+
+    assert args.wiki == "/tmp/wiki"
+
+
 def test_cli_accepts_discovered_path() -> None:
     args = _build_parser().parse_args([
         "--target",
@@ -53,6 +64,33 @@ def test_cli_accepts_tui_flag() -> None:
     args = _build_parser().parse_args(["--target", ".", "--tui"])
 
     assert args.tui is True
+
+
+def test_main_maps_wiki_path_to_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, AuditConfig] = {}
+    target = tmp_path / "target"
+    wiki = tmp_path / "wiki"
+    target.mkdir()
+    wiki.mkdir()
+
+    async def fake_run_audit(config: AuditConfig) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--wiki",
+        str(wiki),
+    ])
+
+    main_module.main()
+
+    assert captured["config"].wiki_path == str(wiki.resolve())
 
 
 def test_main_maps_omitted_discovered_to_target_reproduced_bugs_html(
@@ -207,6 +245,88 @@ def test_tui_mode_runs_audit_through_textual_manager(
         "model": None,
         "max_parallel": 1,
     }
+
+
+def test_main_rejects_missing_wiki_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "target"
+    missing_wiki = tmp_path / "missing-wiki"
+    target.mkdir()
+
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--wiki",
+        str(missing_wiki),
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.main()
+
+    assert exc.value.code == 1
+    assert f"Error: Wiki directory not found: {missing_wiki.resolve()}" in capsys.readouterr().err
+
+
+def test_main_rejects_wiki_file_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "target"
+    wiki_file = tmp_path / "wiki.md"
+    target.mkdir()
+    wiki_file.write_text("# Not a directory\n")
+
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--wiki",
+        str(wiki_file),
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.main()
+
+    assert exc.value.code == 1
+    assert f"Error: Wiki path is not a directory: {wiki_file.resolve()}" in capsys.readouterr().err
+
+
+def test_additional_directories_includes_existing_wiki_path(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    target = tmp_path / "target"
+    output = tmp_path / "output"
+    wiki = tmp_path / "wiki"
+    target.mkdir()
+    output.mkdir()
+    wiki.mkdir()
+    config = AuditConfig(
+        target=str(target),
+        output_dir=str(output),
+        wiki_path=str(wiki),
+    )
+
+    assert agent._additional_directories(config, str(target)) == [
+        str(output.resolve()),
+        str(wiki.resolve()),
+    ]
+
+
+def test_additional_directories_skips_wiki_when_it_is_cwd(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    target = tmp_path / "target"
+    output = tmp_path / "output"
+    target.mkdir()
+    output.mkdir()
+    config = AuditConfig(
+        target=str(target),
+        output_dir=str(output),
+        wiki_path=str(target),
+    )
+
+    assert agent._additional_directories(config, str(target)) == [str(output.resolve())]
 
 
 def test_textual_tui_runs_audit_outside_app_thread(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -22,6 +22,7 @@ DEFAULT_THREAT_MODEL = (
 class AuditConfig:
     target: str
     output_dir: str
+    wiki_path: str | None = None
     discovered_path: str = ""
     max_parallel: int = 1
     threat_model: str = DEFAULT_THREAT_MODEL

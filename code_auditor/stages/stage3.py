@@ -10,6 +10,7 @@ from ..logger import get_logger
 from ..prompts import load_prompt
 from ..utils import format_validation_issues, list_matching_files, run_parallel_limited
 from ..validation.stage3 import validate_stage3_file
+from ..wiki import build_wiki_context
 
 logger = get_logger("stage3")
 
@@ -45,6 +46,7 @@ async def _run_unit(
         "finding_prefix": unit.id,
         "auditing_focus_path": auditing_focus_path,
         "vuln_criteria_path": vuln_criteria_path,
+        "wiki_context": build_wiki_context(config, stage=3),
     })
 
     await run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)

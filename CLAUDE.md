@@ -23,11 +23,13 @@ code-auditor --target /path/to/project [options]
 
 # Common options
 #   --output-dir       Output directory (default: {target}/audit-output)
+#   --wiki             Read-only LLM wiki knowledge base directory
 #   --max-parallel     Max concurrent agents (default: 1)
 #   --backend          Agent backend: claude | codex (default: claude)
 #   --model            Model override
 #   --target-au-count  Target number of analysis units for stage 2 (default: 10)
 #   --audit-only       Run only stages 1-4
+#   --tui              Launch the interactive TUI dashboard
 #   --log-level        DEBUG|INFO|WARNING|ERROR (default: INFO)
 ```
 

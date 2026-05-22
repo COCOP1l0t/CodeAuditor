@@ -16,6 +16,7 @@ from ..discovered import (
     build_dedupe_key,
     build_discovered_entry,
     collect_repo_snapshot,
+    read_discovered_entries,
     read_discovered_keys,
 )
 from ..logger import get_logger
@@ -74,6 +75,13 @@ def _read_text(path: str) -> str:
 
 def _single_line(value: object) -> str:
     return " ".join(str(value or "").strip().split())
+
+
+def _display_list(value: object) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [_single_line(item) for item in value if _single_line(item)]
+    text = _single_line(value)
+    return [text] if text else []
 
 
 def _extract_report_title(report_path: str) -> str | None:
@@ -210,6 +218,100 @@ def _filter_discovered_duplicates(
         candidates.append(candidate)
 
     return candidates
+
+
+_MAX_DEDUPE_TURNS = 30
+_DEFAULT_DEDUPE_EFFORT = "low"
+
+
+async def _filter_semantic_duplicates(
+    candidates: list[_DisclosureCandidate],
+    discovered_path: str,
+    config: AuditConfig,
+) -> list[_DisclosureCandidate]:
+    """Use an LLM agent to compare candidates against existing HTML entries for semantic duplication."""
+    existing_entries = read_discovered_entries(discovered_path)
+    if not existing_entries:
+        return candidates
+
+    logger.info(
+        "Stage 6: Running semantic deduplication against %d existing entries.",
+        len(existing_entries),
+    )
+
+    existing_text = "\n\n".join(
+        (
+            f"Entry {i + 1}\n"
+            f"- dedupe_key: {entry.get('dedupe_key', '')}\n"
+            f"- title: {entry.get('title', '')}\n"
+            f"- location: {entry.get('location', '')}\n"
+            f"- cwe: {entry.get('cwe', '')}\n"
+            f"- vulnerability_class: {entry.get('vulnerability_class', '')}\n"
+            f"- trigger: {entry.get('trigger', '')}\n"
+            f"- summary: {entry.get('summary', '')}"
+        )
+        for i, entry in enumerate(existing_entries)
+    )
+
+    filtered: list[_DisclosureCandidate] = []
+    for candidate in candidates:
+        label = _candidate_label(candidate)
+        prompt = load_prompt("stage6_dedupe.md", {
+            "candidate_title": candidate.title,
+            "candidate_location": _single_line(candidate.finding.get("location")),
+            "candidate_cwe": ", ".join(_display_list(candidate.finding.get("cwe_id") or candidate.finding.get("cwe"))),
+            "candidate_vuln_class": ", ".join(_display_list(candidate.finding.get("vulnerability_class"))),
+            "candidate_trigger": _single_line(candidate.finding.get("trigger")),
+            "candidate_summary": _single_line(candidate.finding.get("summary") or candidate.finding.get("description")),
+            "existing_entries": existing_text,
+        })
+
+        log_file = os.path.join(
+            config.output_dir, "stage6-disclosures", ".dedupe-logs", f"{candidate.vuln_id or 'unknown'}.log"
+        )
+        try:
+            result = await run_agent(
+                prompt,
+                config,
+                cwd=config.target,
+                max_turns=_MAX_DEDUPE_TURNS,
+                effort=_DEFAULT_DEDUPE_EFFORT,
+                log_file=log_file,
+            )
+            parsed = json.loads(result.strip().removeprefix("```json").removesuffix("```").strip())
+            decision = str(parsed.get("decision", "")).lower()
+            matched_key = str(parsed.get("matched_dedupe_key", ""))
+            reason = str(parsed.get("reason", ""))
+
+            if decision == "duplicate" and matched_key:
+                logger.info(
+                    "Stage 6: Semantic dedupe filtered %s as duplicate of %s. Reason: %s",
+                    label,
+                    matched_key,
+                    reason,
+                )
+                continue
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning(
+                "Stage 6: Could not parse semantic dedupe response for %s: %s. Treating as new.",
+                label,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Stage 6: Semantic dedupe agent failed for %s: %s. Treating as new.",
+                label,
+                exc,
+            )
+
+        filtered.append(candidate)
+
+    logger.info(
+        "Stage 6: Semantic dedupe kept %d/%d candidates.",
+        len(filtered),
+        len(candidates),
+    )
+    return filtered
 
 
 def _existing_artifact(disclosure_report: str, filename: str) -> str | None:
@@ -394,6 +496,17 @@ async def run_stage6(
     if not candidates:
         logger.info(
             "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after discovered-bug dedupe."
+        )
+        return []
+
+    candidates = await _filter_semantic_duplicates(
+        candidates,
+        discovered_path,
+        config,
+    )
+    if not candidates:
+        logger.info(
+            "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after semantic dedupe."
         )
         return []
 

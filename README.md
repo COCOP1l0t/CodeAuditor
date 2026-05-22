@@ -8,6 +8,8 @@ A multi-stage, agentic code auditing pipeline that can run on the [Claude Code S
 
 CodeAuditor has discovered several CVEs in widely used open-source projects — see [Vulnerabilities found](#vulnerabilities-found) below.
 
+![TUI Dashboard](docs/images/tui-dashboard.png)
+
 ## How it works
 
 The audit runs as seven sequential stages. Each stage is driven by a prompt template in `prompts/` and executed by one or more backend agents. Outputs are validated, and on validation failure a repair prompt is sent (up to `max_retries`). Intermediate artifacts are written under the output directory; a `.markers/` folder tracks completed sub-tasks so runs can be resumed.

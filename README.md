@@ -34,26 +34,26 @@ Stage 1 produces two directives — an *auditing focus* and *vulnerability crite
        ▼
 ┌─────────────┐     ┌─────────────────────────────┐
 │  Stage 0    │     │      DIRECTIVE INJECTION    │
-│    Init     │────►│  ┌─────────┐  ┌─────────┐  │
-└─────────────┘     │  │Auditing │  │Vuln     │  │
-       │            │  │ Focus   │  │Criteria │  │
-       ▼            │  └───┬─────┘  └────┬────┘  │
-┌─────────────┐     │      │             │       │
-│  Stage 1    │────►│      └──────┬──────┘       │
-│   Context   │     └─────────────┼──────────────┘
-└─────────────┘                   │
-       │                          │
-       ▼                          ▼
+│    Init     │────►│  ┌─────────┐  ┌─────────┐   │
+└─────────────┘     │  │Auditing │  │Vuln     │   │
+       │            │  │ Focus   │  │Criteria │   │
+       ▼            │  └────┬────┘  └────┬────┘   │
+┌─────────────┐     │       │            │        │
+│  Stage 1    │────►│       └──────┬─────┘        │
+│   Context   │     └──────────────┼──────────────┘
+└─────────────┘                    │
+       │                           │
+       ▼                           ▼
 ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
 │  Stage 2    │──►│  Stage 3    │──►│  Stage 4    │──►│  Stage 5    │──►│  Stage 6    │
 │  Decompose  │   │   Discover  │   │   Evaluate  │   │     PoC     │   │   Disclose  │
 └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘   └──────┬──────┘
-                                                                                 │
-                                                                                 ▼
-                                                                          ┌─────────────┐
-                                                                          │  Disclosure │
-                                                                          │   Package   │
-                                                                          └─────────────┘
+                                                                               │
+                                                                               ▼
+                                                                        ┌─────────────┐
+                                                                        │  Disclosure │
+                                                                        │   Package   │
+                                                                        └─────────────┘
 ```
 
 ## Requirements
@@ -185,7 +185,9 @@ Vulnerabilities CodeAuditor has helped discover and disclose:
 | CVE-2026-40386 | [libexif](https://github.com/libexif/libexif) | 2026 | [GitHub](https://github.com/libexif/libexif) |
 | CVE-2026-7180 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | CVE-2026-8341 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
+| CVE-2026-8343 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | CVE-2026-8348 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
+| CVE-2026-9238 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) |
 | Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) |
 | Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) |

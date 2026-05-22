@@ -2,12 +2,12 @@
 
 Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target project, it researches security context → decomposes the codebase into analysis units → findings → vulnerabilities → PoC reproduction → disclosure preparation.
 
-## Quick reference
+## Quick Reference
 
 - **Language**: Python >=3.12
 - **Package manager**: pip (uses `pyproject.toml`, hatchling backend)
 - **Entry point**: `code-auditor` CLI → `code_auditor/__main__.py:main`
-- **Agent backend**: `claude-code-sdk` async `query()` API
+- **Agent backends**: Claude via `claude-code-sdk`; Codex via local Codex app server SDK
 
 ## Running
 
@@ -16,30 +16,27 @@ Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target
 pip install -e .
 
 # Run an audit
-code-auditor --target /path/to/project [--output-dir DIR] [--max-parallel 2] [--resume] [--skip-stages 0,4] [--log-level DEBUG]
+code-auditor --target /path/to/project [options]
 
-# Required args
-#   --target           Root directory of project to audit
-# Optional args
-#   --output-dir       Defaults to {target}/audit-output
-#   --wiki            LLM wiki knowledge base directory (treated as read-only)
-#   --max-parallel     Concurrent agents (default 2)
-#   --resume           Resume from checkpoint markers
-#   --threat-model     Override default threat model text
-#   --scope            Additional scope instructions for stage 1
-#   --skip-stages      Comma-separated stage numbers to skip (0–6)
-#   --only-stage       Run only this stage (+ stage 0); mutually exclusive with --skip-stages
-#   --model            Claude model to use (default claude-sonnet-4-6)
-#   --target-au-count  Target number of analysis units for stage 2 (default 30)
-#   --log-level        DEBUG|INFO|WARNING|ERROR (default INFO)
+# Required
+#   --target           Root directory of the project to audit
+
+# Common options
+#   --output-dir       Output directory (default: {target}/audit-output)
+#   --wiki             Read-only LLM wiki knowledge base directory
+#   --max-parallel     Max concurrent agents (default: 1)
+#   --backend          Agent backend: claude | codex (default: claude)
+#   --model            Model override
+#   --target-au-count  Target number of analysis units for stage 2 (default: 10)
+#   --audit-only       Run only stages 1-4
+#   --tui              Launch the interactive TUI dashboard
+#   --log-level        DEBUG|INFO|WARNING|ERROR (default: INFO)
 ```
 
 ## Testing
 
 ```bash
-pytest                                    # run all tests
-pytest code_auditor/tests/            # same thing
-pytest -k test_stage2                     # filter by name
+pytest -q
 ```
 
 Tests are in `code_auditor/tests/test_parsers_and_report.py`. They cover parsers and validators — no agent calls needed.

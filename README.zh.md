@@ -56,6 +56,12 @@ CodeAuditor 已在多个广泛使用的开源项目中发现了 CVE — 详见�
                                                                         └─────────────┘
 ```
 
+## TUI 仪表盘
+
+使用 `--tui` 启动交互式终端仪表盘：
+
+![TUI 仪表盘](docs/images/tui-dashboard.png)
+
 ## 环境要求
 
 - Python **3.12+**

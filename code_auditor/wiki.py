@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from .config import AuditConfig
+from .logger import get_logger
+
+logger = get_logger("wiki")
 
 NO_WIKI_CONTEXT = "No wiki knowledge base configured."
 
@@ -55,10 +58,13 @@ def build_wiki_context(config: AuditConfig, stage: int) -> str:
         return NO_WIKI_CONTEXT
 
     stage_guidance = _STAGE_GUIDANCE.get(stage, _GENERIC_GUIDANCE)
-    return "\n".join([
+    context = "\n".join([
         f"Wiki root: `{config.wiki_path}`",
         "The wiki is read-only. Do not create, edit, move, or delete files in it.",
         "If a referenced wiki file or directory is absent, skip it and continue with the available pages.",
         "Prefer `index.md` for navigation when it exists.",
         stage_guidance,
     ])
+    logger.info("Injecting wiki context into stage %s prompt (wiki root: %s)", stage, config.wiki_path)
+    logger.debug("Wiki context content:\n%s", context)
+    return context

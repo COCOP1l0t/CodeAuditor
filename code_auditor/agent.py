@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
-from typing import Callable, TextIO
+import time
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any, Callable, Coroutine, Protocol, TextIO
+from uuid import uuid4
 
 from .config import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, AuditConfig, ValidationIssue
 from .logger import get_logger
@@ -11,11 +16,121 @@ from .utils import format_validation_issues
 
 AGENT_MAX_RETRIES = 3
 AGENT_RETRY_BASE_DELAY = 10  # seconds
+STALE_AGENT_LOG_TIMEOUT_SECONDS = 20 * 60
+STALE_AGENT_LOG_CHECK_INTERVAL_SECONDS = 5 * 60
 DEFAULT_CODEX_BIN = "/usr/local/bin/codex"
 
 logger = get_logger("agent")
 
+class _KillableProcess(Protocol):
+    def kill(self) -> object:
+        ...
+
+
 _claude_sdk_patched = False
+_CODEX_SERVICE_TIER_COMPAT_ATTR = "_code_auditor_service_tier_compat"
+_AGENT_PROCESS_REGISTRAR: ContextVar[Callable[[_KillableProcess | None], None] | None] = ContextVar(
+    "agent_process_registrar",
+    default=None,
+)
+
+
+class AgentLogStaleError(RuntimeError):
+    """Raised when an agent log stops updating and the backend process is killed."""
+
+
+@dataclass
+class _AgentRunControl:
+    processes: list[_KillableProcess] = field(default_factory=list)
+    killed_due_to_stale_log: bool = False
+
+    def register_process(self, process: _KillableProcess | None) -> None:
+        if process is None or process in self.processes:
+            return
+        self.processes.append(process)
+
+    def kill_processes(self, log_file: str) -> None:
+        self.killed_due_to_stale_log = True
+        if not self.processes:
+            logger.warning(
+                "Agent log file has not been updated for %d minutes, but no agent process was registered to kill: %s",
+                STALE_AGENT_LOG_TIMEOUT_SECONDS // 60,
+                log_file,
+            )
+            return
+
+        for process in list(self.processes):
+            pid = getattr(process, "pid", "?")
+            logger.warning(
+                "Agent log file has not been updated for %d minutes; killing agent process pid=%s: %s",
+                STALE_AGENT_LOG_TIMEOUT_SECONDS // 60,
+                pid,
+                log_file,
+            )
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                logger.warning("Failed to kill stale agent process pid=%s: %s", pid, exc)
+
+
+def _register_current_agent_process(process: _KillableProcess | None) -> None:
+    registrar = _AGENT_PROCESS_REGISTRAR.get()
+    if registrar:
+        registrar(process)
+
+
+async def _watch_agent_log_for_staleness(log_file: str, run_control: _AgentRunControl) -> None:
+    last_seen_update = time.time()
+    while True:
+        await asyncio.sleep(STALE_AGENT_LOG_CHECK_INTERVAL_SECONDS)
+        try:
+            last_seen_update = os.stat(log_file).st_mtime
+        except FileNotFoundError:
+            pass
+
+        stale_seconds = time.time() - last_seen_update
+        if stale_seconds >= STALE_AGENT_LOG_TIMEOUT_SECONDS:
+            run_control.kill_processes(log_file)
+            raise AgentLogStaleError(
+                f"Agent log file has not been updated for {stale_seconds:.0f}s: {log_file}"
+            )
+
+
+async def _run_agent_attempt_with_stale_log_watch(
+    attempt: Coroutine[object, object, str],
+    *,
+    log_file: str | None,
+    run_control: _AgentRunControl,
+    enable_stale_watch: bool = True,
+) -> str:
+    if not log_file or not enable_stale_watch:
+        return await attempt
+
+    agent_task = asyncio.create_task(attempt)
+    watcher_task = asyncio.create_task(_watch_agent_log_for_staleness(log_file, run_control))
+    try:
+        done, _ = await asyncio.wait(
+            {agent_task, watcher_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if watcher_task in done:
+            exc = watcher_task.exception()
+            agent_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(agent_task, timeout=5)
+            if exc:
+                raise exc
+            raise AgentLogStaleError(f"Agent log watcher exited unexpectedly: {log_file}")
+
+        watcher_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher_task
+        return await agent_task
+    finally:
+        if not watcher_task.done():
+            watcher_task.cancel()
 
 
 def _patch_claude_sdk(sdk_client, mp, process_error, transport):  # type: ignore[no-untyped-def]
@@ -55,6 +170,8 @@ def _patch_claude_sdk(sdk_client, mp, process_error, transport):  # type: ignore
 
         try:
             await original_connect(self)
+            if self._process:
+                _register_current_agent_process(self._process)
         finally:
             self._options.debug_stderr = orig_debug_stderr
             if not had_debug_flag:
@@ -107,6 +224,7 @@ def _load_claude_sdk():  # type: ignore[no-untyped-def]
 
     return ClaudeCodeOptions, query
 
+
 DEFAULT_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit", "Bash"]
 
 
@@ -133,6 +251,8 @@ def _open_agent_log(log_file: str | None) -> TextIO | None:
     if log_fh.tell() > 0:
         log_fh.write("\n--- new agent invocation ---\n\n")
         log_fh.flush()
+    else:
+        os.utime(log_file, None)
     return log_fh
 
 
@@ -144,6 +264,105 @@ def _resolve_codex_bin() -> str:
     return DEFAULT_CODEX_BIN
 
 
+@dataclass(frozen=True)
+class _CodexSdk:
+    flavor: str
+    async_codex_cls: type[Any]
+    app_server_config_cls: type[Any]
+    app_server_client_cls: type[Any] | None
+    approval_mode_cls: type[Any] | None
+    ask_for_approval_cls: type[Any] | None
+    reasoning_effort_cls: type[Any]
+    sandbox_policy_cls: type[Any]
+    service_tier_cls: type[Any] | None
+
+
+def _load_codex_sdk() -> _CodexSdk:
+    try:
+        from openai_codex import (  # type: ignore[import-not-found]
+            AppServerConfig,
+            ApprovalMode,
+            AsyncCodex,
+        )
+        from openai_codex.client import AppServerClient  # type: ignore[import-not-found]
+        from openai_codex.types import (  # type: ignore[import-not-found]
+            ReasoningEffort,
+            SandboxPolicy,
+        )
+
+        return _CodexSdk(
+            flavor="openai_codex",
+            async_codex_cls=AsyncCodex,
+            app_server_config_cls=AppServerConfig,
+            app_server_client_cls=AppServerClient,
+            approval_mode_cls=ApprovalMode,
+            ask_for_approval_cls=None,
+            reasoning_effort_cls=ReasoningEffort,
+            sandbox_policy_cls=SandboxPolicy,
+            service_tier_cls=None,
+        )
+    except ImportError as openai_codex_exc:
+        try:
+            from codex_app_server import (  # type: ignore[import-not-found]
+                AskForApproval,
+                AppServerConfig,
+                AppServerClient,
+                AsyncCodex,
+                ReasoningEffort,
+                SandboxPolicy,
+                ServiceTier,
+            )
+        except ImportError as legacy_exc:
+            raise RuntimeError(
+                "Codex backend requires the OpenAI Codex Python SDK "
+                "(`openai-codex` / `openai_codex`). The legacy "
+                "`codex-app-server-sdk` package is still accepted as a fallback."
+            ) from legacy_exc
+
+        logger.debug("Using legacy codex-app-server-sdk fallback: %s", openai_codex_exc)
+        return _CodexSdk(
+            flavor="codex_app_server",
+            async_codex_cls=AsyncCodex,
+            app_server_config_cls=AppServerConfig,
+            app_server_client_cls=AppServerClient,
+            approval_mode_cls=None,
+            ask_for_approval_cls=AskForApproval,
+            reasoning_effort_cls=ReasoningEffort,
+            sandbox_policy_cls=SandboxPolicy,
+            service_tier_cls=ServiceTier,
+        )
+
+
+def _normalize_codex_service_tier_response(value: Any) -> Any:
+    """Map newer Codex service tier values to this SDK's generated enum."""
+    if isinstance(value, dict):
+        normalized: dict[Any, Any] = {}
+        for key, item in value.items():
+            if key in ("serviceTier", "service_tier") and item == "priority":
+                normalized[key] = "fast"
+            else:
+                normalized[key] = _normalize_codex_service_tier_response(item)
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_codex_service_tier_response(item) for item in value]
+    return value
+
+
+def _patch_codex_sdk_service_tier_compat(app_server_client_cls: type[Any]) -> None:
+    """Patch Codex SDK response decoding for older generated ServiceTier enums."""
+    original_request_raw = app_server_client_cls._request_raw
+    if getattr(original_request_raw, _CODEX_SERVICE_TIER_COMPAT_ATTR, False):
+        return
+
+    def patched_request_raw(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return _normalize_codex_service_tier_response(
+            original_request_raw(self, *args, **kwargs)
+        )
+
+    setattr(patched_request_raw, _CODEX_SERVICE_TIER_COMPAT_ATTR, True)
+    app_server_client_cls._request_raw = patched_request_raw
+
+
 async def _run_claude_agent(
     prompt: str,
     config: AuditConfig,
@@ -153,15 +372,15 @@ async def _run_claude_agent(
     model: str | None = None,
     effort: str | None = None,
     log_file: str | None = None,
+    run_control: _AgentRunControl | None = None,
 ) -> str:
     ClaudeCodeOptions, query = _load_claude_sdk()
     tools = allowed_tools or DEFAULT_TOOLS
     add_dirs = _additional_directories(config, cwd)
 
     extra_args: dict[str, str | None] = {
-        # Run sub-agents like a clean Claude Code install: no user/project
-        # settings, no plugins, no hooks, no CLAUDE.md, no slash commands.
-        "setting-sources": "",
+        # Keep Claude Code settings sources enabled so provider/auth
+        # configuration from ~/.claude/settings.json is honored.
         "disable-slash-commands": None,
     }
     if effort:
@@ -178,6 +397,7 @@ async def _run_claude_agent(
     )
 
     log_fh = _open_agent_log(log_file)
+    run_control = run_control or _AgentRunControl()
 
     last_exc: Exception | None = None
     try:
@@ -187,17 +407,32 @@ async def _run_claude_agent(
                 if log_fh and attempt > 0:
                     log_fh.write(f"\n--- retry attempt {attempt + 1} ---\n\n")
                     log_fh.flush()
-                async for message in query(prompt=prompt, options=options):
-                    if message is None:
-                        continue
-                    if hasattr(message, "content"):
-                        for block in message.content:
-                            if hasattr(block, "text"):
-                                text_parts.append(block.text)
-                                if log_fh:
-                                    log_fh.write(block.text)
-                                    log_fh.write("\n")
-                                    log_fh.flush()
+
+                async def collect_messages(parts: list[str]) -> str:
+                    token = _AGENT_PROCESS_REGISTRAR.set(run_control.register_process)
+                    try:
+                        async for message in query(prompt=prompt, options=options):
+                            if message is None:
+                                continue
+                            if hasattr(message, "content"):
+                                for block in message.content:
+                                    if hasattr(block, "text"):
+                                        parts.append(block.text)
+                                        if log_fh:
+                                            log_fh.write(block.text)
+                                            log_fh.write("\n")
+                                            log_fh.flush()
+                        return "\n".join(parts)
+                    finally:
+                        _AGENT_PROCESS_REGISTRAR.reset(token)
+
+                return await _run_agent_attempt_with_stale_log_watch(
+                    collect_messages(text_parts),
+                    log_file=log_file,
+                    run_control=run_control,
+                )
+            except AgentLogStaleError as exc:
+                logger.warning("Claude agent stopped because its log file went stale: %s", exc)
                 return "\n".join(text_parts)
             except Exception as exc:
                 last_exc = exc
@@ -226,20 +461,11 @@ async def _run_codex_agent(
     model: str | None = None,
     effort: str | None = None,
     log_file: str | None = None,
+    run_control: _AgentRunControl | None = None,
 ) -> str:
-    try:
-        from codex_app_server import (  # type: ignore[import-not-found]
-            AskForApproval,
-            AppServerConfig,
-            AsyncCodex,
-            ReasoningEffort,
-            SandboxPolicy,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            "Codex backend requires the codex-app-server-sdk package. "
-            "Install project dependencies again after this change."
-        ) from exc
+    codex_sdk = _load_codex_sdk()
+    if codex_sdk.flavor == "codex_app_server" and codex_sdk.app_server_client_cls is not None:
+        _patch_codex_sdk_service_tier_compat(codex_sdk.app_server_client_cls)
 
     if allowed_tools is not None:
         logger.debug("Codex backend does not map Claude allowed_tools directly; using Codex defaults.")
@@ -248,11 +474,21 @@ async def _run_codex_agent(
 
     selected_model = model or config.model or DEFAULT_CODEX_MODEL
     codex_bin = _resolve_codex_bin()
-    approval_policy = AskForApproval.model_validate("never")
-    sandbox_policy = SandboxPolicy.model_validate({"type": "dangerFullAccess"})
-    codex_effort = ReasoningEffort(effort) if effort else None
+    sandbox_policy = codex_sdk.sandbox_policy_cls.model_validate({"type": "dangerFullAccess"})
+    codex_effort = codex_sdk.reasoning_effort_cls(effort) if effort else None
+    if codex_sdk.flavor == "openai_codex":
+        if codex_sdk.approval_mode_cls is None:
+            raise RuntimeError("Current Codex SDK import did not expose ApprovalMode.")
+        approval_setting = codex_sdk.approval_mode_cls.deny_all
+        codex_service_tier: object = "fast"
+    else:
+        if codex_sdk.ask_for_approval_cls is None or codex_sdk.service_tier_cls is None:
+            raise RuntimeError("Legacy Codex SDK import did not expose approval or service-tier types.")
+        approval_setting = codex_sdk.ask_for_approval_cls.model_validate("never")
+        codex_service_tier = codex_sdk.service_tier_cls.fast
 
     log_fh = _open_agent_log(log_file)
+    run_control = run_control or _AgentRunControl()
     last_exc: Exception | None = None
     try:
         for attempt in range(AGENT_MAX_RETRIES):
@@ -261,27 +497,64 @@ async def _run_codex_agent(
                     log_fh.write(f"\n--- retry attempt {attempt + 1} ---\n\n")
                     log_fh.flush()
 
-                app_server_config = AppServerConfig(codex_bin=codex_bin, cwd=cwd)
-                async with AsyncCodex(config=app_server_config) as codex:
-                    thread = await codex.thread_start(
+                async def run_codex_turn() -> str:
+                    app_server_config = codex_sdk.app_server_config_cls(
+                        codex_bin=codex_bin,
                         cwd=cwd,
-                        model=selected_model,
+                        config_overrides=('service_tier="fast"',),
                     )
-                    result = await thread.run(
-                        prompt,
-                        approval_policy=approval_policy,
-                        cwd=cwd,
-                        effort=codex_effort,
-                        model=selected_model,
-                        sandbox_policy=sandbox_policy,
-                    )
+                    async with codex_sdk.async_codex_cls(config=app_server_config) as codex:
+                        codex_client = getattr(codex, "_client", None)
+                        sync_client = getattr(codex_client, "_sync", None)
+                        run_control.register_process(getattr(sync_client, "_proc", None))
+                        if codex_sdk.flavor == "openai_codex":
+                            thread = await codex.thread_start(
+                                approval_mode=approval_setting,
+                                cwd=cwd,
+                                model=selected_model,
+                                service_tier=codex_service_tier,
+                            )
+                            result = await thread.run(
+                                prompt,
+                                approval_mode=approval_setting,
+                                cwd=cwd,
+                                effort=codex_effort,
+                                model=selected_model,
+                                sandbox_policy=sandbox_policy,
+                                service_tier=codex_service_tier,
+                            )
+                        else:
+                            thread = await codex.thread_start(
+                                approval_policy=approval_setting,
+                                cwd=cwd,
+                                model=selected_model,
+                                service_tier=codex_service_tier,
+                            )
+                            result = await thread.run(
+                                prompt,
+                                approval_policy=approval_setting,
+                                cwd=cwd,
+                                effort=codex_effort,
+                                model=selected_model,
+                                sandbox_policy=sandbox_policy,
+                                service_tier=codex_service_tier,
+                            )
+                    return result.final_response or ""
 
-                text = result.final_response or ""
+                text = await _run_agent_attempt_with_stale_log_watch(
+                    run_codex_turn(),
+                    log_file=log_file,
+                    run_control=run_control,
+                    enable_stale_watch=False,
+                )
                 if log_fh:
                     log_fh.write(text)
                     log_fh.write("\n")
                     log_fh.flush()
                 return text
+            except AgentLogStaleError as exc:
+                logger.warning("Codex agent stopped because its log file went stale: %s", exc)
+                return ""
             except Exception as exc:
                 last_exc = exc
                 if attempt < AGENT_MAX_RETRIES - 1:
@@ -310,29 +583,66 @@ async def run_agent(
     effort: str | None = None,
     log_file: str | None = None,
 ) -> str:
-    if config.backend == "codex":
-        return await _run_codex_agent(
-            prompt,
-            config,
-            cwd,
-            allowed_tools=allowed_tools,
-            max_turns=max_turns,
-            model=model,
-            effort=effort,
-            log_file=log_file,
+    if config.backend not in ("codex", "claude"):
+        raise ValueError(f"Unsupported agent backend: {config.backend}")
+
+    selected_model = (
+        model
+        or config.model
+        or (DEFAULT_CODEX_MODEL if config.backend == "codex" else DEFAULT_CLAUDE_MODEL)
+    )
+    subagent_id = uuid4().hex[:8]
+    started_at = time.monotonic()
+    status = "failed"
+    run_control = _AgentRunControl()
+
+    logger.info(
+        "Creating %s subagent subagent_id=%s cwd=%s model=%s log_file=%s",
+        config.backend,
+        subagent_id,
+        cwd,
+        selected_model,
+        log_file or "-",
+    )
+
+    try:
+        if config.backend == "codex":
+            result = await _run_codex_agent(
+                prompt,
+                config,
+                cwd,
+                allowed_tools=allowed_tools,
+                max_turns=max_turns,
+                model=model,
+                effort=effort,
+                log_file=log_file,
+                run_control=run_control,
+            )
+        else:
+            result = await _run_claude_agent(
+                prompt,
+                config,
+                cwd,
+                allowed_tools=allowed_tools,
+                max_turns=max_turns,
+                model=model,
+                effort=effort,
+                log_file=log_file,
+                run_control=run_control,
+            )
+        status = "killed_stale_log" if run_control.killed_due_to_stale_log else "completed"
+        return result
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
+    finally:
+        logger.info(
+            "Destroyed %s subagent subagent_id=%s status=%s elapsed=%.2fs",
+            config.backend,
+            subagent_id,
+            status,
+            time.monotonic() - started_at,
         )
-    if config.backend == "claude":
-        return await _run_claude_agent(
-            prompt,
-            config,
-            cwd,
-            allowed_tools=allowed_tools,
-            max_turns=max_turns,
-            model=model,
-            effort=effort,
-            log_file=log_file,
-        )
-    raise ValueError(f"Unsupported agent backend: {config.backend}")
 
 
 async def run_with_validation(

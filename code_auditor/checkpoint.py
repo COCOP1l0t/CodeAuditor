@@ -32,6 +32,11 @@ class CheckpointManager:
         os.makedirs(self._markers_dir, exist_ok=True)
         Path(self._marker_path(task_key)).touch()
 
+    def clear(self, task_key: str) -> None:
+        if not self._needs_marker(task_key):
+            return
+        Path(self._marker_path(task_key)).unlink(missing_ok=True)
+
     def _resolve(self, task_key: str) -> str | None:
         if task_key == "stage1":
             return os.path.join(self._output_dir, "stage1-security-context", "stage-1-security-context.json")

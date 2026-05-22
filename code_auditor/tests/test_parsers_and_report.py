@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 
+import pytest
+
+from code_auditor.checkpoint import CheckpointManager
+from code_auditor.config import AnalysisUnit, AuditConfig
 from code_auditor.parsing.stage2 import parse_au_files, parse_auditing_focus
 from code_auditor.prompts import load_prompt
+from code_auditor.stages import stage3
+from code_auditor.stages import stage4
 from code_auditor.validation.stage2 import (
-    DEFAULT_MAX_ANALYSIS_UNITS,
     validate_stage2_au_file,
     validate_stage2_dir,
     validate_triage_file,
@@ -270,6 +276,7 @@ def test_stage6_prompt_requires_target_guidelines_security_rationale() -> None:
         "target_path": "/tmp/target",
         "disclosure_dir": "/tmp/disclosure",
         "vuln_id": "H-01",
+        "wiki_context": "No wiki context.",
     })
 
     assert "Why This Is a Security Issue" in prompt
@@ -301,3 +308,178 @@ def test_stage6_validator_rejects_report_missing_security_rationale_section() ->
         if "Why This Is a Security Issue" in issue.description
     ]
     assert len(missing) == 1
+
+
+def test_stage4_finalize_skips_invalid_pending_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        pending_dir = os.path.join(tmp, "stage4-vulnerabilities", "_pending")
+        os.makedirs(pending_dir)
+        pending_path = os.path.join(pending_dir, "AU-1-F-1.json")
+        with open(pending_path, "w") as f:
+            json.dump({
+                "id": "pending",
+                "title": "Invalid evaluated finding",
+                "location": "src/foo.c:bar()",
+                "cwe_id": ["CWE-120"],
+                "vulnerability_class": ["buffer overflow"],
+                "trigger": "crafted input",
+                "cvss_score": "7.5",
+            }, f)
+
+        config = AuditConfig(target=tmp, output_dir=tmp)
+
+        assert stage4._assign_ids_and_finalize([pending_path], config) == []
+        assert os.path.exists(pending_path)
+        assert not os.path.exists(os.path.join(tmp, "stage4-vulnerabilities", "H-01.json"))
+
+
+def test_stage4_finalize_ignores_malformed_existing_id() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        stage4_dir = os.path.join(tmp, "stage4-vulnerabilities")
+        pending_dir = os.path.join(stage4_dir, "_pending")
+        os.makedirs(pending_dir)
+
+        with open(os.path.join(stage4_dir, "bad.json"), "w") as f:
+            json.dump({"id": "H-not-a-number"}, f)
+
+        pending_path = os.path.join(pending_dir, "AU-1-F-1.json")
+        with open(pending_path, "w") as f:
+            json.dump({
+                "id": "pending",
+                "title": "Valid evaluated finding",
+                "location": "src/foo.c:bar()",
+                "data_flow_trace": {
+                    "entry_point": "input",
+                    "propagation_chain": ["input reaches sink"],
+                    "neutralizing_checks": "none",
+                    "sink": "sink",
+                },
+                "cwe_id": ["CWE-120"],
+                "vulnerability_class": ["buffer overflow"],
+                "trigger": "crafted input",
+                "cvss_score": "7.5",
+            }, f)
+
+        config = AuditConfig(target=tmp, output_dir=tmp)
+
+        finalized = stage4._assign_ids_and_finalize([pending_path], config)
+
+        assert os.path.join(stage4_dir, "H-01.json") in finalized
+
+
+def test_stage4_run_finding_does_not_checkpoint_invalid_pending_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "target")
+            output_dir = os.path.join(tmp, "audit-output")
+            pending_dir = os.path.join(output_dir, "stage4-vulnerabilities", "_pending")
+            os.makedirs(target)
+            os.makedirs(pending_dir)
+
+            stage3_finding = os.path.join(tmp, "AU-1-F-1.json")
+            with open(stage3_finding, "w") as f:
+                json.dump({"finding_id": "AU-1-F-1"}, f)
+
+            pending_path = os.path.join(pending_dir, "AU-1-F-1.json")
+
+            async def fake_run_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+                with open(pending_path, "w") as f:
+                    json.dump({
+                        "id": "pending",
+                        "title": "Invalid evaluated finding",
+                        "location": "src/foo.c:bar()",
+                        "cwe_id": ["CWE-120"],
+                        "vulnerability_class": ["buffer overflow"],
+                        "trigger": "crafted input",
+                        "cvss_score": "7.5",
+                    }, f)
+                return ""
+
+            monkeypatch.setattr(stage4, "run_agent", fake_run_agent)
+
+            config = AuditConfig(target=target, output_dir=output_dir)
+            checkpoint = CheckpointManager(output_dir, resume=True)
+
+            result = await stage4._run_finding(
+                stage3_finding,
+                config,
+                checkpoint,
+                os.path.join(tmp, "vulnerability-criteria.md"),
+            )
+
+            assert result is None
+            assert not checkpoint.is_complete("stage4:AU-1-F-1.json")
+            assert not os.path.exists(pending_path)
+
+    asyncio.run(run_case())
+
+
+def test_stage4_backfill_only_marks_exact_pending_findings() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        pending_dir = os.path.join(tmp, "stage4-vulnerabilities", "_pending")
+        os.makedirs(pending_dir)
+        au1 = os.path.join(tmp, "AU-1-F-1.json")
+        au2 = os.path.join(tmp, "AU-2-F-1.json")
+        for path in (au1, au2):
+            with open(path, "w") as f:
+                json.dump({"finding_id": os.path.splitext(os.path.basename(path))[0]}, f)
+        with open(os.path.join(pending_dir, "AU-2-F-1.json"), "w") as f:
+            json.dump({"id": "pending"}, f)
+
+        config = AuditConfig(target=tmp, output_dir=tmp)
+        checkpoint = CheckpointManager(tmp, resume=True)
+
+        stage4._backfill_stage4_markers([au1, au2], config, checkpoint)
+
+        assert not os.path.exists(checkpoint._marker_path("stage4:AU-1-F-1.json"))
+        assert os.path.exists(checkpoint._marker_path("stage4:AU-2-F-1.json"))
+
+
+def test_stage3_run_unit_does_not_checkpoint_invalid_finding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "target")
+            output_dir = os.path.join(tmp, "audit-output")
+            stage2_dir = os.path.join(output_dir, "stage2-analysis-units")
+            findings_dir = os.path.join(output_dir, "stage3-findings")
+            os.makedirs(target)
+            os.makedirs(stage2_dir)
+            os.makedirs(findings_dir)
+
+            au_path = os.path.join(stage2_dir, "AU-1.json")
+            with open(au_path, "w") as f:
+                json.dump({"description": "d", "files": ["a.c"], "focus": "f"}, f)
+
+            finding_path = os.path.join(findings_dir, "AU-1-F-1.json")
+
+            async def fake_run_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+                with open(finding_path, "w") as f:
+                    json.dump({
+                        "finding_id": "AU-1-F-1",
+                        "title": "Invalid finding",
+                    }, f)
+                return ""
+
+            monkeypatch.setattr(stage3, "run_agent", fake_run_agent)
+
+            config = AuditConfig(target=target, output_dir=output_dir)
+            checkpoint = CheckpointManager(output_dir, resume=True)
+            unit = AnalysisUnit(id="AU-1", au_file_path=au_path)
+
+            result = await stage3._run_unit(
+                unit,
+                config,
+                checkpoint,
+                os.path.join(tmp, "auditing-focus.md"),
+                os.path.join(tmp, "vulnerability-criteria.md"),
+            )
+
+            assert result == []
+            assert not checkpoint.is_complete("stage3:AU-1")
+            assert not os.path.exists(finding_path)
+
+    asyncio.run(run_case())

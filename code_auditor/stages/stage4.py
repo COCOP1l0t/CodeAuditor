@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
+from contextlib import suppress
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
@@ -11,6 +11,7 @@ from ..config import AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..utils import (
+    natural_sort_key,
     format_validation_issues,
     list_json_files,
     run_parallel_limited,
@@ -95,8 +96,24 @@ async def _run_finding(
     )
 
     if checkpoint.is_complete(key):
-        logger.info("Stage 4: %s already complete, skipping.", stage3_filename)
-        return pending_path if os.path.exists(pending_path) else None
+        if not os.path.exists(pending_path):
+            logger.info("Stage 4: %s already complete, skipping.", stage3_filename)
+            return None
+
+        issues = validate_stage4_file(pending_path)
+        if not issues:
+            logger.info("Stage 4: %s already complete, skipping.", stage3_filename)
+            checkpoint.mark_complete(key)
+            return pending_path
+
+        logger.warning(
+            "Stage 4: Existing pending output for %s is invalid; deleting it and rerunning.\n%s",
+            stage3_filename,
+            format_validation_issues(issues),
+        )
+        with suppress(OSError):
+            os.remove(pending_path)
+        checkpoint.clear(key)
 
     logger.info("Stage 4: Starting evaluation of %s.", stage3_filename)
     prompt = load_prompt("stage4.md", {
@@ -121,6 +138,10 @@ async def _run_finding(
             issues = validate_stage4_file(pending_path)
             if issues:
                 logger.warning("Stage 4: Repair failed for %s\n%s", pending_path, format_validation_issues(issues))
+                with suppress(OSError):
+                    os.remove(pending_path)
+                checkpoint.clear(key)
+                return None
 
     checkpoint.mark_complete(key)
     logger.info("Stage 4: %s complete (confirmed=%s)", stage3_filename, confirmed)
@@ -140,11 +161,23 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
         prefix, number_text = existing_id.split("-", 1)
         for sev, sev_prefix in _SEVERITY_PREFIX.items():
             if sev_prefix == prefix:
-                counters[sev] = max(counters[sev], int(number_text))
+                try:
+                    counters[sev] = max(counters[sev], int(number_text))
+                except ValueError:
+                    logger.warning("Stage 4: Ignoring malformed existing vulnerability ID %s in %s", existing_id, file_path)
                 break
 
     findings: list[tuple[str, str, float]] = []  # (pending_path, severity, cvss)
     for pending_path in pending_paths:
+        issues = validate_stage4_file(pending_path)
+        if issues:
+            logger.warning(
+                "Stage 4: Skipping invalid pending output %s\n%s",
+                os.path.basename(pending_path),
+                format_validation_issues(issues),
+            )
+            continue
+
         severity, cvss = _read_severity_and_cvss(pending_path)
         if severity:
             findings.append((pending_path, severity, cvss))
@@ -167,7 +200,7 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
 
     finalized.sort(key=lambda a: (
         {"C": 0, "H": 1, "M": 2, "L": 3}.get(os.path.basename(a).split("-")[0], 99),
-        a,
+        natural_sort_key(a),
     ))
     return finalized
 
@@ -180,46 +213,32 @@ def _backfill_stage4_markers(
     """Create markers for findings already processed in a previous run.
 
     When a previous run evaluated findings but was interrupted (or predates
-    marker-based tracking), some findings may lack checkpoint markers even
-    though they were already processed.
-
-    Heuristic: find the highest AU number that has any file in ``_pending/``
-    and create markers for every input finding whose AU number is <= that
-    value, since those AUs must have been reached by the previous run.
+    marker-based tracking), pending findings may lack checkpoint markers even
+    though they were already processed. Only exact pending filenames are safe
+    to backfill; inferring completion from AU ordering can skip work after a
+    parallel or interrupted run.
     """
     pending_dir = os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending")
     if not os.path.isdir(pending_dir):
         return
 
-    pending_files = os.listdir(pending_dir)
+    pending_files = {
+        name for name in os.listdir(pending_dir)
+        if os.path.isfile(os.path.join(pending_dir, name))
+    }
     if not pending_files:
-        return
-
-    au_re = re.compile(r"AU-(\d+)")
-    max_au = 0
-    for name in pending_files:
-        m = au_re.search(name)
-        if m:
-            max_au = max(max_au, int(m.group(1)))
-
-    if max_au == 0:
         return
 
     backfilled = 0
     for ff in finding_files:
         filename = os.path.basename(ff)
-        m = au_re.search(filename)
-        if m and int(m.group(1)) <= max_au:
+        if filename in pending_files:
             key = _task_key(filename)
-            if not checkpoint.is_complete(key):
-                checkpoint.mark_complete(key)
-                backfilled += 1
+            checkpoint.mark_complete(key)
+            backfilled += 1
 
     if backfilled:
-        logger.info(
-            "Stage 4: Backfilled %d markers (highest completed AU: %d).",
-            backfilled, max_au,
-        )
+        logger.info("Stage 4: Backfilled %d markers from exact pending files.", backfilled)
 
 
 async def run_stage4(

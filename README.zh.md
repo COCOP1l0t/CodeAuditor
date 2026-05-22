@@ -86,7 +86,7 @@ code-auditor --target /path/to/project [options]
 | 标志 | 说明 |
 |------|------|
 | `--target` | **必需。** 要审计的项目根目录。 |
-| `--output-dir` | 输出目录（默认：`{target}/audit-output`）。 |
+| `--output-dir` | 输出目录（默认：`{target}/audit-output-YYYYMMDD`，使用当前本地日期）。 |
 | `--discovered` | 阶段 6 使用的已复现漏洞 HTML 文件（默认：`{target}/reproduced-bugs.html`）。传入路径可覆盖这个跨运行记录的读取和更新位置。 |
 | `--max-parallel` | 最大并发智能体数（默认：`1`）。 |
 | `--backend` | 智能体后端：`claude` 或 `codex`（默认：`claude`）。 |

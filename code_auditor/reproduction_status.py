@@ -11,6 +11,13 @@ _STATUS_PATTERN = re.compile(
     r"(partially[-\s]+reproduced|not[-\s]+reproduced|false[-\s]+positive|reproduced)",
     re.IGNORECASE,
 )
+_NEGATED_REPRODUCTION_PATTERN = re.compile(
+    r"\b(?:not|never)\s+(?:successfully\s+)?reproduced\b"
+    r"|\bcould\s+not\s+reproduce\b"
+    r"|\bfailed\s+to\s+reproduce\b"
+    r"|\bunable\s+to\s+reproduce\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize_status(raw_status: str) -> str:
@@ -18,6 +25,9 @@ def _normalize_status(raw_status: str) -> str:
 
 
 def _find_status_value(text: str) -> str | None:
+    if _NEGATED_REPRODUCTION_PATTERN.search(text):
+        return "not-reproduced"
+
     match = _STATUS_PATTERN.search(text)
     if not match:
         return None

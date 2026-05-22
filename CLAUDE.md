@@ -22,13 +22,14 @@ code-auditor --target /path/to/project [options]
 #   --target           Root directory of the project to audit
 
 # Common options
-#   --output-dir       Output directory (default: {target}/audit-output)
+#   --output-dir       Output directory (default: {target}/audit-output-YYYYMMDD)
+#   --discovered       Reproduced bugs HTML file (default: {target}/reproduced-bugs.html)
 #   --wiki             Read-only LLM wiki knowledge base directory
 #   --max-parallel     Max concurrent agents (default: 1)
 #   --backend          Agent backend: claude | codex (default: claude)
-#   --model            Model override
+#   --model            Model override (Claude default: claude-sonnet-4-6; Codex default: gpt-5.4)
 #   --target-au-count  Target number of analysis units for stage 2 (default: 10)
-#   --audit-only       Run only stages 1-4
+#   --enable-timeout   Enable per-stage agent timeouts
 #   --tui              Launch the interactive TUI dashboard
 #   --log-level        DEBUG|INFO|WARNING|ERROR (default: INFO)
 ```
@@ -39,26 +40,7 @@ code-auditor --target /path/to/project [options]
 pytest -q
 ```
 
-Tests are in `code_auditor/tests/test_parsers_and_report.py`. They cover parsers and validators — no agent calls needed.
-
-## Project layout
-
-```
-code_auditor/
-├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
-├── config.py            # AuditConfig, Module, AnalysisUnit, ValidationIssue dataclasses
-├── orchestrator.py      # Sequential stage runner
-├── agent.py             # claude-code-sdk wrapper + validation retry loop
-├── prompts.py           # load_prompt() with __KEY__ substitution
-├── checkpoint.py        # File/marker-based checkpoint/resume
-├── logger.py            # stdlib logging wrapper
-├── utils.py             # run_parallel_limited, file helpers, severity sort
-├── stages/              # stage0–stage6 (one file per stage)
-├── parsing/             # stage2.py — extract structured data from agent output
-├── validation/          # common.py + stage1–stage6 — validate agent output format
-└── tests/
-prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
-```
+Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and validators only, no agent calls.
 
 ## Architecture (7 stages)
 
@@ -80,3 +62,22 @@ prompts/                 # stage1.md–stage6.md — prompt templates with __KEY
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
 - **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
+
+## Project layout
+
+```
+code_auditor/
+├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
+├── config.py            # AuditConfig, Module, AnalysisUnit, ValidationIssue dataclasses
+├── orchestrator.py      # Sequential stage runner
+├── agent.py             # claude-code-sdk wrapper + validation retry loop
+├── prompts.py           # load_prompt() with __KEY__ substitution
+├── checkpoint.py        # File/marker-based checkpoint/resume
+├── logger.py            # stdlib logging wrapper
+├── utils.py             # run_parallel_limited, file helpers, severity sort
+├── stages/              # stage0–stage6 (one file per stage)
+├── parsing/             # stage2.py — extract structured data from agent output
+├── validation/          # common.py + stage1–stage6 — validate agent output format
+└── tests/
+prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
+```

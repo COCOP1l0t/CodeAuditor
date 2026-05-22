@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import suppress
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
@@ -36,8 +37,25 @@ async def _run_unit(
     progress = f"[{unit_index}/{total_units}]" if total_units else ""
 
     if checkpoint.is_complete(key):
-        logger.info("Stage 3 %s: %s already complete, skipping.", progress, unit.id)
-        return list_matching_files(result_dir, finding_pattern)
+        finding_files = list_matching_files(result_dir, finding_pattern)
+        invalid_files = [
+            finding_file
+            for finding_file in finding_files
+            if validate_stage3_file(finding_file)
+        ]
+        if not invalid_files:
+            logger.info("Stage 3 %s: %s already complete, skipping.", progress, unit.id)
+            return finding_files
+
+        logger.warning(
+            "Stage 3 %s: %s has invalid checkpointed findings; deleting them and rerunning.",
+            progress,
+            unit.id,
+        )
+        for finding_file in finding_files:
+            with suppress(OSError):
+                os.remove(finding_file)
+        checkpoint.clear(key)
 
     logger.info("Stage 3 %s: Starting bug discovery for %s.", progress, unit.id)
     prompt = load_prompt("stage3.md", {
@@ -53,25 +71,34 @@ async def _run_unit(
 
     logger.info("Stage 3 %s: Agent finished for %s. Validating findings.", progress, unit.id)
     finding_files = list_matching_files(result_dir, finding_pattern)
+    valid_finding_files: list[str] = []
+    had_unresolved_validation = False
     for finding_file in finding_files:
         issues = validate_stage3_file(finding_file)
-        if not issues:
-            continue
-
-        logger.warning("Stage 3: Validation failed for %s\n%s", finding_file, format_validation_issues(issues))
-        repair_prompt = (
-            f"The finding file at `{finding_file}` failed validation. "
-            f"Please fix all issues listed below:\n\n```\n{format_validation_issues(issues)}\n```"
-        )
-        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
-
-        issues = validate_stage3_file(finding_file)
         if issues:
-            logger.warning("Stage 3: Repair failed for %s\n%s", finding_file, format_validation_issues(issues))
+            logger.warning("Stage 3: Validation failed for %s\n%s", finding_file, format_validation_issues(issues))
+            repair_prompt = (
+                f"The finding file at `{finding_file}` failed validation. "
+                f"Please fix all issues listed below:\n\n```\n{format_validation_issues(issues)}\n```"
+            )
+            await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
 
-    checkpoint.mark_complete(key)
-    logger.info("Stage 3 %s: %s complete. Findings: %d", progress, unit.id, len(finding_files))
-    return finding_files
+            issues = validate_stage3_file(finding_file)
+            if issues:
+                logger.warning("Stage 3: Repair failed for %s\n%s", finding_file, format_validation_issues(issues))
+                with suppress(OSError):
+                    os.remove(finding_file)
+                had_unresolved_validation = True
+                continue
+
+        valid_finding_files.append(finding_file)
+
+    if had_unresolved_validation:
+        checkpoint.clear(key)
+    else:
+        checkpoint.mark_complete(key)
+    logger.info("Stage 3 %s: %s complete. Findings: %d", progress, unit.id, len(valid_finding_files))
+    return valid_finding_files
 
 
 async def run_stage3(

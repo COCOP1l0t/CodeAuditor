@@ -7,7 +7,7 @@ import shutil
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
-from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
+from ..config import AuditConfig, select_poc_model
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..reproduction_status import is_failed_status, read_reproduction_status
@@ -20,7 +20,6 @@ logger = get_logger("stage5")
 # building projects, writing exploit code, running/debugging, and iterating.
 _MAX_TURNS = 500
 _DEFAULT_EFFORT = "medium"
-_POC_TIMEOUT = 20 * 60  # 20 minutes
 
 
 def _task_key(vuln_id: str) -> str:
@@ -102,6 +101,9 @@ async def _run_reproduce(
     })
 
     log_file = os.path.join(poc_dir, "agent.log")
+    timeout_seconds = config.agent_timeout_seconds
+    if timeout_seconds is None:
+        logger.info("Stage 5: Agent timeout disabled for %s.", vuln_id)
 
     timed_out = False
     task = asyncio.create_task(
@@ -110,14 +112,17 @@ async def _run_reproduce(
             config,
             cwd=config.target,
             max_turns=_MAX_TURNS,
-            model=DEFAULT_CLAUDE_POC_MODEL if config.backend == "claude" else config.model,
+            model=select_poc_model(config),
             effort=_DEFAULT_EFFORT,
             log_file=log_file,
         )
     )
-    done, _ = await asyncio.wait({task}, timeout=_POC_TIMEOUT)
+    done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
 
     if not done:
+        if timeout_seconds is None:
+            raise AssertionError("Stage 5 timed out without a configured timeout.")
+        timeout_minutes = timeout_seconds // 60
         # Timed out — cancel and allow a short grace period for cleanup.
         timed_out = True
         task.cancel()
@@ -126,7 +131,7 @@ async def _run_reproduce(
             logger.warning("Stage 5: %s agent task did not exit after cancel, moving on.", vuln_id)
         logger.warning(
             "Stage 5: %s timed out after %d minutes — marking as false positive.",
-            vuln_id, _POC_TIMEOUT // 60,
+            vuln_id, timeout_minutes,
         )
     else:
         # Task completed — re-raise if it failed (but not for CancelledError).
@@ -140,13 +145,16 @@ async def _run_reproduce(
     fp_dir = poc_dir + "_fp"
 
     if timed_out and not os.path.isdir(fp_dir):
+        if timeout_seconds is None:
+            raise AssertionError("Stage 5 timeout cleanup reached without a configured timeout.")
+        timeout_minutes = timeout_seconds // 60
         # Agent didn't get to mark it — do it ourselves.
         os.makedirs(fp_dir, exist_ok=True)
         with open(os.path.join(fp_dir, "report.md"), "w") as f:
             f.write(
                 f"# {vuln_id} — False Positive (timeout)\n\n"
                 f"PoC development did not produce a working exploit within "
-                f"the {_POC_TIMEOUT // 60}-minute time limit. "
+                f"the {timeout_minutes}-minute time limit. "
                 f"Marking as false positive.\n"
             )
         # Preserve the agent log in the _fp directory before cleanup.

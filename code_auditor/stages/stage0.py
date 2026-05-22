@@ -40,10 +40,18 @@ def _git_pull(target: str) -> None:
     finally:
         if has_changes:
             logger.info("Restoring stashed changes.")
-            subprocess.run(
-                ["git", "stash", "pop"],
-                cwd=target, capture_output=True, text=True, check=True,
-            )
+            try:
+                subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=target, capture_output=True, text=True, check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                logger.warning(
+                    "Failed to restore stashed changes (merge conflict?): %s\n"
+                    "stderr: %s\n"
+                    "Your changes remain in the stash. Run 'git stash pop' manually to recover them.",
+                    e, e.stderr.strip() if e.stderr else "",
+                )
 
 
 async def run_setup(config: AuditConfig) -> None:

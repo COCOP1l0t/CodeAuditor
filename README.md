@@ -68,7 +68,7 @@ Stage 1 produces two directives — an *auditing focus* and *vulnerability crite
 ## Installation
 
 ```bash
-git clone https://github.com/<owner>/CodeAuditor.git
+git clone https://github.com/COCOP1l0t/CodeAuditor.git
 cd CodeAuditor
 pip install -e .
 ```

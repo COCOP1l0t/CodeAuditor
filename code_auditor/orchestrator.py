@@ -5,7 +5,6 @@ import os
 from .checkpoint import CheckpointManager
 from .config import AnalysisUnit, AuditConfig
 from .logger import get_logger
-from .parsing.stage2 import parse_au_files
 from .stages.stage0 import run_setup
 from .stages.stage1 import Stage1Output, run_stage1
 from .stages.stage2 import run_stage2
@@ -14,7 +13,6 @@ from .stages.stage4 import run_stage4
 from .stages.stage5 import run_stage5
 from .stages.stage6 import run_stage6
 from .tui import TUIManager
-from .utils import list_json_files, natural_sort_key
 
 logger = get_logger("orchestrator")
 
@@ -26,27 +24,19 @@ async def run_audit(config: AuditConfig, tui: TUIManager | None = None) -> None:
         logger.info("Resume mode enabled. Existing output files and markers will be reused.")
 
     # Stage 0: setup
-    if 0 not in config.skip_stages:
-        if tui:
-            tui.begin_stage(0, "Setting up output directory")
-        await run_setup(config)
-        if tui:
-            tui.end_stage(0)
-    else:
-        if tui:
-            tui.skip_stage(0)
+    if tui:
+        tui.begin_stage(0, "Setting up output directory")
+    await run_setup(config)
+    if tui:
+        tui.end_stage(0)
 
     # Stage 1: security context research
     stage1_out: Stage1Output | None = None
-    if 1 not in config.skip_stages:
-        if tui:
-            tui.begin_stage(1, "Researching security context")
-        stage1_out = await run_stage1(config, checkpoint)
-        if tui:
-            tui.end_stage(1)
-    else:
-        if tui:
-            tui.skip_stage(1)
+    if tui:
+        tui.begin_stage(1, "Researching security context")
+    stage1_out = await run_stage1(config, checkpoint)
+    if tui:
+        tui.end_stage(1)
 
     # Resolve directive paths (from stage1 output or default locations)
     details_dir = os.path.join(config.output_dir, "stage1-security-context")
@@ -61,95 +51,57 @@ async def run_audit(config: AuditConfig, tui: TUIManager | None = None) -> None:
 
     # Stage 2: decompose project into analysis units
     analysis_units: list[AnalysisUnit] = []
-    if 2 not in config.skip_stages:
-        if tui:
-            tui.begin_stage(2, "Decomposing codebase")
-        analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
-        if tui:
-            tui.stage_progress(2, items_done=len(analysis_units), items_total=len(analysis_units),
-                               detail=f"{len(analysis_units)} analysis units found")
-            tui.end_stage(2)
-    else:
-        logger.info("Stage 2 skipped. Loading existing analysis units.")
-        stage2_dir = os.path.join(config.output_dir, "stage2-analysis-units")
-        analysis_units = parse_au_files(stage2_dir)
-        if tui:
-            tui.skip_stage(2, f"Loaded {len(analysis_units)} existing AUs")
+    if tui:
+        tui.begin_stage(2, "Decomposing codebase")
+    analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
+    if tui:
+        tui.stage_progress(2, items_done=len(analysis_units), items_total=len(analysis_units),
+                           detail=f"{len(analysis_units)} analysis units found")
+        tui.end_stage(2)
 
-    if not analysis_units and 3 not in config.skip_stages:
+    if not analysis_units:
         raise RuntimeError("Stage 2 produced no analysis units.")
 
     # Stage 3: bug discovery per AU
     bug_files: list[str] = []
-    if 3 not in config.skip_stages:
-        total_aus = len(analysis_units)
-        if tui:
-            tui.begin_stage(3, f"Discovering bugs across {total_aus} AUs")
+    total_aus = len(analysis_units)
+    if tui:
+        tui.begin_stage(3, f"Discovering bugs across {total_aus} AUs")
 
-        bug_files = await run_stage3(
-            analysis_units, config, checkpoint,
-            auditing_focus_path, vuln_criteria_path,
-        )
-        if tui:
-            tui.stage_progress(3, items_done=total_aus, items_total=total_aus,
-                               detail=f"{len(bug_files)} findings")
-            tui.end_stage(3)
-    else:
-        logger.info("Stage 3 skipped.")
-        bug_files = list_json_files(os.path.join(config.output_dir, "stage3-findings"))
-        if tui:
-            tui.skip_stage(3, f"Loaded {len(bug_files)} existing findings")
+    bug_files = await run_stage3(
+        analysis_units, config, checkpoint,
+        auditing_focus_path, vuln_criteria_path,
+    )
+    if tui:
+        tui.stage_progress(3, items_done=total_aus, items_total=total_aus,
+                           detail=f"{len(bug_files)} findings")
+        tui.end_stage(3)
 
     # Stage 4: evaluate findings
     vuln_files: list[str] = []
-    if 4 not in config.skip_stages:
-        if tui:
-            tui.begin_stage(4, f"Evaluating {len(bug_files)} findings")
-        vuln_files = await run_stage4(bug_files, config, checkpoint, vuln_criteria_path)
-        if tui:
-            tui.stage_progress(4, items_done=len(vuln_files), items_total=len(bug_files),
-                               detail=f"{len(vuln_files)} confirmed vulnerabilities")
-            tui.end_stage(4)
-    else:
-        logger.info("Stage 4 skipped.")
-        stage4_dir = os.path.join(config.output_dir, "stage4-vulnerabilities")
-        vuln_files = [f for f in list_json_files(stage4_dir) if "_pending" not in f]
-        if tui:
-            tui.skip_stage(4, f"Loaded {len(vuln_files)} existing vulns")
+    if tui:
+        tui.begin_stage(4, f"Evaluating {len(bug_files)} findings")
+    vuln_files = await run_stage4(bug_files, config, checkpoint, vuln_criteria_path)
+    if tui:
+        tui.stage_progress(4, items_done=len(vuln_files), items_total=len(bug_files),
+                           detail=f"{len(vuln_files)} confirmed vulnerabilities")
+        tui.end_stage(4)
 
     # Stage 5: PoC reproduction per verified vulnerability
     stage5_reports: list[str] = []
-    if 5 not in config.skip_stages:
-        if tui:
-            tui.begin_stage(5, f"Reproducing {len(vuln_files)} vulnerabilities")
-        stage5_reports = await run_stage5(vuln_files, config, checkpoint)
-        if tui:
-            tui.stage_progress(5, items_done=len(stage5_reports), items_total=len(vuln_files),
-                               detail=f"{len(stage5_reports)} PoCs reproduced")
-            tui.end_stage(5)
-    else:
-        logger.info("Stage 5 skipped. Loading existing reports.")
-        stage5_dir = os.path.join(config.output_dir, "stage5-pocs")
-        if os.path.isdir(stage5_dir):
-            for name in sorted(os.listdir(stage5_dir), key=natural_sort_key):
-                entry = os.path.join(stage5_dir, name)
-                if os.path.isdir(entry):
-                    report = os.path.join(entry, "report.md")
-                    if os.path.exists(report):
-                        stage5_reports.append(report)
-        if tui:
-            tui.skip_stage(5, f"Loaded {len(stage5_reports)} existing reports")
+    if tui:
+        tui.begin_stage(5, f"Reproducing {len(vuln_files)} vulnerabilities")
+    stage5_reports = await run_stage5(vuln_files, config, checkpoint)
+    if tui:
+        tui.stage_progress(5, items_done=len(stage5_reports), items_total=len(vuln_files),
+                           detail=f"{len(stage5_reports)} PoCs reproduced")
+        tui.end_stage(5)
 
     # Stage 6: disclosure preparation per reproduced vulnerability
-    if 6 not in config.skip_stages:
-        if tui:
-            tui.begin_stage(6, f"Preparing {len(stage5_reports)} disclosures")
-        await run_stage6(stage5_reports, config, checkpoint)
-        if tui:
-            tui.end_stage(6)
-    else:
-        logger.info("Stage 6 skipped.")
-        if tui:
-            tui.skip_stage(6)
+    if tui:
+        tui.begin_stage(6, f"Preparing {len(stage5_reports)} disclosures")
+    await run_stage6(stage5_reports, config, checkpoint)
+    if tui:
+        tui.end_stage(6)
 
     logger.info("Audit complete.")

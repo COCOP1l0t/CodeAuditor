@@ -1080,11 +1080,6 @@ class TUIManager:
             st.end_time = time.time()
             self._refresh()
 
-    def skip_stage(self, stage_num: int, detail: str = "") -> None:
-        st = _StageState(status="skipped", detail=detail or "Skipped by user")
-        self._state.stages[stage_num] = st
-        self._refresh()
-
     def stage_progress(
         self,
         stage_num: int,

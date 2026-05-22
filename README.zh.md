@@ -68,7 +68,7 @@ CodeAuditor 已在多个广泛使用的开源项目中发现了 CVE — 详见�
 ## 安装
 
 ```bash
-git clone https://github.com/<owner>/CodeAuditor.git
+git clone https://github.com/COCOP1l0t/CodeAuditor.git
 cd CodeAuditor
 pip install -e .
 ```

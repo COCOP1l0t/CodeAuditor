@@ -29,7 +29,6 @@ class AuditConfig:
     max_parallel: int = 1
     threat_model: str = DEFAULT_THREAT_MODEL
     scope: str = ""
-    skip_stages: list[int] = field(default_factory=list)
     resume: bool = True
     log_level: str = "INFO"
     backend: AgentBackend = DEFAULT_BACKEND

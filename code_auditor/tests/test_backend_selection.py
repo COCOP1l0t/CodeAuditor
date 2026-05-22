@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import sys
+import threading
+from pathlib import Path
 
 import pytest
 
 from code_auditor import __main__ as main_module
 from code_auditor import agent
+from code_auditor import logger as logger_module
+from code_auditor import tui as tui_module
 from code_auditor.__main__ import _build_parser
 from code_auditor.config import DEFAULT_BACKEND, AuditConfig
+from code_auditor.tui import TUIManager, TUIState, _TUILogHandler, _visible_log_lines
 
 
 def test_cli_backend_defaults_to_claude() -> None:
@@ -40,6 +47,12 @@ def test_cli_accepts_discovered_path() -> None:
     ])
 
     assert args.discovered == "/tmp/bugs.html"
+
+
+def test_cli_accepts_tui_flag() -> None:
+    args = _build_parser().parse_args(["--target", ".", "--tui"])
+
+    assert args.tui is True
 
 
 def test_main_maps_omitted_discovered_to_target_reproduced_bugs_html(
@@ -114,6 +127,198 @@ def test_main_rejects_existing_directory_as_discovered_path(
 
     assert exc.value.code == 1
     assert capsys.readouterr().err == f"Error: Discovered path is a directory: {discovered.resolve()}\n"
+
+
+def test_tui_mode_exits_nonzero_after_audit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    target = tmp_path / "target"
+    target.mkdir()
+
+    class FakeTUIManager:
+        def configure(self, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def run_audit(self, audit_coro_factory) -> tuple[bool, bool]:  # type: ignore[no-untyped-def]
+            try:
+                asyncio.run(audit_coro_factory())
+            except Exception:
+                return True, False
+            return False, False
+
+    async def failing_run_audit(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("audit failed")
+
+    monkeypatch.setattr(main_module, "TUIManager", FakeTUIManager)
+    monkeypatch.setattr(main_module, "run_audit", failing_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--tui",
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.main()
+
+    assert exc.value.code == 1
+
+
+def test_tui_mode_runs_audit_through_textual_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    target = tmp_path / "target"
+    target.mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeTUIManager:
+        def configure(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            captured["configured"] = kwargs
+
+        def run_audit(self, audit_coro_factory) -> tuple[bool, bool]:  # type: ignore[no-untyped-def]
+            captured["run_audit_called"] = True
+            asyncio.run(audit_coro_factory())
+            return False, False
+
+    async def fake_run_audit(config: AuditConfig, tui: FakeTUIManager | None = None) -> None:
+        captured["config"] = config
+        captured["tui"] = tui
+
+    monkeypatch.setattr(main_module, "TUIManager", FakeTUIManager)
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--tui",
+    ])
+
+    main_module.main()
+
+    assert captured["run_audit_called"] is True
+    assert isinstance(captured["config"], AuditConfig)
+    assert isinstance(captured["tui"], FakeTUIManager)
+    assert captured["configured"] == {
+        "target": str(target.resolve()),
+        "output_dir": main_module._default_output_dir(str(target.resolve())),
+        "backend": "claude",
+        "model": None,
+        "max_parallel": 1,
+    }
+
+
+def test_textual_tui_runs_audit_outside_app_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_started = threading.Event()
+    audit_continue = threading.Event()
+    app_entered = threading.Event()
+
+    class FakeCodeAuditorApp:
+        def __init__(self, *_args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            self._exit_callback = kwargs.get("exit_callback")
+
+        def run(self) -> None:
+            app_entered.set()
+            assert audit_started.wait(timeout=1.0), "audit did not start while Textual app was running"
+            audit_continue.set()
+            if self._exit_callback:
+                self._exit_callback()
+
+        def exit(self) -> None:
+            pass
+
+    async def blocking_audit() -> None:
+        audit_started.set()
+        assert app_entered.is_set()
+        assert audit_continue.wait(timeout=1.0)
+
+    monkeypatch.setattr(tui_module, "CodeAuditorApp", FakeCodeAuditorApp)
+
+    manager = TUIManager()
+    failed, interrupted = manager.run_audit(blocking_audit)
+
+    assert failed is False
+    assert interrupted is False
+
+
+def test_project_declares_textual_tui_dependencies() -> None:
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+
+    assert '"textual>=0.50"' in pyproject
+    assert '"rich>=13.0"' in pyproject
+    assert '"click>=8.1"' not in pyproject
+
+
+def test_tui_backend_is_textual_app() -> None:
+    from textual.app import App
+
+    assert tui_module.TUI_BACKEND == "textual"
+    assert issubclass(tui_module.CodeAuditorApp, App)
+
+
+def test_tui_log_handler_splits_multiline_records_into_scrollable_rows() -> None:
+    state = TUIState(max_log_lines=2, max_log_history=10)
+    handler = _TUILogHandler(state)
+
+    handler.emit(logging.LogRecord(
+        name="code_auditor.test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="first row\nsecond row\nthird row",
+        args=(),
+        exc_info=None,
+    ))
+
+    assert len(state.log_lines) == 3
+    assert "first row" in state.log_lines[0].plain
+    assert state.log_lines[1].plain == "second row"
+    assert state.log_lines[2].plain == "third row"
+    assert [line.plain for line in _visible_log_lines(state)] == ["second row", "third row"]
+
+
+def test_tui_start_replaces_normal_console_log_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    root_logger = logging.getLogger("code_auditor")
+    root_logger.handlers.clear()
+    logger_module.configure_logging("INFO")
+    manager = TUIManager()
+
+    monkeypatch.setattr(manager, "_start_live", lambda: None)
+    monkeypatch.setattr(manager, "_start_keyboard_listener", lambda: None)
+
+    try:
+        manager.start()
+
+        assert any(isinstance(handler, _TUILogHandler) for handler in root_logger.handlers)
+        assert not any(isinstance(handler, logger_module._ConsoleLogHandler) for handler in root_logger.handlers)
+    finally:
+        manager.stop()
+
+
+def test_tui_exit_key_requests_exit() -> None:
+    manager = TUIManager()
+
+    prefix = manager._handle_keyboard_char("q", prefix=False)
+
+    assert prefix is False
+    assert manager._exit_requested is True
+    assert manager._stop_keyboard.is_set()
+
+
+def test_tui_ctrl_c_interrupts_main_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = TUIManager()
+    interrupted = False
+
+    def fake_interrupt_main() -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    monkeypatch.setattr(manager, "_interrupt_main", fake_interrupt_main)
+
+    manager._handle_keyboard_char("\x03", prefix=False)
+
+    assert interrupted is True
 
 
 def test_resolve_codex_bin_uses_default_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]

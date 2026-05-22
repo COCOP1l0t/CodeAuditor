@@ -125,6 +125,10 @@ Clear, descriptive title (e.g., "Heap Buffer Overflow in DHCP Option Parsing").
 
 One-paragraph description of the vulnerability: what it is, where it occurs, and its impact.
 
+#### Why This Is a Security Issue
+
+Write a maintainer-facing summary of why this bug qualifies as a security issue from the target security guidelines point of view. Start from the project's explicit security policy, bug bounty scope, in-scope/out-of-scope issue types, and the vulnerability criteria produced during Stage 1. If explicit target security guidelines cover the issue, cite the relevant scope category or rule in plain language. If explicit guidelines are missing or incomplete, use the project's historical vulnerability calibration and the reproduced impact to explain the security boundary. Be concise and concrete: connect attacker-controlled input, affected trust boundary, violated security expectation, and demonstrated impact. Do not overclaim; if the target guidelines only partially support the classification, state that nuance.
+
 #### Severity Assessment
 
 - **CWE Classification**: CWE identifier and name (e.g., CWE-122: Heap-based Buffer Overflow).
@@ -188,11 +192,20 @@ Subject: [Security] <concise description of the vulnerability>
 Hi,
 
 <Opening paragraph: state that you are reporting a security
-vulnerability in [project name], and briefly describethe affected
-component. e.g., "I'm writing to report a ...">
+vulnerability in [project name], and briefly describe the affected
+component. Explain that the reported bug was discovered through
+AI-assisted static code auditing and passed human validation before
+disclosure. e.g., "I'm writing to report a ...">
 
 <Affected versions paragraph: state which versions and modules are
 known to be affected.>
+
+<Security rationale paragraph: summarize why this bug should be treated
+as a security issue under the target security guidelines. Reference the
+project's explicit scope, bug bounty criteria, or vulnerability criteria
+when available; otherwise summarize the historical calibration and
+reproduced impact. Keep this maintainer-facing and avoid internal audit
+terminology.>
 
 <Impact paragraph: describe the security impact — what an attacker
 could achieve, the severity (reference the CVSS score), and the
@@ -214,7 +227,9 @@ Regards
 
 - [ ] Email written to `__DISCLOSURE_DIR__/email.txt`
 - [ ] Plain-text format with lines wrapped at 72 characters
+- [ ] Email includes a concise target security guidelines rationale for why the bug is a security issue
 - [ ] Email communicates the security impact and references `disclosure.zip`
+- [ ] Email states the bug was discovered by AI-assisted static code auditing and passed human validation
 - [ ] No internal audit identifiers
 
 ### Step 5: Package Artifacts

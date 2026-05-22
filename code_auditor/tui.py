@@ -1,4 +1,4 @@
-"""Terminal User Interface for CodeAuditor using Rich.
+"""Terminal User Interface for CodeAuditor using Textual and Rich.
 
 Provides a beautiful dashboard that shows:
 - Audit configuration summary
@@ -8,6 +8,7 @@ Provides a beautiful dashboard that shows:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import select
 import sys
@@ -17,17 +18,22 @@ import time
 import tty
 from _thread import interrupt_main
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from rich.console import Console
 from rich.layout import Layout
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
+from textual.app import App, ComposeResult
+from textual.css.query import NoMatches
+from textual.widgets import Footer, Header, RichLog, Static
 
 from .logger import configure_logging as _configure_logging
 from .logger import format_log_record
+
+TUI_BACKEND = "textual"
 
 # ── Colour palette ──────────────────────────────────────────────────────────
 ACCENT = "cyan"
@@ -324,10 +330,180 @@ def _render_dashboard(state: TUIState) -> Layout:
     return layout
 
 
+class CodeAuditorApp(App[None]):
+    """Textual app that renders CodeAuditor state with Rich widgets."""
+
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+
+    #config {
+        height: 7;
+    }
+
+    #stages {
+        height: 15;
+    }
+
+    #logs {
+        height: 1fr;
+        border: solid $surface;
+    }
+
+    #summary {
+        height: 8;
+        display: none;
+    }
+    """
+
+    BINDINGS = [
+        ("q", "request_exit", "Quit"),
+        ("ctrl+c", "interrupt", "Interrupt"),
+        ("j", "scroll_log_down", "Scroll down"),
+        ("k", "scroll_log_up", "Scroll up"),
+        ("pagedown", "scroll_log_page_down", "Page down"),
+        ("pageup", "scroll_log_page_up", "Page up"),
+        ("end", "scroll_log_latest", "Latest"),
+        ("home", "scroll_log_oldest", "Oldest"),
+    ]
+
+    def __init__(
+        self,
+        state: TUIState,
+        *,
+        exit_callback: Callable[[], None] | None = None,
+        interrupt_callback: Callable[[], None] | None = None,
+        audit_coro_factory: Callable[[], Awaitable[None]] | None = None,
+        audit_done_callback: Callable[[BaseException | None], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self._state = state
+        self._exit_callback = exit_callback
+        self._interrupt_callback = interrupt_callback
+        self._audit_coro_factory = audit_coro_factory
+        self._audit_done_callback = audit_done_callback
+        self._audit_task: asyncio.Task[None] | None = None
+        self._rendered_log_signature: tuple[int, int, int] | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static(id="config")
+        yield Static(id="stages")
+        yield RichLog(id="logs", wrap=True, highlight=False, markup=False)
+        yield Static(id="summary")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_from_state()
+        self.set_interval(0.25, self.refresh_from_state)
+        if self._audit_coro_factory:
+            self._audit_task = asyncio.create_task(self._run_audit())
+
+    async def _run_audit(self) -> None:
+        error: BaseException | None = None
+        assert self._audit_coro_factory is not None
+        try:
+            await self._audit_coro_factory()
+        except BaseException as exc:
+            error = exc
+        finally:
+            self._state.finished = True
+            if self._audit_done_callback:
+                self._audit_done_callback(error)
+            self.refresh_from_state()
+
+    def refresh_from_state(self) -> None:
+        if not self.is_mounted:
+            return
+
+        try:
+            config = self.query_one("#config", Static)
+            stages = self.query_one("#stages", Static)
+            summary = self.query_one("#summary", Static)
+        except NoMatches:
+            return
+
+        config.update(_make_config_table(self._state))
+        stages.update(_make_stage_panel(self._state))
+
+        summary.display = self._state.finished
+        if self._state.finished:
+            summary.update(_make_summary(self._state))
+
+        self._refresh_log()
+
+    def _refresh_log(self) -> None:
+        visible_lines = _visible_log_lines(self._state)
+        signature = (
+            len(self._state.log_lines),
+            self._state.log_scroll_offset,
+            self._state.max_log_lines,
+        )
+        if signature == self._rendered_log_signature:
+            return
+
+        try:
+            log = self.query_one("#logs", RichLog)
+        except NoMatches:
+            return
+        log.clear()
+        if visible_lines:
+            for line in visible_lines:
+                log.write(line, scroll_end=self._state.log_scroll_offset == 0)
+        else:
+            log.write(Text("Waiting for logs...", style=DIM), scroll_end=True)
+        self._rendered_log_signature = signature
+
+    def action_request_exit(self) -> None:
+        if self._audit_task and not self._audit_task.done():
+            self._audit_task.cancel()
+            if self._interrupt_callback:
+                self._interrupt_callback()
+        elif self._exit_callback:
+            self._exit_callback()
+        self.exit()
+
+    def action_interrupt(self) -> None:
+        if self._audit_task and not self._audit_task.done():
+            self._audit_task.cancel()
+        if self._interrupt_callback:
+            self._interrupt_callback()
+        self.exit()
+
+    def action_scroll_log_down(self) -> None:
+        self._state.log_scroll_offset -= 1
+        _clamp_log_scroll_offset(self._state)
+        self.refresh_from_state()
+
+    def action_scroll_log_up(self) -> None:
+        self._state.log_scroll_offset += 1
+        _clamp_log_scroll_offset(self._state)
+        self.refresh_from_state()
+
+    def action_scroll_log_page_down(self) -> None:
+        self._state.log_scroll_offset -= max(1, self._state.max_log_lines)
+        _clamp_log_scroll_offset(self._state)
+        self.refresh_from_state()
+
+    def action_scroll_log_page_up(self) -> None:
+        self._state.log_scroll_offset += max(1, self._state.max_log_lines)
+        _clamp_log_scroll_offset(self._state)
+        self.refresh_from_state()
+
+    def action_scroll_log_latest(self) -> None:
+        self._state.log_scroll_offset = 0
+        self.refresh_from_state()
+
+    def action_scroll_log_oldest(self) -> None:
+        self._state.log_scroll_offset = _max_log_scroll_offset(self._state)
+        self.refresh_from_state()
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 class TUIManager:
-    """Manages the Rich live dashboard for CodeAuditor.
+    """Manages the Textual live dashboard for CodeAuditor.
 
     Usage::
 
@@ -352,7 +528,12 @@ class TUIManager:
     def __init__(self) -> None:
         self._state = TUIState()
         self._console = Console()
-        self._live: Live | None = None
+        self._app: CodeAuditorApp | None = None
+        self._app_thread: threading.Thread | None = None
+        self._app_thread_id: int | None = None
+        self._audit_thread: threading.Thread | None = None
+        self._audit_loop: asyncio.AbstractEventLoop | None = None
+        self._audit_task: asyncio.Task[None] | None = None
         self._log_handler: _TUILogHandler | None = None
         self._refresh_thread: threading.Thread | None = None
         self._stop_refresh = threading.Event()
@@ -362,6 +543,8 @@ class TUIManager:
         self._mouse_reporting_enabled = False
         self._exit_requested = False
         self._interrupt_main = interrupt_main
+        self._audit_failed = False
+        self._audit_interrupted = False
 
     # ── Configuration ───────────────────────────────────────────────────
 
@@ -390,15 +573,7 @@ class TUIManager:
         """Start the live dashboard and install the log handler."""
         self._state.start_time = time.time()
 
-        # Install log handler
-        self._log_handler = _TUILogHandler(self._state)
-        self._log_handler.setLevel(logging.DEBUG)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
-        self._log_handler.setFormatter(fmt)
-
-        root_logger = logging.getLogger("code_auditor")
-        root_logger.handlers.clear()
-        root_logger.addHandler(self._log_handler)
+        self._install_log_handler()
 
         # Start live display
         self._start_live()
@@ -413,8 +588,88 @@ class TUIManager:
         self._refresh_thread = threading.Thread(target=_bg_refresh, daemon=True)
         self._refresh_thread.start()
 
-        # Start keyboard listener for Ctrl+C interruption and final q exit.
-        self._start_keyboard_listener()
+    def run_audit(self, audit_coro_factory: Callable[[], Awaitable[None]]) -> tuple[bool, bool]:
+        """Run Textual on the main thread and audit work in a background loop."""
+        self._state.start_time = time.time()
+        self._audit_failed = False
+        self._audit_interrupted = False
+        self._exit_requested = False
+        self._install_log_handler()
+        self._app = CodeAuditorApp(
+            self._state,
+            exit_callback=self._mark_exit_requested,
+            interrupt_callback=self._interrupt_from_tui,
+            audit_done_callback=self._audit_done,
+        )
+        self._app_thread_id = threading.get_ident()
+        self._start_audit_thread(audit_coro_factory)
+        try:
+            self._app.run()
+        finally:
+            if self._audit_thread and self._audit_thread.is_alive():
+                self._cancel_audit()
+                self._audit_thread.join(timeout=2.0)
+            self._remove_log_handler()
+            self._app = None
+            self._app_thread = None
+            self._app_thread_id = None
+            self._audit_thread = None
+        return self._audit_failed, self._audit_interrupted
+
+    def _start_audit_thread(self, audit_coro_factory: Callable[[], Awaitable[None]]) -> None:
+        def _run() -> None:
+            loop = asyncio.new_event_loop()
+            self._audit_loop = loop
+            asyncio.set_event_loop(loop)
+            error: BaseException | None = None
+            try:
+                task = loop.create_task(audit_coro_factory())
+                self._audit_task = task
+                loop.run_until_complete(task)
+            except BaseException as exc:
+                error = exc
+            finally:
+                self._state.finished = True
+                self._audit_done(error)
+                self._refresh()
+                self._audit_task = None
+                self._audit_loop = None
+                loop.close()
+
+        self._audit_thread = threading.Thread(target=_run, daemon=True)
+        self._audit_thread.start()
+
+    def _cancel_audit(self) -> None:
+        loop = self._audit_loop
+        task = self._audit_task
+        if loop and task and not task.done():
+            loop.call_soon_threadsafe(task.cancel)
+
+    def _install_log_handler(self) -> None:
+        self._log_handler = _TUILogHandler(self._state)
+        self._log_handler.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+        self._log_handler.setFormatter(fmt)
+
+        root_logger = logging.getLogger("code_auditor")
+        root_logger.handlers.clear()
+        root_logger.addHandler(self._log_handler)
+
+    def _remove_log_handler(self) -> None:
+        if self._log_handler:
+            root_logger = logging.getLogger("code_auditor")
+            root_logger.removeHandler(self._log_handler)
+            self._log_handler = None
+
+    def _audit_done(self, error: BaseException | None) -> None:
+        if error is None:
+            return
+        if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)):
+            self._audit_interrupted = True
+            self._state.error = "Interrupted by user."
+            return
+        self._audit_failed = True
+        self._state.error = str(error)
 
     def stop(self) -> None:
         """Stop the live display and remove the log handler."""
@@ -429,12 +684,8 @@ class TUIManager:
         if self._refresh_thread:
             self._refresh_thread.join(timeout=1.0)
             self._refresh_thread = None
-        if self._live:
-            self._sync_log_viewport_size()
-            self._live.refresh()
-            time.sleep(0.1)
-            self._live.stop()
-            self._live = None
+        self._refresh()
+        self._stop_textual_app()
 
         if self._log_handler:
             root_logger = logging.getLogger("code_auditor")
@@ -459,13 +710,11 @@ class TUIManager:
             self._refresh_thread = None
 
         # One final update so the summary panel appears in the dashboard.
-        if self._live:
-            self._sync_log_viewport_size()
-            self._live.update(_render_dashboard(self._state))
+        self._refresh()
 
-        if self._keyboard_enabled and self._keyboard_thread and self._keyboard_thread.is_alive():
+        if self._app_thread and self._app_thread.is_alive():
             self._exit_requested = False
-            while not self._exit_requested and not self._stop_keyboard.is_set():
+            while not self._exit_requested and self._app_thread.is_alive():
                 time.sleep(0.1)
 
         self._stop_keyboard.set()
@@ -475,10 +724,7 @@ class TUIManager:
         self._set_mouse_reporting(False)
         self._keyboard_enabled = False
 
-        # Stop Live and exit alternate screen
-        if self._live:
-            self._live.stop()
-            self._live = None
+        self._stop_textual_app()
 
         if self._log_handler:
             root_logger = logging.getLogger("code_auditor")
@@ -492,6 +738,19 @@ class TUIManager:
         self._exit_requested = True
         self._stop_keyboard.set()
         self._stop_refresh.set()
+        self._exit_textual_app()
+
+    def _mark_exit_requested(self) -> None:
+        self._exit_requested = True
+        self._stop_keyboard.set()
+        self._stop_refresh.set()
+
+    def _interrupt_from_tui(self) -> None:
+        self._mark_exit_requested()
+        self._audit_interrupted = True
+        self._state.error = "Interrupted by user."
+        if self._app_thread_id != threading.get_ident():
+            self._interrupt_main()
 
     # ── Keyboard listener ───────────────────────────────────────────────
 
@@ -742,14 +1001,19 @@ class TUIManager:
 
     def _start_live(self) -> None:
         self._sync_log_viewport_size()
-        self._live = Live(
-            _render_dashboard(self._state),
-            console=self._console,
-            refresh_per_second=4,
-            screen=True,
-            vertical_overflow="visible",
+        self._app = CodeAuditorApp(
+            self._state,
+            exit_callback=self._mark_exit_requested,
+            interrupt_callback=self._interrupt_from_tui,
         )
-        self._live.start()
+
+        def _run_app() -> None:
+            assert self._app is not None
+            self._app_thread_id = threading.get_ident()
+            self._app.run(headless=True)
+
+        self._app_thread = threading.Thread(target=_run_app, daemon=True)
+        self._app_thread.start()
 
     # ── Refresh ─────────────────────────────────────────────────────────
 
@@ -759,9 +1023,48 @@ class TUIManager:
         _clamp_log_scroll_offset(self._state)
 
     def _refresh(self) -> None:
-        if self._live:
-            self._sync_log_viewport_size()
-            self._live.update(_render_dashboard(self._state))
+        self._sync_log_viewport_size()
+        app = self._app
+        if app is None:
+            return
+        if self._app_thread_id == threading.get_ident():
+            app.refresh_from_state()
+            return
+        if self._app_thread is not None and not self._app_thread.is_alive():
+            return
+        call_from_thread = getattr(app, "call_from_thread", None)
+        if call_from_thread is None:
+            return
+        try:
+            call_from_thread(app.refresh_from_state)
+        except RuntimeError:
+            pass
+
+    def _exit_textual_app(self) -> None:
+        app = self._app
+        if app is None:
+            return
+        if self._app_thread_id == threading.get_ident():
+            app.exit()
+            return
+        if self._app_thread is not None and not self._app_thread.is_alive():
+            return
+        call_from_thread = getattr(app, "call_from_thread", None)
+        if call_from_thread is None:
+            return
+        try:
+            call_from_thread(app.exit)
+        except RuntimeError:
+            pass
+
+    def _stop_textual_app(self) -> None:
+        self._exit_textual_app()
+        if self._app_thread:
+            self._app_thread.join(timeout=1.0)
+            if not self._app_thread.is_alive():
+                self._app_thread = None
+                self._app = None
+                self._app_thread_id = None
 
     # ── Stage events ────────────────────────────────────────────────────
 

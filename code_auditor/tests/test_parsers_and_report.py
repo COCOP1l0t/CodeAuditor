@@ -10,6 +10,7 @@ import pytest
 from code_auditor.checkpoint import CheckpointManager
 from code_auditor.config import AnalysisUnit, AuditConfig
 from code_auditor.parsing.stage2 import parse_au_files, parse_auditing_focus
+from code_auditor.prompts import load_prompt
 from code_auditor.stages import stage3
 from code_auditor.stages import stage4
 from code_auditor.validation.stage2 import (
@@ -18,6 +19,7 @@ from code_auditor.validation.stage2 import (
     validate_triage_file,
 )
 from code_auditor.validation.stage4 import validate_stage4_file
+from code_auditor.validation.stage6 import validate_stage6_disclosure
 
 
 def _write_au(path: str, desc: str, files: list[str], focus: str) -> None:
@@ -264,6 +266,48 @@ def test_stage4_validator_rejects_non_array_propagation_chain():
         issues = validate_stage4_file(path)
         chain_issues = [i for i in issues if "propagation_chain" in i.description and "array" in i.description]
         assert len(chain_issues) == 1
+
+
+def test_stage6_prompt_requires_target_guidelines_security_rationale() -> None:
+    prompt = load_prompt("stage6.md", {
+        "vuln_report_path": "/tmp/report.md",
+        "poc_dir": "/tmp/poc",
+        "finding_reference": "Finding context",
+        "target_path": "/tmp/target",
+        "disclosure_dir": "/tmp/disclosure",
+        "vuln_id": "H-01",
+        "wiki_context": "No wiki context.",
+    })
+
+    assert "Why This Is a Security Issue" in prompt
+    assert "target security guidelines" in prompt.lower()
+    assert "maintainer" in prompt.lower()
+
+
+def test_stage6_validator_rejects_report_missing_security_rationale_section() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        report_path = os.path.join(tmp, "report.md")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(
+                "# Report\n\n"
+                "## Summary\n\nSummary text.\n\n"
+                "## Severity Assessment\n\nHigh.\n\n"
+                "## Security Impact\n\nImpact text.\n\n"
+                "## Root Cause\n\nRoot cause text.\n\n"
+                "## Reproduction\n\nSteps.\n"
+            )
+        with open(os.path.join(tmp, "email.txt"), "w", encoding="utf-8") as f:
+            f.write("Subject: [Security] Test\n")
+        with open(os.path.join(tmp, "disclosure.zip"), "wb") as f:
+            f.write(b"zip")
+
+        issues = validate_stage6_disclosure(tmp)
+
+    missing = [
+        issue for issue in issues
+        if "Why This Is a Security Issue" in issue.description
+    ]
+    assert len(missing) == 1
 
 
 def test_stage4_finalize_skips_invalid_pending_file() -> None:

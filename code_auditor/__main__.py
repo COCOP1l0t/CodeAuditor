@@ -119,7 +119,7 @@ def main() -> None:
     )
 
     if args.tui:
-        # TUI mode: Rich live dashboard
+        # TUI mode: Textual live dashboard
         tui = TUIManager()
         tui.configure(
             target=config.target,
@@ -131,25 +131,14 @@ def main() -> None:
             max_parallel=config.max_parallel,
         )
         configure_logging(config.log_level)
-        tui.start()
-        if config.wiki_path:
-            logger.info("Loaded wiki knowledge base: %s", config.wiki_path)
-        logger.info("Starting audit of %s", config.target)
 
-        failed = False
-        interrupted = False
-        try:
-            asyncio.run(run_audit(config, tui=tui))
-        except KeyboardInterrupt:
-            interrupted = True
-            tui.request_exit()
-            tui.set_error("Interrupted by user.")
-        except Exception as e:
-            failed = True
-            tui.set_error(str(e))
-            logger.error("Audit failed: %s", e)
-        finally:
-            tui.wait_for_exit()
+        async def run_tui_audit() -> None:
+            if config.wiki_path:
+                logger.info("Loaded wiki knowledge base: %s", config.wiki_path)
+            logger.info("Starting audit of %s", config.target)
+            await run_audit(config, tui=tui)
+
+        failed, interrupted = tui.run_audit(run_tui_audit)
         if interrupted:
             _exit_after_keyboard_interrupt()
         if failed:

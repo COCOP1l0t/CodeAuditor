@@ -7,7 +7,7 @@ import subprocess
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Callable, Coroutine, Protocol, TextIO
+from typing import Any, Callable, Coroutine, Protocol, TextIO
 from uuid import uuid4
 
 from .config import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, AuditConfig, ValidationIssue
@@ -28,6 +28,7 @@ class _KillableProcess(Protocol):
 
 
 _claude_sdk_patched = False
+_CODEX_SERVICE_TIER_COMPAT_ATTR = "_code_auditor_service_tier_compat"
 _AGENT_PROCESS_REGISTRAR: ContextVar[Callable[[_KillableProcess | None], None] | None] = ContextVar(
     "agent_process_registrar",
     default=None,
@@ -262,6 +263,105 @@ def _resolve_codex_bin() -> str:
     return DEFAULT_CODEX_BIN
 
 
+@dataclass(frozen=True)
+class _CodexSdk:
+    flavor: str
+    async_codex_cls: type[Any]
+    app_server_config_cls: type[Any]
+    app_server_client_cls: type[Any] | None
+    approval_mode_cls: type[Any] | None
+    ask_for_approval_cls: type[Any] | None
+    reasoning_effort_cls: type[Any]
+    sandbox_policy_cls: type[Any]
+    service_tier_cls: type[Any] | None
+
+
+def _load_codex_sdk() -> _CodexSdk:
+    try:
+        from openai_codex import (  # type: ignore[import-not-found]
+            AppServerConfig,
+            ApprovalMode,
+            AsyncCodex,
+        )
+        from openai_codex.client import AppServerClient  # type: ignore[import-not-found]
+        from openai_codex.types import (  # type: ignore[import-not-found]
+            ReasoningEffort,
+            SandboxPolicy,
+        )
+
+        return _CodexSdk(
+            flavor="openai_codex",
+            async_codex_cls=AsyncCodex,
+            app_server_config_cls=AppServerConfig,
+            app_server_client_cls=AppServerClient,
+            approval_mode_cls=ApprovalMode,
+            ask_for_approval_cls=None,
+            reasoning_effort_cls=ReasoningEffort,
+            sandbox_policy_cls=SandboxPolicy,
+            service_tier_cls=None,
+        )
+    except ImportError as openai_codex_exc:
+        try:
+            from codex_app_server import (  # type: ignore[import-not-found]
+                AskForApproval,
+                AppServerConfig,
+                AppServerClient,
+                AsyncCodex,
+                ReasoningEffort,
+                SandboxPolicy,
+                ServiceTier,
+            )
+        except ImportError as legacy_exc:
+            raise RuntimeError(
+                "Codex backend requires the OpenAI Codex Python SDK "
+                "(`openai-codex` / `openai_codex`). The legacy "
+                "`codex-app-server-sdk` package is still accepted as a fallback."
+            ) from legacy_exc
+
+        logger.debug("Using legacy codex-app-server-sdk fallback: %s", openai_codex_exc)
+        return _CodexSdk(
+            flavor="codex_app_server",
+            async_codex_cls=AsyncCodex,
+            app_server_config_cls=AppServerConfig,
+            app_server_client_cls=AppServerClient,
+            approval_mode_cls=None,
+            ask_for_approval_cls=AskForApproval,
+            reasoning_effort_cls=ReasoningEffort,
+            sandbox_policy_cls=SandboxPolicy,
+            service_tier_cls=ServiceTier,
+        )
+
+
+def _normalize_codex_service_tier_response(value: Any) -> Any:
+    """Map newer Codex service tier values to this SDK's generated enum."""
+    if isinstance(value, dict):
+        normalized: dict[Any, Any] = {}
+        for key, item in value.items():
+            if key in ("serviceTier", "service_tier") and item == "priority":
+                normalized[key] = "fast"
+            else:
+                normalized[key] = _normalize_codex_service_tier_response(item)
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_codex_service_tier_response(item) for item in value]
+    return value
+
+
+def _patch_codex_sdk_service_tier_compat(app_server_client_cls: type[Any]) -> None:
+    """Patch Codex SDK response decoding for older generated ServiceTier enums."""
+    original_request_raw = app_server_client_cls._request_raw
+    if getattr(original_request_raw, _CODEX_SERVICE_TIER_COMPAT_ATTR, False):
+        return
+
+    def patched_request_raw(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return _normalize_codex_service_tier_response(
+            original_request_raw(self, *args, **kwargs)
+        )
+
+    setattr(patched_request_raw, _CODEX_SERVICE_TIER_COMPAT_ATTR, True)
+    app_server_client_cls._request_raw = patched_request_raw
+
+
 async def _run_claude_agent(
     prompt: str,
     config: AuditConfig,
@@ -362,19 +462,9 @@ async def _run_codex_agent(
     log_file: str | None = None,
     run_control: _AgentRunControl | None = None,
 ) -> str:
-    try:
-        from codex_app_server import (  # type: ignore[import-not-found]
-            AskForApproval,
-            AppServerConfig,
-            AsyncCodex,
-            ReasoningEffort,
-            SandboxPolicy,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            "Codex backend requires the codex-app-server-sdk package. "
-            "Install project dependencies again after this change."
-        ) from exc
+    codex_sdk = _load_codex_sdk()
+    if codex_sdk.flavor == "codex_app_server" and codex_sdk.app_server_client_cls is not None:
+        _patch_codex_sdk_service_tier_compat(codex_sdk.app_server_client_cls)
 
     if allowed_tools is not None:
         logger.debug("Codex backend does not map Claude allowed_tools directly; using Codex defaults.")
@@ -383,9 +473,18 @@ async def _run_codex_agent(
 
     selected_model = model or config.model or DEFAULT_CODEX_MODEL
     codex_bin = _resolve_codex_bin()
-    approval_policy = AskForApproval.model_validate("never")
-    sandbox_policy = SandboxPolicy.model_validate({"type": "dangerFullAccess"})
-    codex_effort = ReasoningEffort(effort) if effort else None
+    sandbox_policy = codex_sdk.sandbox_policy_cls.model_validate({"type": "dangerFullAccess"})
+    codex_effort = codex_sdk.reasoning_effort_cls(effort) if effort else None
+    if codex_sdk.flavor == "openai_codex":
+        if codex_sdk.approval_mode_cls is None:
+            raise RuntimeError("Current Codex SDK import did not expose ApprovalMode.")
+        approval_setting = codex_sdk.approval_mode_cls.deny_all
+        codex_service_tier: object = "fast"
+    else:
+        if codex_sdk.ask_for_approval_cls is None or codex_sdk.service_tier_cls is None:
+            raise RuntimeError("Legacy Codex SDK import did not expose approval or service-tier types.")
+        approval_setting = codex_sdk.ask_for_approval_cls.model_validate("never")
+        codex_service_tier = codex_sdk.service_tier_cls.fast
 
     log_fh = _open_agent_log(log_file)
     run_control = run_control or _AgentRunControl()
@@ -398,23 +497,47 @@ async def _run_codex_agent(
                     log_fh.flush()
 
                 async def run_codex_turn() -> str:
-                    app_server_config = AppServerConfig(codex_bin=codex_bin, cwd=cwd)
-                    async with AsyncCodex(config=app_server_config) as codex:
+                    app_server_config = codex_sdk.app_server_config_cls(
+                        codex_bin=codex_bin,
+                        cwd=cwd,
+                        config_overrides=('service_tier="fast"',),
+                    )
+                    async with codex_sdk.async_codex_cls(config=app_server_config) as codex:
                         codex_client = getattr(codex, "_client", None)
                         sync_client = getattr(codex_client, "_sync", None)
                         run_control.register_process(getattr(sync_client, "_proc", None))
-                        thread = await codex.thread_start(
-                            cwd=cwd,
-                            model=selected_model,
-                        )
-                        result = await thread.run(
-                            prompt,
-                            approval_policy=approval_policy,
-                            cwd=cwd,
-                            effort=codex_effort,
-                            model=selected_model,
-                            sandbox_policy=sandbox_policy,
-                        )
+                        if codex_sdk.flavor == "openai_codex":
+                            thread = await codex.thread_start(
+                                approval_mode=approval_setting,
+                                cwd=cwd,
+                                model=selected_model,
+                                service_tier=codex_service_tier,
+                            )
+                            result = await thread.run(
+                                prompt,
+                                approval_mode=approval_setting,
+                                cwd=cwd,
+                                effort=codex_effort,
+                                model=selected_model,
+                                sandbox_policy=sandbox_policy,
+                                service_tier=codex_service_tier,
+                            )
+                        else:
+                            thread = await codex.thread_start(
+                                approval_policy=approval_setting,
+                                cwd=cwd,
+                                model=selected_model,
+                                service_tier=codex_service_tier,
+                            )
+                            result = await thread.run(
+                                prompt,
+                                approval_policy=approval_setting,
+                                cwd=cwd,
+                                effort=codex_effort,
+                                model=selected_model,
+                                sandbox_policy=sandbox_policy,
+                                service_tier=codex_service_tier,
+                            )
                     return result.final_response or ""
 
                 text = await _run_agent_attempt_with_stale_log_watch(

@@ -4,12 +4,16 @@ import asyncio
 import logging
 import sys
 import threading
+import types
+from enum import Enum
+from pathlib import Path
 
 import pytest
 
 from code_auditor import __main__ as main_module
 from code_auditor import agent
 from code_auditor import logger as logger_module
+from code_auditor import tui as tui_module
 from code_auditor.__main__ import _build_parser
 from code_auditor.config import (
     DEFAULT_AGENT_TIMEOUT_SECONDS,
@@ -345,14 +349,12 @@ def test_tui_mode_exits_nonzero_after_audit_failure(
         def configure(self, **_kwargs) -> None:  # type: ignore[no-untyped-def]
             pass
 
-        def start(self) -> None:
-            pass
-
-        def set_error(self, _message: str) -> None:
-            pass
-
-        def wait_for_exit(self) -> None:
-            pass
+        def run_audit(self, audit_coro_factory) -> tuple[bool, bool]:  # type: ignore[no-untyped-def]
+            try:
+                asyncio.run(audit_coro_factory())
+            except Exception:
+                return True, False
+            return False, False
 
     async def failing_run_audit(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
         raise RuntimeError("audit failed")
@@ -370,6 +372,76 @@ def test_tui_mode_exits_nonzero_after_audit_failure(
         main_module.main()
 
     assert exc.value.code == 1
+
+
+def test_tui_mode_runs_audit_through_textual_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    target = tmp_path / "target"
+    target.mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeTUIManager:
+        def configure(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            captured["configured"] = kwargs
+
+        def run_audit(self, audit_coro_factory) -> tuple[bool, bool]:  # type: ignore[no-untyped-def]
+            captured["run_audit_called"] = True
+            asyncio.run(audit_coro_factory())
+            return False, False
+
+    async def fake_run_audit(config: AuditConfig, tui: FakeTUIManager | None = None) -> None:
+        captured["config"] = config
+        captured["tui"] = tui
+
+    monkeypatch.setattr(main_module, "TUIManager", FakeTUIManager)
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--tui",
+    ])
+
+    main_module.main()
+
+    assert captured["run_audit_called"] is True
+    assert isinstance(captured["config"], AuditConfig)
+    assert isinstance(captured["tui"], FakeTUIManager)
+
+
+def test_textual_tui_runs_audit_outside_app_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_started = threading.Event()
+    audit_continue = threading.Event()
+    app_entered = threading.Event()
+
+    class FakeCodeAuditorApp:
+        def __init__(self, *_args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            self._exit_callback = kwargs.get("exit_callback")
+
+        def run(self) -> None:
+            app_entered.set()
+            assert audit_started.wait(timeout=1.0), "audit did not start while Textual app was running"
+            audit_continue.set()
+            if self._exit_callback:
+                self._exit_callback()
+
+        def exit(self) -> None:
+            pass
+
+    async def blocking_audit() -> None:
+        audit_started.set()
+        assert app_entered.is_set()
+        assert audit_continue.wait(timeout=1.0)
+
+    monkeypatch.setattr(tui_module, "CodeAuditorApp", FakeCodeAuditorApp)
+
+    manager = TUIManager()
+    failed, interrupted = manager.run_audit(blocking_audit)
+
+    assert failed is False
+    assert interrupted is False
 
 
 @pytest.mark.parametrize(
@@ -431,6 +503,211 @@ def test_run_agent_dispatches_to_codex_backend(monkeypatch: pytest.MonkeyPatch) 
     asyncio.run(run_case())
 
 
+def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        captured: dict[str, object] = {}
+        fake_openai_codex = types.ModuleType("openai_codex")
+        fake_openai_codex_client = types.ModuleType("openai_codex.client")
+        fake_openai_codex_types = types.ModuleType("openai_codex.types")
+
+        class FakeApprovalMode(Enum):
+            deny_all = "deny_all"
+            auto_review = "auto_review"
+
+        class FakeSandboxPolicy:
+            @classmethod
+            def model_validate(cls, value: dict[str, str]) -> dict[str, str]:
+                return value
+
+        class FakeReasoningEffort:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        class FakeAppServerConfig:
+            def __init__(
+                self,
+                *,
+                codex_bin: str,
+                cwd: str,
+                config_overrides: tuple[str, ...] = (),
+            ) -> None:
+                captured["codex_bin"] = codex_bin
+                captured["cwd"] = cwd
+                captured["config_overrides"] = config_overrides
+
+        class FakeAppServerClient:
+            pass
+
+        class FakeRunResult:
+            final_response = "codex-result"
+
+        class FakeThread:
+            async def run(self, prompt: str, **kwargs: object) -> FakeRunResult:
+                captured["prompt"] = prompt
+                captured["run_approval_mode"] = kwargs.get("approval_mode")
+                captured["run_sandbox_policy"] = kwargs.get("sandbox_policy")
+                captured["run_service_tier"] = kwargs.get("service_tier")
+                return FakeRunResult()
+
+        class FakeAsyncCodex:
+            def __init__(self, *, config: FakeAppServerConfig) -> None:
+                captured["app_server_config"] = config
+                self._client = types.SimpleNamespace(_sync=types.SimpleNamespace(_proc=None))
+
+            async def __aenter__(self) -> "FakeAsyncCodex":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def thread_start(self, **kwargs: object) -> FakeThread:
+                captured["thread_start_approval_mode"] = kwargs.get("approval_mode")
+                captured["thread_start_service_tier"] = kwargs.get("service_tier")
+                return FakeThread()
+
+        fake_openai_codex.AppServerConfig = FakeAppServerConfig
+        fake_openai_codex.ApprovalMode = FakeApprovalMode
+        fake_openai_codex.AsyncCodex = FakeAsyncCodex
+        fake_openai_codex_client.AppServerClient = FakeAppServerClient
+        fake_openai_codex_types.ReasoningEffort = FakeReasoningEffort
+        fake_openai_codex_types.SandboxPolicy = FakeSandboxPolicy
+        monkeypatch.setitem(sys.modules, "openai_codex", fake_openai_codex)
+        monkeypatch.setitem(sys.modules, "openai_codex.client", fake_openai_codex_client)
+        monkeypatch.setitem(sys.modules, "openai_codex.types", fake_openai_codex_types)
+        monkeypatch.setattr(agent, "_resolve_codex_bin", lambda: "/tmp/codex")
+
+        config = AuditConfig(target="/tmp/project", output_dir="/tmp/output", backend="codex")
+
+        assert await agent._run_codex_agent("prompt", config, cwd="/tmp/project") == "codex-result"
+        assert captured["config_overrides"] == ('service_tier="fast"',)
+        assert captured["thread_start_approval_mode"] is FakeApprovalMode.deny_all
+        assert captured["thread_start_service_tier"] == "fast"
+        assert captured["run_approval_mode"] is FakeApprovalMode.deny_all
+        assert captured["run_sandbox_policy"] == {"type": "dangerFullAccess"}
+        assert captured["run_service_tier"] == "fast"
+
+    asyncio.run(run_case())
+
+
+def test_codex_backend_forces_supported_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        captured: dict[str, object] = {}
+        fake_codex_app_server = types.ModuleType("codex_app_server")
+
+        class FakeServiceTier(Enum):
+            fast = "fast"
+            flex = "flex"
+
+        class FakeAskForApproval:
+            @classmethod
+            def model_validate(cls, value: str) -> str:
+                return value
+
+        class FakeSandboxPolicy:
+            @classmethod
+            def model_validate(cls, value: dict[str, str]) -> dict[str, str]:
+                return value
+
+        class FakeReasoningEffort:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        class FakeAppServerConfig:
+            def __init__(
+                self,
+                *,
+                codex_bin: str,
+                cwd: str,
+                config_overrides: tuple[str, ...] = (),
+            ) -> None:
+                captured["codex_bin"] = codex_bin
+                captured["cwd"] = cwd
+                captured["config_overrides"] = config_overrides
+
+        class FakeAppServerClient:
+            def _request_raw(self, _method: str, _params: dict[str, object] | None = None) -> dict[str, object]:
+                return {}
+
+        class FakeRunResult:
+            final_response = "codex-result"
+
+        class FakeThread:
+            async def run(self, prompt: str, **kwargs: object) -> FakeRunResult:
+                captured["prompt"] = prompt
+                captured["run_service_tier"] = kwargs.get("service_tier")
+                return FakeRunResult()
+
+        class FakeAsyncCodex:
+            def __init__(self, *, config: FakeAppServerConfig) -> None:
+                captured["app_server_config"] = config
+                self._client = types.SimpleNamespace(_sync=types.SimpleNamespace(_proc=None))
+
+            async def __aenter__(self) -> "FakeAsyncCodex":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def thread_start(self, **kwargs: object) -> FakeThread:
+                captured["thread_start_approval_policy"] = kwargs.get("approval_policy")
+                captured["thread_start_service_tier"] = kwargs.get("service_tier")
+                return FakeThread()
+
+        fake_codex_app_server.AskForApproval = FakeAskForApproval
+        fake_codex_app_server.AppServerConfig = FakeAppServerConfig
+        fake_codex_app_server.AppServerClient = FakeAppServerClient
+        fake_codex_app_server.AsyncCodex = FakeAsyncCodex
+        fake_codex_app_server.ReasoningEffort = FakeReasoningEffort
+        fake_codex_app_server.SandboxPolicy = FakeSandboxPolicy
+        fake_codex_app_server.ServiceTier = FakeServiceTier
+        monkeypatch.setitem(sys.modules, "openai_codex", None)
+        monkeypatch.setitem(sys.modules, "openai_codex.client", None)
+        monkeypatch.setitem(sys.modules, "openai_codex.types", None)
+        monkeypatch.setitem(sys.modules, "codex_app_server", fake_codex_app_server)
+        monkeypatch.setattr(agent, "_resolve_codex_bin", lambda: "/tmp/codex")
+
+        config = AuditConfig(target="/tmp/project", output_dir="/tmp/output", backend="codex")
+
+        assert await agent._run_codex_agent("prompt", config, cwd="/tmp/project") == "codex-result"
+        assert captured["config_overrides"] == ('service_tier="fast"',)
+        assert captured["thread_start_approval_policy"] == "never"
+        assert captured["thread_start_service_tier"] is FakeServiceTier.fast
+        assert captured["run_service_tier"] is FakeServiceTier.fast
+
+    asyncio.run(run_case())
+
+
+def test_codex_sdk_patch_normalizes_priority_service_tier_responses() -> None:
+    class FakeClient:
+        def _request_raw(self, _method: str, _params: dict[str, object] | None = None) -> dict[str, object]:
+            return {
+                "serviceTier": "priority",
+                "nested": {
+                    "service_tier": "priority",
+                    "unchanged": "priority",
+                },
+            }
+
+        def request(self, method: str, params: dict[str, object] | None, *, response_model):  # type: ignore[no-untyped-def]
+            return response_model.model_validate(self._request_raw(method, params))
+
+    class FakeResponseModel:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> dict[str, object]:
+            assert payload["serviceTier"] == "fast"
+            nested = payload["nested"]
+            assert isinstance(nested, dict)
+            assert nested["service_tier"] == "fast"
+            assert nested["unchanged"] == "priority"
+            return payload
+
+    agent._patch_codex_sdk_service_tier_compat(FakeClient)
+
+    result = FakeClient().request("thread/start", None, response_model=FakeResponseModel)
+
+    assert result["serviceTier"] == "fast"
+
+
 def test_claude_backend_keeps_claude_code_settings_sources(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run_case() -> None:
         captured: dict[str, dict[str, str | None]] = {}
@@ -455,6 +732,21 @@ def test_claude_backend_keeps_claude_code_settings_sources(monkeypatch: pytest.M
         assert "setting-sources" not in captured["extra_args"]
 
     asyncio.run(run_case())
+
+
+def test_project_declares_textual_tui_dependencies() -> None:
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+
+    assert '"textual>=0.50"' in pyproject
+    assert '"rich>=13.0"' in pyproject
+    assert '"click>=8.1"' in pyproject
+
+
+def test_tui_backend_is_textual_app() -> None:
+    from textual.app import App
+
+    assert tui_module.TUI_BACKEND == "textual"
+    assert issubclass(tui_module.CodeAuditorApp, App)
 
 
 def test_tui_configure_displays_discovered_path() -> None:

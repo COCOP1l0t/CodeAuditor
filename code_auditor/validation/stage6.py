@@ -8,6 +8,7 @@ from .common import read_file_or_issues
 
 _REQUIRED_REPORT_SECTIONS = [
     "Summary",
+    "Why This Is a Security Issue",
     "Severity Assessment",
     "Security Impact",
     "Root Cause",

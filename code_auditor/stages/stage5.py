@@ -10,6 +10,7 @@ from ..checkpoint import CheckpointManager
 from ..config import DEFAULT_CLAUDE_POC_MODEL, AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
+from ..reproduction_status import is_failed_status, read_reproduction_status
 from ..utils import run_parallel_limited
 from ..wiki import build_wiki_context
 
@@ -36,6 +37,41 @@ def _read_vuln_id(file_path: str) -> str | None:
         return None
 
 
+def _resolve_reproduction_report(poc_dir: str) -> str | None:
+    """Return the Stage 5 report path, normalizing failed reports to ``_fp``.
+
+    Agents are instructed to rename failed reproductions to ``*_fp``, but older
+    output and interrupted runs may leave a false-positive report in the normal
+    PoC directory. Normalize that shape so Stage 6 cannot treat it as a
+    reproduced vulnerability.
+    """
+    report_path = os.path.join(poc_dir, "report.md")
+    fp_dir = poc_dir + "_fp"
+    fp_report_path = os.path.join(fp_dir, "report.md")
+
+    if os.path.exists(report_path):
+        status = read_reproduction_status(report_path)
+        if is_failed_status(status):
+            if os.path.isdir(fp_dir):
+                logger.warning(
+                    "Stage 5: Failed report found in %s, but %s already exists. Using existing _fp report.",
+                    poc_dir,
+                    fp_dir,
+                )
+                return fp_report_path if os.path.exists(fp_report_path) else None
+
+            shutil.move(poc_dir, fp_dir)
+            logger.info("Stage 5: Normalized failed reproduction output to %s.", fp_dir)
+            return fp_report_path if os.path.exists(fp_report_path) else None
+
+        return report_path
+
+    if os.path.exists(fp_report_path):
+        return fp_report_path
+
+    return None
+
+
 async def _run_reproduce(
     vuln_file_path: str,
     config: AuditConfig,
@@ -49,17 +85,10 @@ async def _run_reproduce(
 
     key = _task_key(vuln_id)
     poc_dir = os.path.join(config.output_dir, "stage5-pocs", vuln_id)
-    report_path = os.path.join(poc_dir, "report.md")
-
-    fp_report_path = os.path.join(poc_dir + "_fp", "report.md")
 
     if checkpoint.is_complete(key):
         logger.info("Stage 5: %s already complete, skipping.", vuln_id)
-        if os.path.exists(report_path):
-            return report_path
-        if os.path.exists(fp_report_path):
-            return fp_report_path
-        return None
+        return _resolve_reproduction_report(poc_dir)
 
     logger.info("Stage 5: Starting PoC reproduction for %s.", vuln_id)
     os.makedirs(poc_dir, exist_ok=True)
@@ -127,14 +156,14 @@ async def _run_reproduce(
         if os.path.isdir(poc_dir):
             shutil.rmtree(poc_dir)
 
-    if os.path.isdir(fp_dir):
-        fp_report = os.path.join(fp_dir, "report.md")
+    resolved_report = _resolve_reproduction_report(poc_dir)
+    if resolved_report and os.path.basename(os.path.dirname(resolved_report)).endswith("_fp"):
         logger.info("Stage 5: %s marked as false positive.", vuln_id)
-        return fp_report if os.path.exists(fp_report) else None
+        return resolved_report
 
-    has_report = os.path.exists(report_path)
+    has_report = resolved_report is not None
     logger.info("Stage 5: %s complete (report=%s)", vuln_id, has_report)
-    return report_path if has_report else None
+    return resolved_report
 
 
 async def run_stage5(

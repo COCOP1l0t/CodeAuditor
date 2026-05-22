@@ -5,9 +5,15 @@ import asyncio
 import os
 import sys
 
-from .config import DEFAULT_BACKEND, DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, AuditConfig
+from .config import (
+    DEFAULT_BACKEND,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+    AuditConfig,
+)
 from .logger import configure_logging, get_logger
 from .orchestrator import run_audit
+from .tui import TUIManager
 
 logger = get_logger("main")
 
@@ -37,7 +43,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run only stages 1-4 (skip PoC reproduction and disclosure stages 5-6)",
     )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the interactive TUI dashboard",
+    )
     return parser
+
+
+def _exit_after_keyboard_interrupt() -> None:
+    print("\nInterrupted by user.", file=sys.stderr)
+    sys.exit(130)
 
 
 def main() -> None:
@@ -65,15 +81,40 @@ def main() -> None:
         skip_stages=skip_stages,
     )
 
-    configure_logging(config.log_level)
-    logger.info("Starting audit of %s", config.target)
+    if args.tui:
+        # TUI mode: Textual live dashboard
+        tui = TUIManager()
+        tui.configure(
+            target=config.target,
+            output_dir=config.output_dir,
+            backend=config.backend,
+            model=config.model,
+            max_parallel=config.max_parallel,
+        )
+        configure_logging(config.log_level)
 
-    try:
-        asyncio.run(run_audit(config))
-        print("\nAudit complete.")
-    except Exception as e:
-        print(f"\nError: {e}", file=sys.stderr)
-        sys.exit(1)
+        async def run_tui_audit() -> None:
+            logger.info("Starting audit of %s", config.target)
+            await run_audit(config, tui=tui)
+
+        failed, interrupted = tui.run_audit(run_tui_audit)
+        if interrupted:
+            _exit_after_keyboard_interrupt()
+        if failed:
+            sys.exit(1)
+    else:
+        # Classic mode: plain log output
+        configure_logging(config.log_level)
+        logger.info("Starting audit of %s", config.target)
+
+        try:
+            asyncio.run(run_audit(config))
+            print("\nAudit complete.")
+        except KeyboardInterrupt:
+            _exit_after_keyboard_interrupt()
+        except Exception as e:
+            print(f"\nError: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

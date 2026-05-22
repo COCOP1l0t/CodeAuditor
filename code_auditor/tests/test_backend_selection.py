@@ -48,6 +48,35 @@ def test_cli_accepts_codex_backend_and_model_override() -> None:
     assert args.model == "gpt-5.4"
 
 
+
+def test_cli_accepts_wiki_path() -> None:
+    args = _build_parser().parse_args([
+        "--target",
+        ".",
+        "--wiki",
+        "/tmp/wiki",
+    ])
+
+    assert args.wiki == "/tmp/wiki"
+
+
+def test_cli_accepts_discovered_path() -> None:
+    args = _build_parser().parse_args([
+        "--target",
+        ".",
+        "--discovered",
+        "/tmp/bugs.html",
+    ])
+
+    assert args.discovered == "/tmp/bugs.html"
+
+
+def test_cli_accepts_tui_flag() -> None:
+    args = _build_parser().parse_args(["--target", ".", "--tui"])
+
+    assert args.tui is True
+
+
 def test_main_maps_wiki_path_to_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

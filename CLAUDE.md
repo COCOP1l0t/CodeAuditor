@@ -2,6 +2,13 @@
 
 Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target project, it researches security context → decomposes the codebase into analysis units → findings → vulnerabilities → PoC reproduction → disclosure preparation.
 
+## Quick Reference
+
+- **Language**: Python >=3.12
+- **Package manager**: pip (uses `pyproject.toml`, hatchling backend)
+- **Entry point**: `code-auditor` CLI → `code_auditor/__main__.py:main`
+- **Agent backends**: Claude via `claude-code-sdk`; Codex via local Codex app server SDK
+
 ## Running
 
 ```bash

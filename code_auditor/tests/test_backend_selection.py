@@ -38,10 +38,95 @@ def test_cli_accepts_codex_backend_and_model_override() -> None:
     assert args.model == "gpt-5.4"
 
 
+def test_cli_accepts_discovered_path() -> None:
+    args = _build_parser().parse_args([
+        "--target",
+        ".",
+        "--discovered",
+        "/tmp/bugs.html",
+    ])
+
+    assert args.discovered == "/tmp/bugs.html"
+
+
 def test_cli_accepts_tui_flag() -> None:
     args = _build_parser().parse_args(["--target", ".", "--tui"])
 
     assert args.tui is True
+
+
+def test_main_maps_omitted_discovered_to_target_reproduced_bugs_html(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, AuditConfig] = {}
+    target = tmp_path / "target"
+    target.mkdir()
+
+    async def fake_run_audit(config: AuditConfig) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+    ])
+
+    main_module.main()
+
+    assert captured["config"].discovered_path == str((target / "reproduced-bugs.html").resolve())
+
+
+def test_main_maps_explicit_discovered_to_resolved_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, AuditConfig] = {}
+    target = tmp_path / "target"
+    discovered = tmp_path / "missing-parent" / "bugs.html"
+    target.mkdir()
+
+    async def fake_run_audit(config: AuditConfig) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--discovered",
+        str(discovered),
+    ])
+
+    main_module.main()
+
+    assert captured["config"].discovered_path == str(discovered.resolve())
+
+
+def test_main_rejects_existing_directory_as_discovered_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "target"
+    discovered = tmp_path / "discovered-dir"
+    target.mkdir()
+    discovered.mkdir()
+
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(target),
+        "--discovered",
+        str(discovered),
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.main()
+
+    assert exc.value.code == 1
+    assert capsys.readouterr().err == f"Error: Discovered path is a directory: {discovered.resolve()}\n"
 
 
 def test_tui_mode_exits_nonzero_after_audit_failure(
@@ -117,7 +202,7 @@ def test_tui_mode_runs_audit_through_textual_manager(
     assert isinstance(captured["tui"], FakeTUIManager)
     assert captured["configured"] == {
         "target": str(target.resolve()),
-        "output_dir": str((target / "audit-output").resolve()),
+        "output_dir": main_module._default_output_dir(str(target.resolve())),
         "backend": "claude",
         "model": None,
         "max_parallel": 1,

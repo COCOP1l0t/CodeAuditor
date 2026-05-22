@@ -85,11 +85,16 @@ code-auditor --target /path/to/project [options]
 |------|-------------|
 | `--target` | **Required.** Root directory of the project to audit. |
 | `--output-dir` | Output directory (default: `{target}/audit-output`). |
+| `--discovered` | Reproduced bugs HTML file used by Stage 6 (default: `{target}/reproduced-bugs.html`). Pass a path to override where this cross-run record is read and updated. |
 | `--max-parallel` | Max concurrent agents (default: `1`). |
 | `--backend` | Agent backend: `claude` or `codex` (default: `claude`). |
 | `--model` | Backend model override. Claude defaults to `claude-sonnet-4-6`; Codex uses the local Codex config default unless specified. |
 | `--target-au-count` | Target number of analysis units for Stage 2 (default: `10`). |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` (default: `INFO`). |
+
+By default, Stage 6 creates or updates `{target}/reproduced-bugs.html`. Before generating disclosures, Stage 6 reads this file and skips reproduced bugs with matching dedupe metadata. After Stage 6 successfully writes disclosure output for a new reproduced bug, it appends a new HTML entry to the same file. Use `--discovered /path/to/reproduced-bugs.html` to read and update a different HTML file.
+
+The HTML record uses one collapsible section per reproduced bug. Each section carries a visible review status tag and matching machine-readable status fields for `unreviewed`, `reported`, `confirmed`, `rejected`, or `duplicated`.
 
 Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
@@ -115,6 +120,8 @@ code-auditor \
 ├── stage6-disclosures/       # disclosure reports, emails, zipped PoCs
 └── .markers/          # checkpoint markers for --resume
 ```
+
+Stage 6 also creates or updates `{target}/reproduced-bugs.html` by default. This target-root file is outside `{output-dir}` unless you point `--discovered` somewhere else.
 
 ## Project layout
 

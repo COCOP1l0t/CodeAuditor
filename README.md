@@ -85,7 +85,7 @@ code-auditor --target /path/to/project [options]
 
 | Flag | Description |
 |------|-------------|
-| `--target` | **Required.** Root directory of the project to audit. |
+| **`--target`** | **Required.** Root directory of the project to audit. |
 | `--output-dir` | Output directory (default: `{target}/audit-output-YYYYMMDD`, using the current local date). |
 | `--discovered` | Reproduced bugs HTML file used by Stage 6 (default: `{target}/reproduced-bugs.html`). Pass a path to override where this cross-run record is read and updated. |
 | `--wiki` | LLM wiki knowledge base directory. CodeAuditor treats it as read-only and gives agents stage-specific wiki search guidance. |
@@ -95,7 +95,10 @@ code-auditor --target /path/to/project [options]
 | `--target-au-count` | Target number of analysis units for Stage 2 (default: `10`). |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` (default: `INFO`). |
 | `--enable-timeout` | Enable per-stage agent timeouts. By default, CodeAuditor runs without per-stage agent timeouts for long-running targets such as QEMU. |
+| `--disable-stale-log-kill` | Disable the 20-minute stale-log kill watchdog. |
 | `--tui` | Launch the interactive TUI dashboard instead of plain log output. |
+
+**Bold** options are required.
 
 By default, Stage 6 creates or updates `{target}/reproduced-bugs.html`. Before generating disclosures, Stage 6 reads this file and skips reproduced bugs with matching dedupe metadata. After Stage 6 successfully writes disclosure output for a new reproduced bug, it appends a new HTML entry to the same file. Use `--discovered /path/to/reproduced-bugs.html` to read and update a different HTML file.
 
@@ -136,6 +139,7 @@ code-auditor \
   --output-dir ~/audits/libfoo \
   --wiki ~/knowledge/libfoo-wiki \
   --max-parallel 4 \
+  --tui \
   --log-level DEBUG
 ```
 

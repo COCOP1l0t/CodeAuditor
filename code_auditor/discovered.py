@@ -525,9 +525,12 @@ def build_discovered_entry(
     stage6_report_path: str | None = None,
     stage6_email_path: str | None = None,
     stage6_zip_path: str | None = None,
+    stage6_email_title: str | None = None,
 ) -> str:
     """Build one human-readable HTML entry with machine-readable metadata."""
-    title = _single_line(finding.get("title")) or "Untitled vulnerability"
+    title = _single_line(stage6_email_title)
+    if not title:
+        raise ValueError("stage6_email_title is required and cannot be empty")
     repo_url = repo_snapshot.get("repo_url", "")
     audited_commit = repo_snapshot.get("audited_commit", "")
     audit_finished_date = repo_snapshot.get("audit_finished_date", "")

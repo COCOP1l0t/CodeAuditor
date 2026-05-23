@@ -567,16 +567,37 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
         class FakeAppServerClient:
             pass
 
-        class FakeRunResult:
-            final_response = "codex-result"
+        class FakeDeltaPayload:
+            delta = "codex-result"
+            turn_id = "turn-1"
+
+        class FakeCompletedTurn:
+            id = "turn-1"
+            status = types.SimpleNamespace(value="completed")
+            error = None
+
+        class FakeCompletedPayload:
+            turn = FakeCompletedTurn()
+
+        class FakeNotification:
+            def __init__(self, method: str, payload: object) -> None:
+                self.method = method
+                self.payload = payload
+
+        class FakeTurnHandle:
+            id = "turn-1"
+
+            async def stream(self) -> AsyncIterator[FakeNotification]:
+                yield FakeNotification("item/agentMessage/delta", FakeDeltaPayload())
+                yield FakeNotification("turn/completed", FakeCompletedPayload())
 
         class FakeThread:
-            async def run(self, prompt: str, **kwargs: object) -> FakeRunResult:
+            async def turn(self, prompt: str, **kwargs: object) -> FakeTurnHandle:
                 captured["prompt"] = prompt
                 captured["run_approval_mode"] = kwargs.get("approval_mode")
                 captured["run_sandbox_policy"] = kwargs.get("sandbox_policy")
                 captured["run_service_tier"] = kwargs.get("service_tier")
-                return FakeRunResult()
+                return FakeTurnHandle()
 
         class FakeAsyncCodex:
             def __init__(self, *, config: FakeAppServerConfig) -> None:
@@ -657,14 +678,35 @@ def test_codex_backend_forces_supported_legacy_service_tier(monkeypatch: pytest.
             def _request_raw(self, _method: str, _params: dict[str, object] | None = None) -> dict[str, object]:
                 return {}
 
-        class FakeRunResult:
-            final_response = "codex-result"
+        class FakeDeltaPayload:
+            delta = "codex-result"
+            turn_id = "turn-1"
+
+        class FakeCompletedTurn:
+            id = "turn-1"
+            status = types.SimpleNamespace(value="completed")
+            error = None
+
+        class FakeCompletedPayload:
+            turn = FakeCompletedTurn()
+
+        class FakeNotification:
+            def __init__(self, method: str, payload: object) -> None:
+                self.method = method
+                self.payload = payload
+
+        class FakeTurnHandle:
+            id = "turn-1"
+
+            async def stream(self) -> AsyncIterator[FakeNotification]:
+                yield FakeNotification("item/agentMessage/delta", FakeDeltaPayload())
+                yield FakeNotification("turn/completed", FakeCompletedPayload())
 
         class FakeThread:
-            async def run(self, prompt: str, **kwargs: object) -> FakeRunResult:
+            async def turn(self, prompt: str, **kwargs: object) -> FakeTurnHandle:
                 captured["prompt"] = prompt
                 captured["run_service_tier"] = kwargs.get("service_tier")
-                return FakeRunResult()
+                return FakeTurnHandle()
 
         class FakeAsyncCodex:
             def __init__(self, *, config: FakeAppServerConfig) -> None:

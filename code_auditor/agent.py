@@ -430,6 +430,7 @@ async def _run_claude_agent(
                     collect_messages(text_parts),
                     log_file=log_file,
                     run_control=run_control,
+                    enable_stale_watch=not config.disable_stale_log_kill,
                 )
             except AgentLogStaleError as exc:
                 logger.warning("Claude agent stopped because its log file went stale: %s", exc)
@@ -514,7 +515,7 @@ async def _run_codex_agent(
                                 model=selected_model,
                                 service_tier=codex_service_tier,
                             )
-                            result = await thread.run(
+                            turn = await thread.turn(
                                 prompt,
                                 approval_mode=approval_setting,
                                 cwd=cwd,
@@ -530,7 +531,7 @@ async def _run_codex_agent(
                                 model=selected_model,
                                 service_tier=codex_service_tier,
                             )
-                            result = await thread.run(
+                            turn = await thread.turn(
                                 prompt,
                                 approval_policy=approval_setting,
                                 cwd=cwd,
@@ -539,19 +540,57 @@ async def _run_codex_agent(
                                 sandbox_policy=sandbox_policy,
                                 service_tier=codex_service_tier,
                             )
-                    return result.final_response or ""
 
-                text = await _run_agent_attempt_with_stale_log_watch(
+                        stream = turn.stream()
+                        completed = None
+                        text_parts: list[str] = []
+                        try:
+                            async for event in stream:
+                                payload = event.payload
+                                if (
+                                    event.method == "item/agentMessage/delta"
+                                    and getattr(payload, "turn_id", None) == turn.id
+                                ):
+                                    delta = getattr(payload, "delta", "")
+                                    if delta:
+                                        text_parts.append(delta)
+                                        if log_fh:
+                                            log_fh.write(delta)
+                                            log_fh.flush()
+                                    continue
+                                if (
+                                    event.method == "turn/completed"
+                                    and getattr(getattr(payload, "turn", None), "id", None) == turn.id
+                                ):
+                                    completed = payload
+                        finally:
+                            await stream.aclose()
+
+                        if completed is None:
+                            raise RuntimeError("turn completed event not received")
+
+                        turn_obj = getattr(completed, "turn", None)
+                        if turn_obj is not None:
+                            status = getattr(turn_obj, "status", None)
+                            status_val = getattr(status, "value", str(status)) if status else ""
+                            if status_val == "failed":
+                                error = getattr(turn_obj, "error", None)
+                                error_msg = getattr(error, "message", "") if error else ""
+                                if error_msg:
+                                    raise RuntimeError(error_msg)
+                                raise RuntimeError(f"turn failed with status {status_val}")
+
+                        if log_fh:
+                            log_fh.write("\n")
+                            log_fh.flush()
+                        return "".join(text_parts)
+
+                return await _run_agent_attempt_with_stale_log_watch(
                     run_codex_turn(),
                     log_file=log_file,
                     run_control=run_control,
-                    enable_stale_watch=False,
+                    enable_stale_watch=not config.disable_stale_log_kill,
                 )
-                if log_fh:
-                    log_fh.write(text)
-                    log_fh.write("\n")
-                    log_fh.flush()
-                return text
             except AgentLogStaleError as exc:
                 logger.warning("Codex agent stopped because its log file went stale: %s", exc)
                 return ""

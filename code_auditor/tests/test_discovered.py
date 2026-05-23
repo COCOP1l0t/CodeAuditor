@@ -4,6 +4,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from code_auditor.checkpoint import CheckpointManager
 from code_auditor.config import AuditConfig
 from code_auditor.discovered import (
@@ -187,7 +189,7 @@ def test_read_discovered_keys_handles_comment_terminator_in_metadata_title(tmp_p
         "dirty_status": "clean",
         "audit_finished_date": "2026-05-11",
     }
-    entry = build_discovered_entry(finding, repo_snapshot)
+    entry = build_discovered_entry(finding, repo_snapshot, stage6_email_title="Email title")
 
     append_entries(str(path), [entry])
 
@@ -211,10 +213,12 @@ def test_build_discovered_entry_uses_absolute_link_for_sibling_artifact_path(tmp
         },
         discovered_path=str(discovered_path),
         stage5_report_path=str(sibling_stage5),
+        stage6_email_title="Email title",
     )
 
     assert f'<a href="{sibling_stage5.as_posix()}">Stage 5 Report</a>' in entry
     assert "../target-sibling/stage5/report.md" not in entry
+    assert '<span class="bug-title">Email title</span>' in entry
 
 
 def test_build_discovered_entry_includes_visible_fields_and_relative_links_as_html(tmp_path: Path) -> None:
@@ -243,11 +247,12 @@ def test_build_discovered_entry_includes_visible_fields_and_relative_links_as_ht
         stage6_report_path=str(stage6_report),
         stage6_email_path=str(stage6_email),
         stage6_zip_path=str(stage6_zip),
+        stage6_email_title="Stage 6 email title",
     )
 
     assert '<details class="reproduced-bug" data-dedupe-key="sha256:' in entry
     assert 'data-review-status="unreviewed">' in entry
-    assert '<summary><span class="bug-title">Length underflow reaches memcpy</span>' in entry
+    assert '<summary><span class="bug-title">Stage 6 email title</span>' in entry
     assert '<span class="review-tag review-tag-unreviewed">unreviewed</span></summary>' in entry
     assert '<fieldset class="review-status" data-review-status="unreviewed">' in entry
     assert '<legend>Review status</legend>' in entry
@@ -277,7 +282,7 @@ def test_build_discovered_entry_includes_visible_fields_and_relative_links_as_ht
     payload = metadata_line.removeprefix("<!-- code-auditor:discovered ").removesuffix(" -->")
     metadata = json.loads(payload)
     assert metadata["dedupe_key"].startswith("sha256:")
-    assert metadata["title"] == "Length underflow reaches memcpy"
+    assert metadata["title"] == "Stage 6 email title"
     assert metadata["repo_url"] == "https://example.test/repo.git"
     assert metadata["audited_commit"] == "abcdef123456"
     assert metadata["audit_finished_date"] == "2026-05-11"
@@ -307,12 +312,12 @@ def test_append_entries_writes_status_sidecar_without_overwriting_existing_statu
     first_key = build_dedupe_key(first_finding, repo_snapshot["repo_url"])
     second_key = build_dedupe_key(second_finding, repo_snapshot["repo_url"])
 
-    append_entries(str(path), [build_discovered_entry(first_finding, repo_snapshot)])
+    append_entries(str(path), [build_discovered_entry(first_finding, repo_snapshot, stage6_email_title="First email")])
     sidecar = tmp_path / "reproduced-bugs-status.json"
     assert json.loads(sidecar.read_text(encoding="utf-8")) == {first_key: "confirmed"}
 
     sidecar.write_text(json.dumps({first_key: "rejected"}, indent=2) + "\n", encoding="utf-8")
-    append_entries(str(path), [build_discovered_entry(second_finding, repo_snapshot)])
+    append_entries(str(path), [build_discovered_entry(second_finding, repo_snapshot, stage6_email_title="Second email")])
 
     assert json.loads(sidecar.read_text(encoding="utf-8")) == {
         first_key: "rejected",
@@ -361,15 +366,17 @@ def test_stage6_skips_duplicate_keys_within_same_input_set(
 
     async def fake_run_disclosure(report_path: str, config: AuditConfig, *_args: object) -> str:
         calls.append(Path(report_path).parent.name)
-        disclosure_report = (
+        disclosure_dir = (
             Path(config.output_dir)
             / "stage6-disclosures"
             / Path(report_path).parent.name
             / "disclosure"
-            / "report.md"
         )
-        disclosure_report.parent.mkdir(parents=True, exist_ok=True)
+        disclosure_dir.mkdir(parents=True, exist_ok=True)
+        disclosure_report = disclosure_dir / "report.md"
         disclosure_report.write_text("# Disclosure\n", encoding="utf-8")
+        email = disclosure_dir / "email.txt"
+        email.write_text("Subject: Vulnerability report\n", encoding="utf-8")
         return str(disclosure_report)
 
     monkeypatch.setattr(stage6, "_run_disclosure", fake_run_disclosure)
@@ -423,6 +430,7 @@ def test_stage6_appends_new_entry_to_configured_discovered_path(
     assert "Stage 6 Report" in content
     assert "email.txt" in content
     assert "disclosure.zip" in content
+    assert '<span class="bug-title">Security issue</span>' in content
 
 
 def test_stage6_does_not_append_when_disclosure_returns_none(
@@ -452,11 +460,12 @@ def test_stage6_handles_missing_stage4_finding_without_crashing(
     stage5_report = _write_stage5_report(output_dir, "H-01", "Fallback report title")
 
     async def fake_run_disclosure(report_path: str, config: AuditConfig, *_args: object) -> str:
-        disclosure_report = (
-            Path(config.output_dir) / "stage6-disclosures" / "H-01" / "disclosure" / "report.md"
-        )
-        disclosure_report.parent.mkdir(parents=True, exist_ok=True)
+        disclosure_dir = Path(config.output_dir) / "stage6-disclosures" / "H-01" / "disclosure"
+        disclosure_dir.mkdir(parents=True, exist_ok=True)
+        disclosure_report = disclosure_dir / "report.md"
         disclosure_report.write_text("# Disclosure\n", encoding="utf-8")
+        email = disclosure_dir / "email.txt"
+        email.write_text("Subject: Fallback report title\n", encoding="utf-8")
         return str(disclosure_report)
 
     monkeypatch.setattr(stage6, "_run_disclosure", fake_run_disclosure)
@@ -496,6 +505,7 @@ def test_stage6_rereads_discovered_keys_before_append(
                     discovered_path=config.discovered_path,
                     stage5_report_path=report_path,
                     stage6_report_path=str(disclosure_report),
+                    stage6_email_title="Email title",
                 )
             ],
         )
@@ -508,6 +518,94 @@ def test_stage6_rereads_discovered_keys_before_append(
     assert len(disclosure_reports) == 1
     content = Path(config.discovered_path).read_text(encoding="utf-8")
     assert content.count("<!-- code-auditor:discovered") == 1
+
+
+def test_build_discovered_entry_uses_stage6_email_title(tmp_path: Path) -> None:
+    entry = build_discovered_entry(
+        _finding(title="Stage 4 title"),
+        {
+            "target_path": str(tmp_path),
+            "repo_url": "",
+            "audited_commit": "",
+            "version": "",
+            "description": "",
+            "dirty_status": "unknown",
+            "audit_finished_date": "2026-05-11",
+        },
+        stage6_email_title="Stage 6 email title",
+    )
+
+    assert '<span class="bug-title">Stage 6 email title</span>' in entry
+
+
+def test_build_discovered_entry_raises_when_stage6_email_title_is_missing(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="stage6_email_title is required"):
+        build_discovered_entry(
+            _finding(title="Stage 4 title"),
+            {
+                "target_path": str(tmp_path),
+                "repo_url": "",
+                "audited_commit": "",
+                "version": "",
+                "description": "",
+                "dirty_status": "unknown",
+                "audit_finished_date": "2026-05-11",
+            },
+        )
+
+
+def test_build_discovered_entry_raises_when_stage6_email_title_is_blank(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="stage6_email_title is required"):
+        build_discovered_entry(
+            _finding(title="Stage 4 title"),
+            {
+                "target_path": str(tmp_path),
+                "repo_url": "",
+                "audited_commit": "",
+                "version": "",
+                "description": "",
+                "dirty_status": "unknown",
+                "audit_finished_date": "2026-05-11",
+            },
+            stage6_email_title="",
+        )
+
+
+def test_extract_email_subject_reads_subject_line(tmp_path: Path) -> None:
+    from code_auditor.stages.stage6 import _extract_email_subject
+
+    email = tmp_path / "email.txt"
+    email.write_text("Subject: Buffer overflow in parser\n\nBody text\n", encoding="utf-8")
+
+    assert _extract_email_subject(str(email)) == "Buffer overflow in parser"
+
+
+def test_extract_email_subject_is_case_insensitive(tmp_path: Path) -> None:
+    from code_auditor.stages.stage6 import _extract_email_subject
+
+    email = tmp_path / "email.txt"
+    email.write_text("subject: Lowercase subject line\n", encoding="utf-8")
+
+    assert _extract_email_subject(str(email)) == "Lowercase subject line"
+
+
+def test_extract_email_subject_returns_none_for_missing_file(tmp_path: Path) -> None:
+    from code_auditor.stages.stage6 import _extract_email_subject
+
+    assert _extract_email_subject(str(tmp_path / "nonexistent.txt")) is None
+
+
+def test_extract_email_subject_returns_none_when_no_subject_line(tmp_path: Path) -> None:
+    from code_auditor.stages.stage6 import _extract_email_subject
+
+    email = tmp_path / "email.txt"
+    email.write_text("Hello,\n\nThis is the body.\n", encoding="utf-8")
+
+    assert _extract_email_subject(str(email)) is None
 
 
 def test_collect_repo_snapshot_handles_non_git_target_without_raising(tmp_path: Path) -> None:

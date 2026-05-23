@@ -318,6 +318,20 @@ def _existing_artifact(disclosure_report: str, filename: str) -> str | None:
     return str(path) if path.exists() else None
 
 
+def _extract_email_subject(email_path: str | None) -> str | None:
+    """Extract the Subject line from a disclosure email.txt."""
+    if not email_path:
+        return None
+    try:
+        content = Path(email_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in content.splitlines():
+        if line.lower().startswith("subject:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
 def _append_discovered_entries(
     successes: list[tuple[_DisclosureCandidate, str]],
     repo_snapshot: dict[str, str],
@@ -337,6 +351,16 @@ def _append_discovered_entries(
             )
             continue
 
+        email_path = _existing_artifact(disclosure_report, "email.txt")
+        email_title = _extract_email_subject(email_path)
+        if not email_title:
+            logger.warning(
+                "Stage 6: Skipping %s because disclosure email subject is missing."
+                " The bug reproducing process is broken.",
+                _candidate_label(candidate),
+            )
+            continue
+
         entries.append(
             build_discovered_entry(
                 candidate.finding,
@@ -345,8 +369,9 @@ def _append_discovered_entries(
                 stage4_finding_path=candidate.finding_path,
                 stage5_report_path=candidate.report_path,
                 stage6_report_path=disclosure_report,
-                stage6_email_path=_existing_artifact(disclosure_report, "email.txt"),
+                stage6_email_path=email_path,
                 stage6_zip_path=_existing_artifact(disclosure_report, "disclosure.zip"),
+                stage6_email_title=email_title,
             )
         )
         latest_keys.add(candidate.dedupe_key)

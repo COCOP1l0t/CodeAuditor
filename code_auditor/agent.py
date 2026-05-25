@@ -274,7 +274,7 @@ class _CodexSdk:
     ask_for_approval_cls: type[Any] | None
     reasoning_effort_cls: type[Any]
     sandbox_policy_cls: type[Any]
-    service_tier_cls: type[Any] | None
+    text_input_cls: type[Any] | None
 
 
 def _load_codex_sdk() -> _CodexSdk:
@@ -299,7 +299,7 @@ def _load_codex_sdk() -> _CodexSdk:
             ask_for_approval_cls=None,
             reasoning_effort_cls=ReasoningEffort,
             sandbox_policy_cls=SandboxPolicy,
-            service_tier_cls=None,
+            text_input_cls=None,
         )
     except ImportError as openai_codex_exc:
         try:
@@ -310,7 +310,7 @@ def _load_codex_sdk() -> _CodexSdk:
                 AsyncCodex,
                 ReasoningEffort,
                 SandboxPolicy,
-                ServiceTier,
+                TextInput,
             )
         except ImportError as legacy_exc:
             raise RuntimeError(
@@ -329,7 +329,7 @@ def _load_codex_sdk() -> _CodexSdk:
             ask_for_approval_cls=AskForApproval,
             reasoning_effort_cls=ReasoningEffort,
             sandbox_policy_cls=SandboxPolicy,
-            service_tier_cls=ServiceTier,
+            text_input_cls=TextInput,
         )
 
 
@@ -481,12 +481,10 @@ async def _run_codex_agent(
         if codex_sdk.approval_mode_cls is None:
             raise RuntimeError("Current Codex SDK import did not expose ApprovalMode.")
         approval_setting = codex_sdk.approval_mode_cls.deny_all
-        codex_service_tier: object = "fast"
     else:
-        if codex_sdk.ask_for_approval_cls is None or codex_sdk.service_tier_cls is None:
-            raise RuntimeError("Legacy Codex SDK import did not expose approval or service-tier types.")
+        if codex_sdk.ask_for_approval_cls is None:
+            raise RuntimeError("Legacy Codex SDK import did not expose approval types.")
         approval_setting = codex_sdk.ask_for_approval_cls.model_validate("never")
-        codex_service_tier = codex_sdk.service_tier_cls.fast
 
     log_fh = _open_agent_log(log_file)
     run_control = run_control or _AgentRunControl()
@@ -502,7 +500,6 @@ async def _run_codex_agent(
                     app_server_config = codex_sdk.app_server_config_cls(
                         codex_bin=codex_bin,
                         cwd=cwd,
-                        config_overrides=('service_tier="fast"',),
                     )
                     async with codex_sdk.async_codex_cls(config=app_server_config) as codex:
                         codex_client = getattr(codex, "_client", None)
@@ -513,7 +510,6 @@ async def _run_codex_agent(
                                 approval_mode=approval_setting,
                                 cwd=cwd,
                                 model=selected_model,
-                                service_tier=codex_service_tier,
                             )
                             turn = await thread.turn(
                                 prompt,
@@ -522,23 +518,25 @@ async def _run_codex_agent(
                                 effort=codex_effort,
                                 model=selected_model,
                                 sandbox_policy=sandbox_policy,
-                                service_tier=codex_service_tier,
                             )
                         else:
                             thread = await codex.thread_start(
                                 approval_policy=approval_setting,
                                 cwd=cwd,
                                 model=selected_model,
-                                service_tier=codex_service_tier,
+                            )
+                            turn_input = (
+                                codex_sdk.text_input_cls(prompt)
+                                if codex_sdk.text_input_cls is not None
+                                else prompt
                             )
                             turn = await thread.turn(
-                                prompt,
+                                turn_input,
                                 approval_policy=approval_setting,
                                 cwd=cwd,
                                 effort=codex_effort,
                                 model=selected_model,
                                 sandbox_policy=sandbox_policy,
-                                service_tier=codex_service_tier,
                             )
 
                         stream = turn.stream()

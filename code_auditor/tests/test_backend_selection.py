@@ -594,9 +594,9 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
         class FakeThread:
             async def turn(self, prompt: str, **kwargs: object) -> FakeTurnHandle:
                 captured["prompt"] = prompt
+                captured["run_kwargs"] = kwargs
                 captured["run_approval_mode"] = kwargs.get("approval_mode")
                 captured["run_sandbox_policy"] = kwargs.get("sandbox_policy")
-                captured["run_service_tier"] = kwargs.get("service_tier")
                 return FakeTurnHandle()
 
         class FakeAsyncCodex:
@@ -611,8 +611,8 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
                 return None
 
             async def thread_start(self, **kwargs: object) -> FakeThread:
+                captured["thread_start_kwargs"] = kwargs
                 captured["thread_start_approval_mode"] = kwargs.get("approval_mode")
-                captured["thread_start_service_tier"] = kwargs.get("service_tier")
                 return FakeThread()
 
         fake_openai_codex.AppServerConfig = FakeAppServerConfig
@@ -629,24 +629,24 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
         config = AuditConfig(target="/tmp/project", output_dir="/tmp/output", backend="codex")
 
         assert await agent._run_codex_agent("prompt", config, cwd="/tmp/project") == "codex-result"
-        assert captured["config_overrides"] == ('service_tier="fast"',)
+        assert captured["config_overrides"] == ()
         assert captured["thread_start_approval_mode"] is FakeApprovalMode.deny_all
-        assert captured["thread_start_service_tier"] == "fast"
+        assert "service_tier" not in captured["thread_start_kwargs"]
         assert captured["run_approval_mode"] is FakeApprovalMode.deny_all
         assert captured["run_sandbox_policy"] == {"type": "dangerFullAccess"}
-        assert captured["run_service_tier"] == "fast"
+        assert "service_tier" not in captured["run_kwargs"]
 
     asyncio.run(run_case())
 
 
-def test_codex_backend_forces_supported_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codex_backend_uses_default_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run_case() -> None:
         captured: dict[str, object] = {}
         fake_codex_app_server = types.ModuleType("codex_app_server")
 
-        class FakeServiceTier(Enum):
-            fast = "fast"
-            flex = "flex"
+        class FakeTextInput:
+            def __init__(self, text: str) -> None:
+                self.text = text
 
         class FakeAskForApproval:
             @classmethod
@@ -703,9 +703,11 @@ def test_codex_backend_forces_supported_legacy_service_tier(monkeypatch: pytest.
                 yield FakeNotification("turn/completed", FakeCompletedPayload())
 
         class FakeThread:
-            async def turn(self, prompt: str, **kwargs: object) -> FakeTurnHandle:
+            async def turn(self, prompt: object, **kwargs: object) -> FakeTurnHandle:
+                if isinstance(prompt, str):
+                    raise TypeError(f"unsupported input item: {type(prompt)!r}")
                 captured["prompt"] = prompt
-                captured["run_service_tier"] = kwargs.get("service_tier")
+                captured["run_kwargs"] = kwargs
                 return FakeTurnHandle()
 
         class FakeAsyncCodex:
@@ -720,8 +722,8 @@ def test_codex_backend_forces_supported_legacy_service_tier(monkeypatch: pytest.
                 return None
 
             async def thread_start(self, **kwargs: object) -> FakeThread:
+                captured["thread_start_kwargs"] = kwargs
                 captured["thread_start_approval_policy"] = kwargs.get("approval_policy")
-                captured["thread_start_service_tier"] = kwargs.get("service_tier")
                 return FakeThread()
 
         fake_codex_app_server.AskForApproval = FakeAskForApproval
@@ -730,20 +732,24 @@ def test_codex_backend_forces_supported_legacy_service_tier(monkeypatch: pytest.
         fake_codex_app_server.AsyncCodex = FakeAsyncCodex
         fake_codex_app_server.ReasoningEffort = FakeReasoningEffort
         fake_codex_app_server.SandboxPolicy = FakeSandboxPolicy
-        fake_codex_app_server.ServiceTier = FakeServiceTier
+        fake_codex_app_server.TextInput = FakeTextInput
         monkeypatch.setitem(sys.modules, "openai_codex", None)
         monkeypatch.setitem(sys.modules, "openai_codex.client", None)
         monkeypatch.setitem(sys.modules, "openai_codex.types", None)
         monkeypatch.setitem(sys.modules, "codex_app_server", fake_codex_app_server)
         monkeypatch.setattr(agent, "_resolve_codex_bin", lambda: "/tmp/codex")
+        monkeypatch.setattr(agent, "AGENT_MAX_RETRIES", 1)
 
         config = AuditConfig(target="/tmp/project", output_dir="/tmp/output", backend="codex")
 
         assert await agent._run_codex_agent("prompt", config, cwd="/tmp/project") == "codex-result"
-        assert captured["config_overrides"] == ('service_tier="fast"',)
+        prompt = captured["prompt"]
+        assert isinstance(prompt, FakeTextInput)
+        assert prompt.text == "prompt"
+        assert captured["config_overrides"] == ()
         assert captured["thread_start_approval_policy"] == "never"
-        assert captured["thread_start_service_tier"] is FakeServiceTier.fast
-        assert captured["run_service_tier"] is FakeServiceTier.fast
+        assert "service_tier" not in captured["thread_start_kwargs"]
+        assert "service_tier" not in captured["run_kwargs"]
 
     asyncio.run(run_case())
 

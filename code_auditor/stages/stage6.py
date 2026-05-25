@@ -353,16 +353,35 @@ def _existing_artifact(disclosure_report: str, filename: str) -> str | None:
 
 
 def _extract_email_subject(email_path: str | None) -> str | None:
-    """Extract the Subject line from a disclosure email.txt."""
+    """Extract the Subject line from a disclosure email.txt.
+
+    Handles both standard RFC 822 folded headers (continuation lines start
+    with whitespace) and LLM-generated subjects wrapped by ``fold -s -w 72``
+    where continuation lines do not start with whitespace.
+    """
     if not email_path:
         return None
     try:
         content = Path(email_path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    for line in content.splitlines():
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
         if line.lower().startswith("subject:"):
-            return line.split(":", 1)[1].strip()
+            parts = [line.split(":", 1)[1].strip()]
+            for next_line in lines[i + 1 :]:
+                if not next_line.strip():
+                    break
+                if next_line[0] in " \t":
+                    parts.append(next_line.strip())
+                    continue
+                # Heuristic: a new header line looks like "Header-Name: value".
+                # Stop collecting if we see one; otherwise treat as wrapped
+                # subject text produced by ``fold -s -w 72``.
+                if re.match(r"^[A-Za-z-]+:\s", next_line):
+                    break
+                parts.append(next_line.strip())
+            return " ".join(parts)
     return None
 
 

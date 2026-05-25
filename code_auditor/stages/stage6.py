@@ -223,6 +223,37 @@ _MAX_DEDUPE_TURNS = 30
 _DEFAULT_DEDUPE_EFFORT = "low"
 
 
+def _extract_json_object(text: str) -> str | None:
+    """Extract the first JSON object from text that may contain prefixes or suffixes."""
+    stripped = text.strip().removeprefix("```json").removesuffix("```").strip()
+    # Try direct parse first
+    try:
+        json.loads(stripped)
+        return stripped
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Find the first '{' and its matching '}'
+    start = stripped.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i, ch in enumerate(stripped[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = stripped[start : i + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    return None
+
+
 async def _filter_semantic_duplicates(
     candidates: list[_DisclosureCandidate],
     discovered_path: str,
@@ -277,7 +308,10 @@ async def _filter_semantic_duplicates(
                 effort=_DEFAULT_DEDUPE_EFFORT,
                 log_file=log_file,
             )
-            parsed = json.loads(result.strip().removeprefix("```json").removesuffix("```").strip())
+            json_text = _extract_json_object(result)
+            if json_text is None:
+                raise json.JSONDecodeError("No JSON object found in response", result, 0)
+            parsed = json.loads(json_text)
             decision = str(parsed.get("decision", "")).lower()
             matched_key = str(parsed.get("matched_dedupe_key", ""))
             reason = str(parsed.get("reason", ""))

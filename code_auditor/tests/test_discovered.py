@@ -608,6 +608,39 @@ def test_extract_email_subject_returns_none_when_no_subject_line(tmp_path: Path)
     assert _extract_email_subject(str(email)) is None
 
 
+@pytest.mark.parametrize(
+    "text,expected_decision",
+    [
+        ('{"decision": "duplicate"}', "duplicate"),
+        ('prefix{"decision": "duplicate"}', "duplicate"),
+        ('prefix{"decision": "duplicate"}suffix', "duplicate"),
+        ('```json\n{"decision": "duplicate"}\n```', "duplicate"),
+        ('prefix{"a": {"b": 1}, "decision": "duplicate"}suffix', "duplicate"),
+        (
+            'Using the available repo context only for semantic comparison; this looks like a dedupe classification task, so I\'m matching root cause, component, and trigger rather than editing code.{"decision": "duplicate", "matched_dedupe_key": "sha256:abc", "reason": "r"}',
+            "duplicate",
+        ),
+        ('prefix\n{\n  "decision": "new",\n  "matched_dedupe_key": "",\n  "reason": "r"\n}\nsuffix', "new"),
+    ],
+)
+def test_extract_json_object_parses_json_with_prefixes_and_suffixes(text: str, expected_decision: str) -> None:
+    from code_auditor.stages.stage6 import _extract_json_object
+
+    result = _extract_json_object(text)
+    assert result is not None
+    import json
+
+    parsed = json.loads(result)
+    assert parsed["decision"] == expected_decision
+
+
+def test_extract_json_object_returns_none_for_invalid_text() -> None:
+    from code_auditor.stages.stage6 import _extract_json_object
+
+    assert _extract_json_object("no json here") is None
+    assert _extract_json_object("") is None
+
+
 def test_collect_repo_snapshot_handles_non_git_target_without_raising(tmp_path: Path) -> None:
     snapshot = collect_repo_snapshot(str(tmp_path), audit_finished_date="2026-05-11")
 

@@ -333,6 +333,8 @@ def _render_dashboard(state: TUIState) -> Layout:
 class CodeAuditorApp(App[None]):
     """Textual app that renders CodeAuditor state with Rich widgets."""
 
+    TITLE = "CodeAuditor"
+
     CSS = """
     Screen {
         layout: vertical;

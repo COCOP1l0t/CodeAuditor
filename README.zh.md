@@ -178,6 +178,8 @@ CodeAuditor 帮助发现和披露的漏洞：
 | CVE-2026-8343 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | CVE-2026-8348 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | CVE-2026-9238 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
+| CVE-2026-48914 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
+| CVE-2026-48915 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) |
 | Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) |
 | Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) |

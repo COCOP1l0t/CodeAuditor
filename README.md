@@ -129,6 +129,8 @@ wiki/
 
 `index.md` is recommended as the navigation entry point. Partial wikis are supported; stages skip absent files and use the pages that exist.
 
+> A real-world example is the [QEMU-Security-Wiki](https://github.com/qianfei11/QEMU-Security-Wiki) — a community-maintained knowledge base for auditing QEMU.
+
 Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
 ### Example

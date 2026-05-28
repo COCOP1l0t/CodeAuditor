@@ -104,6 +104,33 @@ code-auditor --target /path/to/project [options]
 
 该 HTML 记录为每个已复现漏洞使用一个可折叠区块。每个区块都有可见的审核状态标签，并带有一致的机器可读状态字段，支持 `unreviewed`、`reported`、`confirmed`、`rejected`、`duplicated`。
 
+### Wiki 知识库
+
+`--wiki /path/to/wiki` 允许 CodeAuditor 在审计期间使用现有的 LLM wiki 知识库。CodeAuditor 将 wiki 视为只读，并指示智能体不要创建、编辑或更新 wiki 文件。如需防止写入，请通过外部文件系统权限强制执行。
+
+推荐结构：
+
+```text
+wiki/
+|-- index.md
+|-- overview.md
+|-- attack-surface.md
+|-- auditing-guide.md
+|-- exploit-patterns.md
+|-- reproduction-workflow.md
+|-- vulnerability-timeline.md
+|-- entities/
+|   `-- <component>.md
+|-- concepts/
+|   `-- <vulnerability-class>.md
+`-- sources/
+    `-- <cve-or-case-study>.md
+```
+
+推荐将 `index.md` 作为导航入口点。支持部分 wiki；各阶段会跳过不存在的文件，使用实际存在的页面。
+
+> 一个实际示例是 [QEMU-Security-Wiki](https://github.com/qianfei11/QEMU-Security-Wiki) — 社区维护的 QEMU 审计知识库。
+
 运行会自动从检查点标记恢复 —— 删除输出目录（或其 `.markers/` 子目录）以开始全新的审计。
 
 ### 示例

@@ -159,9 +159,9 @@ def _make_stage_panel(state: TUIState) -> Panel:
     table.add_column("#", width=3, justify="center")
     table.add_column("Stage", width=12)
     table.add_column("Description", ratio=3)
-    table.add_column("Status", width=14, justify="center")
+    table.add_column("Status", width=14, justify="left")
     table.add_column("Progress", width=14, justify="right")
-    table.add_column("Time", width=10, justify="right")
+    table.add_column("Time", width=14, justify="right")
 
     for stage_num in sorted(STAGE_INFO.keys()):
         name, desc = STAGE_INFO[stage_num]

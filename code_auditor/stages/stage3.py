@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from contextlib import suppress
@@ -67,7 +68,39 @@ async def _run_unit(
         "wiki_context": build_wiki_context(config, stage=3),
     })
 
-    await run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)
+    timeout_seconds = config.agent_timeout_seconds
+    if config.disable_stale_log_kill:
+        timeout_seconds = None
+    if timeout_seconds is None:
+        logger.info("Stage 3 %s: Agent timeout disabled for %s.", progress, unit.id)
+
+    timed_out = False
+    task = asyncio.create_task(
+        run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)
+    )
+    done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
+
+    if not done:
+        if timeout_seconds is None:
+            raise AssertionError("Stage 3 timed out without a configured timeout.")
+        timeout_minutes = timeout_seconds // 60
+        timed_out = True
+        task.cancel()
+        grace_done, _ = await asyncio.wait({task}, timeout=30)
+        if not grace_done:
+            logger.warning("Stage 3 %s: %s agent task did not exit after cancel.", progress, unit.id)
+        logger.warning(
+            "Stage 3 %s: %s timed out after %d minutes.",
+            progress, unit.id, timeout_minutes,
+        )
+    else:
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+    if timed_out:
+        checkpoint.clear(key)
+        return []
 
     logger.info("Stage 3 %s: Agent finished for %s. Validating findings.", progress, unit.id)
     finding_files = list_matching_files(result_dir, finding_pattern)
@@ -81,7 +114,13 @@ async def _run_unit(
                 f"The finding file at `{finding_file}` failed validation. "
                 f"Please fix all issues listed below:\n\n```\n{format_validation_issues(issues)}\n```"
             )
-            await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
+            try:
+                await asyncio.wait_for(
+                    run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file),
+                    timeout=300,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Stage 3 %s: Repair timed out for %s.", progress, finding_file)
 
             issues = validate_stage3_file(finding_file)
             if issues:

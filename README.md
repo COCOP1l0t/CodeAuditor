@@ -104,6 +104,8 @@ By default, Stage 6 creates or updates `{target}/reproduced-bugs.html`. Before g
 
 The HTML record uses one collapsible section per reproduced bug. Each section carries a visible review status tag and matching machine-readable status fields for `unreviewed`, `reported`, `confirmed`, `rejected`, or `duplicated`.
 
+Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
+
 ### Wiki knowledge base
 
 `--wiki /path/to/wiki` lets CodeAuditor use an existing LLM wiki knowledge base during the audit. CodeAuditor treats the wiki as read-only and instructs agents not to create, edit, or update wiki files. Enforce filesystem permissions externally if write prevention is required.
@@ -130,8 +132,6 @@ wiki/
 `index.md` is recommended as the navigation entry point. Partial wikis are supported; stages skip absent files and use the pages that exist.
 
 > A real-world example is the [QEMU-Security-Wiki](https://github.com/qianfei11/QEMU-Security-Wiki) — a community-maintained knowledge base for auditing QEMU.
-
-Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
 ### Example
 

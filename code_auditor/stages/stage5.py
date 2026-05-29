@@ -26,6 +26,10 @@ def _task_key(vuln_id: str) -> str:
     return f"stage5:{vuln_id}"
 
 
+def _is_fp_report(report_path: str | None) -> bool:
+    return report_path is not None and os.path.basename(os.path.dirname(report_path)).endswith("_fp")
+
+
 def _read_vuln_id(file_path: str) -> str | None:
     try:
         with open(file_path) as f:
@@ -87,7 +91,11 @@ async def _run_reproduce(
 
     if checkpoint.is_complete(key):
         logger.info("Stage 5: %s already complete, skipping.", vuln_id)
-        return _resolve_reproduction_report(poc_dir)
+        resolved = _resolve_reproduction_report(poc_dir)
+        if _is_fp_report(resolved):
+            logger.info("Stage 5: %s marked as false positive.", vuln_id)
+            return None
+        return resolved
 
     logger.info("Stage 5: Starting PoC reproduction for %s.", vuln_id)
     os.makedirs(poc_dir, exist_ok=True)
@@ -165,9 +173,9 @@ async def _run_reproduce(
             shutil.rmtree(poc_dir)
 
     resolved_report = _resolve_reproduction_report(poc_dir)
-    if resolved_report and os.path.basename(os.path.dirname(resolved_report)).endswith("_fp"):
+    if _is_fp_report(resolved_report):
         logger.info("Stage 5: %s marked as false positive.", vuln_id)
-        return resolved_report
+        return None
 
     has_report = resolved_report is not None
     logger.info("Stage 5: %s complete (report=%s)", vuln_id, has_report)

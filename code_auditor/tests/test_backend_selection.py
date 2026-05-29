@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import sys
 import threading
@@ -845,6 +846,45 @@ def test_tui_configure_displays_discovered_path() -> None:
 
     assert "Discovered" in rendered
     assert discovered_path in rendered
+
+
+def _render_stage_panel(state: TUIState, *, width: int = 100) -> str:
+    console = logger_module.Console(
+        record=True,
+        file=io.StringIO(),
+        force_terminal=False,
+        color_system=None,
+        width=width,
+    )
+    console.print(tui_module._make_stage_panel(state))
+    return console.export_text(styles=False)
+
+
+def test_tui_progress_bars_stay_aligned_for_short_counts() -> None:
+    state = TUIState(stages={
+        2: tui_module._StageState(status="done", items_done=24, items_total=24),
+        3: tui_module._StageState(status="running", items_done=8, items_total=18),
+    })
+
+    rendered = _render_stage_panel(state)
+    complete_line = next(line for line in rendered.splitlines() if "24/24" in line)
+    partial_line = next(line for line in rendered.splitlines() if "8/18" in line)
+
+    complete_bar_start = min(index for index, char in enumerate(complete_line) if char in "█░")
+    partial_bar_start = min(index for index, char in enumerate(partial_line) if char in "█░")
+    assert partial_bar_start == complete_bar_start
+
+
+def test_tui_progress_column_expands_for_wide_counts() -> None:
+    state = TUIState(stages={
+        2: tui_module._StageState(status="done", items_done=100, items_total=100),
+        3: tui_module._StageState(status="running", items_done=8, items_total=100),
+    })
+
+    rendered = _render_stage_panel(state)
+
+    assert any("████████ 100/100" in line for line in rendered.splitlines())
+    assert any("░░░░░░░░   8/100" in line for line in rendered.splitlines())
 
 
 def test_tui_log_handler_splits_multiline_records_into_scrollable_rows() -> None:

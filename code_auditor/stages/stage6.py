@@ -568,6 +568,8 @@ async def run_stage6(
         return []
 
     repo_snapshot = collect_repo_snapshot(config.target)
+    repo_snapshot["llm_backend"] = config.backend
+    repo_snapshot["llm_model"] = select_poc_model(config)
     repo_url = repo_snapshot.get("repo_url", "")
     discovered_path = resolve_discovered_path(config)
     candidates = _filter_discovered_duplicates(

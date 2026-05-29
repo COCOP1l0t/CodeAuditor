@@ -240,6 +240,8 @@ def test_build_discovered_entry_includes_visible_fields_and_relative_links_as_ht
             "description": "Example package",
             "dirty_status": "clean",
             "audit_finished_date": "2026-05-11",
+            "llm_backend": "codex",
+            "llm_model": "gpt-5.5",
         },
         discovered_path=str(discovered_path),
         stage4_finding_path=str(stage4),
@@ -267,6 +269,8 @@ def test_build_discovered_entry_includes_visible_fields_and_relative_links_as_ht
     assert "<dt>Version</dt><dd>1.2.3</dd>" in entry
     assert "<dt>Audited Commit</dt><dd><code>abcdef123456</code></dd>" in entry
     assert "<dt>Audit Finished</dt><dd>2026-05-11</dd>" in entry
+    assert "<dt>LLM Backend</dt><dd>codex</dd>" in entry
+    assert "<dt>LLM Model</dt><dd>gpt-5.5</dd>" in entry
     assert "<dt>Severity</dt><dd>High / CVSS 8.1</dd>" in entry
     assert "<dt>CWE</dt><dd>CWE-191</dd>" in entry
     assert "<dt>Location</dt><dd><code>src/parser.c:parse_packet lines 10-24</code></dd>" in entry
@@ -286,6 +290,8 @@ def test_build_discovered_entry_includes_visible_fields_and_relative_links_as_ht
     assert metadata["repo_url"] == "https://example.test/repo.git"
     assert metadata["audited_commit"] == "abcdef123456"
     assert metadata["audit_finished_date"] == "2026-05-11"
+    assert metadata["llm_backend"] == "codex"
+    assert metadata["llm_model"] == "gpt-5.5"
     assert metadata["review_status"] == "unreviewed"
 
 
@@ -399,6 +405,8 @@ def test_stage6_appends_new_entry_to_configured_discovered_path(
         tmp_path,
         discovered_path=explicit_discovered,
     )
+    config.backend = "codex"
+    config.model = "custom-stage6-model"
     finding_path = _write_stage4_finding(output_dir, "H-01", _finding())
     stage5_report = _write_stage5_report(output_dir, "H-01", "Length underflow reaches memcpy")
 
@@ -431,6 +439,14 @@ def test_stage6_appends_new_entry_to_configured_discovered_path(
     assert "email.txt" in content
     assert "disclosure.zip" in content
     assert '<span class="bug-title">Security issue</span>' in content
+    assert "<dt>LLM Backend</dt><dd>codex</dd>" in content
+    assert "<dt>LLM Model</dt><dd>custom-stage6-model</dd>" in content
+
+    metadata_line = next(line for line in content.splitlines() if line.startswith("<!-- code-auditor:discovered "))
+    payload = metadata_line.removeprefix("<!-- code-auditor:discovered ").removesuffix(" -->")
+    metadata = json.loads(payload)
+    assert metadata["llm_backend"] == "codex"
+    assert metadata["llm_model"] == "custom-stage6-model"
 
 
 def test_stage6_does_not_append_when_disclosure_returns_none(

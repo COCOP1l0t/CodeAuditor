@@ -534,6 +534,8 @@ def build_discovered_entry(
     repo_url = repo_snapshot.get("repo_url", "")
     audited_commit = repo_snapshot.get("audited_commit", "")
     audit_finished_date = repo_snapshot.get("audit_finished_date", "")
+    llm_backend = repo_snapshot.get("llm_backend", "")
+    llm_model = repo_snapshot.get("llm_model", "")
     dedupe_key = build_dedupe_key(finding, repo_url)
     review_status = _normalize_review_status(finding.get("review_status"))
 
@@ -543,6 +545,8 @@ def build_discovered_entry(
         "repo_url": repo_url,
         "audited_commit": audited_commit,
         "audit_finished_date": audit_finished_date,
+        "llm_backend": llm_backend,
+        "llm_model": llm_model,
         "review_status": review_status,
         "location": _single_line(finding.get("location")),
         "cwe": ", ".join(_display_list(finding.get("cwe_id") or finding.get("cwe"))),
@@ -571,6 +575,8 @@ def build_discovered_entry(
         _metadata_row("Audited Commit", audited_commit, code=True),
         _metadata_row("Dirty Status", repo_snapshot.get("dirty_status")),
         _metadata_row("Audit Finished", audit_finished_date),
+        _metadata_row("LLM Backend", llm_backend),
+        _metadata_row("LLM Model", llm_model),
         _metadata_row("Severity", _severity_cvss(finding)),
         _metadata_row("CWE", ", ".join(_display_list(finding.get("cwe_id") or finding.get("cwe")))),
         _metadata_row("Vulnerability Class", ", ".join(_display_list(finding.get("vulnerability_class")))),

@@ -49,6 +49,8 @@ HEADER_HEIGHT = 3
 CONFIG_HEIGHT = 7
 STAGES_HEIGHT = 13
 SUMMARY_HEIGHT = 8
+PROGRESS_BAR_LEN = 8
+MIN_PROGRESS_COUNT_WIDTH = 5
 
 # ── Stage metadata ──────────────────────────────────────────────────────────
 STAGE_INFO: dict[int, tuple[str, str]] = {
@@ -154,13 +156,33 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def _progress_count_width(state: TUIState) -> int:
+    count_width = MIN_PROGRESS_COUNT_WIDTH
+    for stage in state.stages.values():
+        if stage.items_total > 0:
+            count_width = max(count_width, len(f"{stage.items_done}/{stage.items_total}"))
+    return count_width
+
+
+def _fmt_progress(stage: _StageState, count_width: int) -> str:
+    if stage.items_total <= 0:
+        return ""
+
+    pct = max(0.0, min(1.0, stage.items_done / stage.items_total))
+    filled = int(pct * PROGRESS_BAR_LEN)
+    bar = "█" * filled + "░" * (PROGRESS_BAR_LEN - filled)
+    count = f"{stage.items_done}/{stage.items_total}"
+    return f"{bar} {count:>{count_width}}"
+
+
 def _make_stage_panel(state: TUIState) -> Panel:
     table = Table(show_header=True, header_style=f"bold {ACCENT}", box=None, padding=(0, 1), expand=True)
     table.add_column("#", width=3, justify="center")
     table.add_column("Stage", width=12)
     table.add_column("Description", ratio=3)
     table.add_column("Status", width=14, justify="left")
-    table.add_column("Progress", width=14, justify="right")
+    progress_count_width = _progress_count_width(state)
+    table.add_column("Progress", width=PROGRESS_BAR_LEN + 1 + progress_count_width, justify="right")
     table.add_column("Time", width=14, justify="right")
 
     for stage_num in sorted(STAGE_INFO.keys()):
@@ -182,16 +204,7 @@ def _make_stage_panel(state: TUIState) -> Panel:
             status_text = Text(st.status)
 
         # Progress
-        if st.items_total > 0:
-            pct = st.items_done / st.items_total
-            bar_len = 8
-            filled = int(pct * bar_len)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            progress_text = f"{bar} {st.items_done}/{st.items_total}"
-        elif st.status == "running":
-            progress_text = ""
-        else:
-            progress_text = ""
+        progress_text = _fmt_progress(st, progress_count_width)
 
         # Time
         if st.start_time and st.end_time:

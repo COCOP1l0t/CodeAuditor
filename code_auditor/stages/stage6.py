@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -513,46 +512,20 @@ async def _run_disclosure(
     })
 
     log_file = os.path.join(stage6_vuln_dir, "agent.log")
-    timeout_seconds = config.agent_timeout_seconds
-    if timeout_seconds is None:
-        logger.info("Stage 6: Agent timeout disabled for %s.", vuln_id)
-
-    timed_out = False
-    task = asyncio.create_task(
-        run_agent(
-            prompt,
-            config,
-            cwd=config.target,
-            max_turns=_MAX_TURNS,
-            model=select_poc_model(config),
-            effort=_DEFAULT_EFFORT,
-            log_file=log_file,
-        )
+    await run_agent(
+        prompt,
+        config,
+        cwd=config.target,
+        max_turns=_MAX_TURNS,
+        model=select_poc_model(config),
+        effort=_DEFAULT_EFFORT,
+        log_file=log_file,
     )
-    done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
-
-    if not done:
-        if timeout_seconds is None:
-            raise AssertionError("Stage 6 timed out without a configured timeout.")
-        timeout_minutes = timeout_seconds // 60
-        timed_out = True
-        task.cancel()
-        grace_done, _ = await asyncio.wait({task}, timeout=30)
-        if not grace_done:
-            logger.warning("Stage 6: %s agent task did not exit after cancel, moving on.", vuln_id)
-        logger.warning(
-            "Stage 6: %s timed out after %d minutes.",
-            vuln_id, timeout_minutes,
-        )
-    else:
-        exc = task.exception()
-        if exc is not None:
-            raise exc
 
     checkpoint.mark_complete(key)
 
     has_report = os.path.exists(disclosure_report)
-    logger.info("Stage 6: %s complete (report=%s, timed_out=%s)", vuln_id, has_report, timed_out)
+    logger.info("Stage 6: %s complete (report=%s)", vuln_id, has_report)
     return disclosure_report if has_report else None
 
 

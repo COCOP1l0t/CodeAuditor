@@ -50,16 +50,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-au-count", type=int, default=10, help="Target number of analysis units for stage 2 (default: 10)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument(
-        "--enable-timeout",
-        action="store_true",
-        help="Enable per-stage agent timeouts",
-    )
-    parser.add_argument(
-        "--disable-stale-log-kill",
-        action="store_true",
-        help="Disable the 20-minute stale-log kill watchdog",
-    )
-    parser.add_argument(
         "--tui",
         action="store_true",
         help="Launch the interactive TUI dashboard",
@@ -107,8 +97,6 @@ def main() -> None:
     discovered_path = _resolve_discovered_path(args.discovered, target)
     wiki_path = _resolve_wiki_path(args.wiki)
 
-    agent_timeout_seconds = DEFAULT_AGENT_TIMEOUT_SECONDS if args.enable_timeout else None
-
     config = AuditConfig(
         target=target,
         output_dir=output_dir,
@@ -120,8 +108,7 @@ def main() -> None:
         backend=args.backend,
         model=args.model,
         target_au_count=args.target_au_count,
-        agent_timeout_seconds=agent_timeout_seconds,
-        disable_stale_log_kill=args.disable_stale_log_kill,
+        agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
     )
 
     if args.tui:

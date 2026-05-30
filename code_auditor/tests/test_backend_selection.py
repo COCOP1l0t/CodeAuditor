@@ -78,6 +78,12 @@ def test_cli_accepts_tui_flag() -> None:
     assert args.tui is True
 
 
+@pytest.mark.parametrize("removed_flag", ["--enable-timeout", "--disable-stale-log-kill"])
+def test_cli_rejects_removed_timeout_flags(removed_flag: str) -> None:
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["--target", ".", removed_flag])
+
+
 def test_main_maps_wiki_path_to_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -261,7 +267,7 @@ def test_additional_directories_skips_wiki_when_it_is_cwd(tmp_path) -> None:  # 
     assert agent._additional_directories(config, str(target)) == [str(output.resolve())]
 
 
-def test_main_disables_timeout_by_default(
+def test_main_enables_default_agent_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -279,7 +285,7 @@ def test_main_disables_timeout_by_default(
 
     main_module.main()
 
-    assert captured["config"].agent_timeout_seconds is None
+    assert captured["config"].agent_timeout_seconds == DEFAULT_AGENT_TIMEOUT_SECONDS
 
 
 def test_main_defaults_output_dir_to_local_dated_audit_output(
@@ -334,28 +340,6 @@ def test_main_keeps_explicit_output_dir(
     main_module.main()
 
     assert captured["config"].output_dir == str(explicit_output)
-
-
-def test_main_maps_enable_timeout_to_config(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-) -> None:  # type: ignore[no-untyped-def]
-    captured: dict[str, AuditConfig] = {}
-
-    async def fake_run_audit(config: AuditConfig) -> None:
-        captured["config"] = config
-
-    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
-    monkeypatch.setattr(sys, "argv", [
-        "code-auditor",
-        "--target",
-        str(tmp_path),
-        "--enable-timeout",
-    ])
-
-    main_module.main()
-
-    assert captured["config"].agent_timeout_seconds == DEFAULT_AGENT_TIMEOUT_SECONDS
 
 
 def test_main_exits_130_on_keyboard_interrupt(
@@ -529,6 +513,117 @@ def test_run_agent_dispatches_to_codex_backend(monkeypatch: pytest.MonkeyPatch) 
         config = AuditConfig(target="/tmp/project", output_dir="/tmp/output", backend="codex")
 
         assert await agent.run_agent("prompt", config, cwd="/tmp/project") == "codex-result"
+
+    asyncio.run(run_case())
+
+
+def test_run_agent_kills_backend_when_semantic_checker_says_finished(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_case() -> None:
+        log_file = tmp_path / "agent.log"
+
+        class FakeProcess:
+            killed = False
+            pid = 1234
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = FakeProcess()
+
+        async def fake_claude_agent(
+            *_args,
+            log_file: str | None = None,
+            run_control=None,
+            **_kwargs,
+        ) -> str:  # type: ignore[no-untyped-def]
+            assert run_control is not None
+            run_control.register_process(process)
+            assert log_file is not None
+            Path(log_file).write_text("final analysis is already complete\n", encoding="utf-8")
+            while True:
+                await asyncio.sleep(1)
+
+        async def fake_status_check(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return agent._AgentCompletionDecision(finished=True, reason="agent already wrote a final answer")
+
+        monkeypatch.setattr(agent, "_run_claude_agent", fake_claude_agent)
+        monkeypatch.setattr(agent, "_check_agent_log_semantically", fake_status_check)
+
+        config = AuditConfig(
+            target=str(tmp_path),
+            output_dir=str(tmp_path),
+            backend="claude",
+            agent_timeout_seconds=0.01,
+        )
+
+        result = await asyncio.wait_for(
+            agent.run_agent("prompt", config, cwd=str(tmp_path), log_file=str(log_file)),
+            timeout=1,
+        )
+
+        assert process.killed is True
+        assert result == "final analysis is already complete\n"
+
+    asyncio.run(run_case())
+
+
+def test_run_agent_repeats_semantic_check_until_checker_says_finished(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_case() -> None:
+        log_file = tmp_path / "agent.log"
+
+        class FakeProcess:
+            killed = False
+            pid = 5678
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = FakeProcess()
+        decisions: list[str] = []
+
+        async def fake_claude_agent(
+            *_args,
+            log_file: str | None = None,
+            run_control=None,
+            **_kwargs,
+        ) -> str:  # type: ignore[no-untyped-def]
+            assert run_control is not None
+            run_control.register_process(process)
+            assert log_file is not None
+            Path(log_file).write_text("analysis still running\n", encoding="utf-8")
+            while True:
+                await asyncio.sleep(1)
+
+        async def fake_status_check(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            decisions.append(Path(log_file).read_text(encoding="utf-8"))
+            return agent._AgentCompletionDecision(
+                finished=len(decisions) == 2,
+                reason="finished on second semantic check",
+            )
+
+        monkeypatch.setattr(agent, "_run_claude_agent", fake_claude_agent)
+        monkeypatch.setattr(agent, "_check_agent_log_semantically", fake_status_check)
+
+        config = AuditConfig(
+            target=str(tmp_path),
+            output_dir=str(tmp_path),
+            backend="claude",
+            agent_timeout_seconds=0.01,
+        )
+
+        await asyncio.wait_for(
+            agent.run_agent("prompt", config, cwd=str(tmp_path), log_file=str(log_file)),
+            timeout=1,
+        )
+
+        assert len(decisions) == 2
+        assert process.killed is True
 
     asyncio.run(run_case())
 

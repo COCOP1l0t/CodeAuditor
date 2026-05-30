@@ -29,7 +29,6 @@ code-auditor --target /path/to/project [options]
 #   --backend          Agent backend: claude | codex (default: claude)
 #   --model            Model override (Claude default: claude-sonnet-4-6; Codex default: gpt-5.4)
 #   --target-au-count  Target number of analysis units for stage 2 (default: 10)
-#   --enable-timeout   Enable per-stage agent timeouts
 #   --tui              Launch the interactive TUI dashboard
 #   --log-level        DEBUG|INFO|WARNING|ERROR (default: INFO)
 ```

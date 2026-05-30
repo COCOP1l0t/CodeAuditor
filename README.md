@@ -94,11 +94,11 @@ code-auditor --target /path/to/project [options]
 | `--model` | Backend model override. Claude defaults to `claude-sonnet-4-6`; Codex uses the local Codex config default unless specified. |
 | `--target-au-count` | Target number of analysis units for Stage 2 (default: `10`). |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` (default: `INFO`). |
-| `--enable-timeout` | Enable per-stage agent timeouts. By default, CodeAuditor runs without per-stage agent timeouts for long-running targets such as QEMU. |
-| `--disable-stale-log-kill` | Disable the 20-minute stale-log kill watchdog. |
 | `--tui` | Launch the interactive TUI dashboard instead of plain log output. |
 
 **Bold** options are required.
+
+Agent runs use a 20-minute semantic timeout cycle by default. If an agent is still running after 20 minutes, CodeAuditor starts a status-checking subagent to inspect that agent's `agent.log`; when the checker determines the analysis is already finished, CodeAuditor kills the original backend process. Otherwise, it waits another 20 minutes and repeats the check.
 
 By default, Stage 6 creates or updates `{target}/reproduced-bugs.html`. Before generating disclosures, Stage 6 reads this file and skips reproduced bugs with matching dedupe metadata. After Stage 6 successfully writes disclosure output for a new reproduced bug, it appends a new HTML entry to the same file. Use `--discovered /path/to/reproduced-bugs.html` to read and update a different HTML file.
 

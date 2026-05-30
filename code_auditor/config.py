@@ -34,8 +34,7 @@ class AuditConfig:
     backend: AgentBackend = DEFAULT_BACKEND
     model: str | None = None
     target_au_count: int = 10
-    agent_timeout_seconds: int | None = None
-    disable_stale_log_kill: bool = False
+    agent_timeout_seconds: int | None = DEFAULT_AGENT_TIMEOUT_SECONDS
 
 
 def select_poc_model(config: AuditConfig) -> str:

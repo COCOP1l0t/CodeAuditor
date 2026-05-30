@@ -94,11 +94,11 @@ code-auditor --target /path/to/project [options]
 | `--model` | 后端模型覆盖。Claude 默认为 `claude-sonnet-4-6`；Codex 使用本地 Codex 配置默认值，除非另行指定。 |
 | `--target-au-count` | 阶段 2 的目标分析单元数量（默认：`10`）。 |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR`（默认：`INFO`）。 |
-| `--enable-timeout` | 启用每个阶段的智能体超时。默认情况下，CodeAuditor 不设置每阶段智能体超时，以支持 QEMU 等长时间运行的目标。 |
-| `--disable-stale-log-kill` | 禁用 20 分钟陈旧日志终止看门狗。 |
 | `--tui` | 启动交互式 TUI 仪表盘，替代纯日志输出。 |
 
 **粗体** 选项为必需。
+
+智能体默认使用 20 分钟的语义超时循环。如果某个智能体运行超过 20 分钟，CodeAuditor 会启动一个状态检查智能体来分析该智能体的 `agent.log`；当状态检查认为分析已经完成时，CodeAuditor 会终止原后端进程。否则会再等待 20 分钟并重复检查。
 
 默认情况下，阶段 6 会创建或更新 `{target}/reproduced-bugs.html`。在生成披露材料前，阶段 6 会读取该文件，并跳过带有匹配去重元数据的已复现漏洞。阶段 6 成功写出新的已复现漏洞披露材料后，会把新的 HTML 条目追加到同一个文件。使用 `--discovered /path/to/reproduced-bugs.html` 可改为读取并更新其他 HTML 文件。
 

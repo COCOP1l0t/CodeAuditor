@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import subprocess
 import time
@@ -16,8 +17,8 @@ from .utils import format_validation_issues
 
 AGENT_MAX_RETRIES = 3
 AGENT_RETRY_BASE_DELAY = 10  # seconds
-STALE_AGENT_LOG_TIMEOUT_SECONDS = 20 * 60
-STALE_AGENT_LOG_CHECK_INTERVAL_SECONDS = 5 * 60
+STATUS_CHECK_AGENT_TIMEOUT_SECONDS = 5 * 60
+STATUS_CHECK_LOG_MAX_CHARS = 200_000
 DEFAULT_CODEX_BIN = "/usr/local/bin/codex"
 
 logger = get_logger("agent")
@@ -35,37 +36,33 @@ _AGENT_PROCESS_REGISTRAR: ContextVar[Callable[[_KillableProcess | None], None] |
 )
 
 
-class AgentLogStaleError(RuntimeError):
-    """Raised when an agent log stops updating and the backend process is killed."""
-
-
 @dataclass
 class _AgentRunControl:
     processes: list[_KillableProcess] = field(default_factory=list)
-    killed_due_to_stale_log: bool = False
+    killed_after_status_check: bool = False
 
     def register_process(self, process: _KillableProcess | None) -> None:
         if process is None or process in self.processes:
             return
         self.processes.append(process)
 
-    def kill_processes(self, log_file: str) -> None:
-        self.killed_due_to_stale_log = True
+    def kill_processes(self, log_file: str, reason: str) -> None:
+        self.killed_after_status_check = True
         if not self.processes:
             logger.warning(
-                "Agent log file has not been updated for %d minutes, but no agent process was registered to kill: %s",
-                STALE_AGENT_LOG_TIMEOUT_SECONDS // 60,
+                "Status checker decided the agent has finished, but no agent process was registered to kill: %s. Reason: %s",
                 log_file,
+                reason,
             )
             return
 
         for process in list(self.processes):
             pid = getattr(process, "pid", "?")
             logger.warning(
-                "Agent log file has not been updated for %d minutes; killing agent process pid=%s: %s",
-                STALE_AGENT_LOG_TIMEOUT_SECONDS // 60,
+                "Status checker decided the agent has finished; killing agent process pid=%s: %s. Reason: %s",
                 pid,
                 log_file,
+                reason,
             )
             try:
                 process.kill()
@@ -81,56 +78,175 @@ def _register_current_agent_process(process: _KillableProcess | None) -> None:
         registrar(process)
 
 
-async def _watch_agent_log_for_staleness(log_file: str, run_control: _AgentRunControl) -> None:
-    last_seen_update = time.time()
-    while True:
-        await asyncio.sleep(STALE_AGENT_LOG_CHECK_INTERVAL_SECONDS)
-        try:
-            last_seen_update = os.stat(log_file).st_mtime
-        except FileNotFoundError:
-            pass
-
-        stale_seconds = time.time() - last_seen_update
-        if stale_seconds >= STALE_AGENT_LOG_TIMEOUT_SECONDS:
-            run_control.kill_processes(log_file)
-            raise AgentLogStaleError(
-                f"Agent log file has not been updated for {stale_seconds:.0f}s: {log_file}"
-            )
+@dataclass(frozen=True)
+class _AgentCompletionDecision:
+    finished: bool
+    reason: str
 
 
-async def _run_agent_attempt_with_stale_log_watch(
-    attempt: Coroutine[object, object, str],
+def _read_agent_log(log_file: str, max_chars: int | None = None) -> str:
+    try:
+        with open(log_file, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return ""
+    if max_chars is not None and len(content) > max_chars:
+        return content[-max_chars:]
+    return content
+
+
+def _extract_json_object(text: str) -> str | None:
+    stripped = text.strip()
+    if stripped.startswith("```json"):
+        stripped = stripped.removeprefix("```json").removesuffix("```").strip()
+    elif stripped.startswith("```"):
+        stripped = stripped.removeprefix("```").removesuffix("```").strip()
+
+    try:
+        json.loads(stripped)
+        return stripped
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    start = stripped.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for index, ch in enumerate(stripped[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = stripped[start : index + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    return None
+
+
+def _parse_agent_completion_decision(response: str) -> _AgentCompletionDecision:
+    json_text = _extract_json_object(response)
+    if json_text is None:
+        raise ValueError("status-checking subagent did not return a JSON object")
+
+    parsed = json.loads(json_text)
+    if not isinstance(parsed, dict):
+        raise ValueError("status-checking subagent JSON response is not an object")
+
+    return _AgentCompletionDecision(
+        finished=bool(parsed.get("finished", False)),
+        reason=str(parsed.get("reason", "")).strip() or "no reason provided",
+    )
+
+
+def _build_status_check_prompt(log_file: str, log_excerpt: str) -> str:
+    return (
+        "You are a CodeAuditor status-checking subagent. Analyze the agent.log excerpt "
+        "semantically and decide whether the code-auditor subagent has finished its "
+        "analysis even though the parent process is still running.\n\n"
+        "Return JSON only with this exact shape:\n"
+        '{"finished": true|false, "reason": "short explanation"}\n\n'
+        "Set finished=true only when the log clearly shows the agent completed the "
+        "analysis or final output it was asked to produce. Set finished=false when the "
+        "log shows ongoing work, active commands, pending investigation, retries, "
+        "waiting, errors that still require action, or when the evidence is ambiguous.\n\n"
+        f"Log file: {log_file}\n\n"
+        "agent.log excerpt:\n"
+        "```\n"
+        f"{log_excerpt}\n"
+        "```"
+    )
+
+
+async def _check_agent_log_semantically(
+    config: AuditConfig,
     *,
+    cwd: str,
+    log_file: str,
+) -> _AgentCompletionDecision:
+    log_excerpt = _read_agent_log(log_file, max_chars=STATUS_CHECK_LOG_MAX_CHARS)
+    if not log_excerpt.strip():
+        return _AgentCompletionDecision(finished=False, reason="agent.log is empty or missing")
+
+    prompt = _build_status_check_prompt(log_file, log_excerpt)
+    try:
+        response = await asyncio.wait_for(
+            run_agent(
+                prompt,
+                config,
+                cwd=cwd,
+                allowed_tools=["Read"],
+                max_turns=10,
+                effort="low",
+                log_file=None,
+            ),
+            timeout=STATUS_CHECK_AGENT_TIMEOUT_SECONDS,
+        )
+        return _parse_agent_completion_decision(response)
+    except asyncio.TimeoutError:
+        logger.warning("Status-checking subagent timed out for %s.", log_file)
+    except Exception as exc:
+        logger.warning("Status-checking subagent failed for %s: %s", log_file, exc)
+    return _AgentCompletionDecision(finished=False, reason="status check failed")
+
+
+async def _await_agent_with_semantic_timeout(
+    agent_call: Coroutine[object, object, str],
+    *,
+    config: AuditConfig,
+    cwd: str,
     log_file: str | None,
     run_control: _AgentRunControl,
-    enable_stale_watch: bool = True,
 ) -> str:
-    if not log_file or not enable_stale_watch:
-        return await attempt
+    timeout_seconds = config.agent_timeout_seconds
+    if not log_file or timeout_seconds is None:
+        return await agent_call
 
-    agent_task = asyncio.create_task(attempt)
-    watcher_task = asyncio.create_task(_watch_agent_log_for_staleness(log_file, run_control))
+    timeout_minutes = max(1, int(timeout_seconds // 60))
+    agent_task = asyncio.create_task(agent_call)
     try:
-        done, _ = await asyncio.wait(
-            {agent_task, watcher_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if watcher_task in done:
-            exc = watcher_task.exception()
-            agent_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.wait_for(agent_task, timeout=5)
-            if exc:
-                raise exc
-            raise AgentLogStaleError(f"Agent log watcher exited unexpectedly: {log_file}")
+        while True:
+            done, _ = await asyncio.wait({agent_task}, timeout=timeout_seconds)
+            if agent_task in done:
+                return await agent_task
 
-        watcher_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watcher_task
-        return await agent_task
+            logger.info(
+                "Agent still running after %d minutes; launching semantic status checker for %s.",
+                timeout_minutes,
+                log_file,
+            )
+            decision = await _check_agent_log_semantically(config, cwd=cwd, log_file=log_file)
+
+            if agent_task.done():
+                return await agent_task
+
+            if not decision.finished:
+                logger.info(
+                    "Status checker says agent should continue for %s. Reason: %s",
+                    log_file,
+                    decision.reason,
+                )
+                continue
+
+            run_control.kill_processes(log_file, decision.reason)
+            agent_task.cancel()
+            try:
+                await asyncio.wait_for(agent_task, timeout=30)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                logger.warning("Agent task did not exit after semantic status-check kill: %s", log_file)
+
+            return _read_agent_log(log_file)
     finally:
-        if not watcher_task.done():
-            watcher_task.cancel()
+        if not agent_task.done():
+            agent_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await agent_task
 
 
 def _patch_claude_sdk(sdk_client, mp, process_error, transport):  # type: ignore[no-untyped-def]
@@ -426,15 +542,7 @@ async def _run_claude_agent(
                     finally:
                         _AGENT_PROCESS_REGISTRAR.reset(token)
 
-                return await _run_agent_attempt_with_stale_log_watch(
-                    collect_messages(text_parts),
-                    log_file=log_file,
-                    run_control=run_control,
-                    enable_stale_watch=not config.disable_stale_log_kill,
-                )
-            except AgentLogStaleError as exc:
-                logger.warning("Claude agent stopped because its log file went stale: %s", exc)
-                return "\n".join(text_parts)
+                return await collect_messages(text_parts)
             except Exception as exc:
                 last_exc = exc
                 if attempt < AGENT_MAX_RETRIES - 1:
@@ -583,15 +691,7 @@ async def _run_codex_agent(
                             log_fh.flush()
                         return "".join(text_parts)
 
-                return await _run_agent_attempt_with_stale_log_watch(
-                    run_codex_turn(),
-                    log_file=log_file,
-                    run_control=run_control,
-                    enable_stale_watch=not config.disable_stale_log_kill,
-                )
-            except AgentLogStaleError as exc:
-                logger.warning("Codex agent stopped because its log file went stale: %s", exc)
-                return ""
+                return await run_codex_turn()
             except Exception as exc:
                 last_exc = exc
                 if attempt < AGENT_MAX_RETRIES - 1:
@@ -644,7 +744,7 @@ async def run_agent(
 
     try:
         if config.backend == "codex":
-            result = await _run_codex_agent(
+            agent_call = _run_codex_agent(
                 prompt,
                 config,
                 cwd,
@@ -656,7 +756,7 @@ async def run_agent(
                 run_control=run_control,
             )
         else:
-            result = await _run_claude_agent(
+            agent_call = _run_claude_agent(
                 prompt,
                 config,
                 cwd,
@@ -667,7 +767,15 @@ async def run_agent(
                 log_file=log_file,
                 run_control=run_control,
             )
-        status = "killed_stale_log" if run_control.killed_due_to_stale_log else "completed"
+
+        result = await _await_agent_with_semantic_timeout(
+            agent_call,
+            config=config,
+            cwd=cwd,
+            log_file=log_file,
+            run_control=run_control,
+        )
+        status = "killed_after_status_check" if run_control.killed_after_status_check else "completed"
         return result
     except asyncio.CancelledError:
         status = "cancelled"
@@ -680,7 +788,6 @@ async def run_agent(
             status,
             time.monotonic() - started_at,
         )
-
 
 async def run_with_validation(
     prompt: str,

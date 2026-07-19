@@ -207,10 +207,10 @@ CodeAuditor 帮助发现和披露的漏洞：
 | CVE-2026-9238 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | CVE-2026-48914 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | CVE-2026-48915 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
-| Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) |
-| Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) |
-| Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) |
-| Embargoed | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5039](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5039) |
+| CVE-2026-53701 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) — H.266/VVC PPS 越界写入；已发布；已在 1.28.3 中修复 |
+| CVE-2026-53702 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) — H.265 SEI 栈溢出；已发布；已在 1.28.3 中修复 |
+| CVE-2026-53703 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) — RealMedia 音频越界读取；修复需要更长时间，目前暂无时间表 |
+| CVE-2026-53704 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5039](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5039) — RealMedia FILEINFO 越界读取；修复需要更长时间，目前暂无时间表 |
 
 ## 负责任的使用
 

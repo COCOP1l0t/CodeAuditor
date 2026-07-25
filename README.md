@@ -210,7 +210,6 @@ Vulnerabilities CodeAuditor has helped discover and disclose:
 | CVE-2026-41439 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3714](https://gitlab.com/qemu-project/qemu/-/work_items/3714) |
 | CVE-2026-48914 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
 | CVE-2026-48915 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3857](https://gitlab.com/qemu-project/qemu/-/work_items/3857) |
-| CVE-2026-61404 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3837](https://gitlab.com/qemu-project/qemu/-/work_items/3837) [#3838](https://gitlab.com/qemu-project/qemu/-/work_items/3838) [#3839](https://gitlab.com/qemu-project/qemu/-/work_items/3839) [#3885](https://gitlab.com/qemu-project/qemu/-/work_items/3885) |
 | CVE-2026-61405 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3890](https://gitlab.com/qemu-project/qemu/-/work_items/3890) |
 | CVE-2026-61406 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3899](https://gitlab.com/qemu-project/qemu/-/work_items/3899) |
 | CVE-2026-61476 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3875](https://gitlab.com/qemu-project/qemu/-/work_items/3875) |

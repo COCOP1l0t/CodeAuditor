@@ -215,10 +215,10 @@ Vulnerabilities CodeAuditor has helped discover and disclose:
 | CVE-2026-61406 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3899](https://gitlab.com/qemu-project/qemu/-/work_items/3899) |
 | CVE-2026-61476 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3875](https://gitlab.com/qemu-project/qemu/-/work_items/3875) |
 | CVE-2026-63324 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3984](https://gitlab.com/qemu-project/qemu/-/work_items/3984) |
-| CVE-2026-53701 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) — H.266/VVC PPS OOB write; published; fixed in 1.28.3 |
-| CVE-2026-53702 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) — H.265 SEI stack overflow; published; fixed in 1.28.3 |
-| CVE-2026-53703 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) — RealMedia audio OOB read; fix will take longer, with no timeline yet |
-| CVE-2026-53704 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5039](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5039) — RealMedia FILEINFO OOB read; fix will take longer, with no timeline yet |
+| CVE-2026-53701 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) |
+| CVE-2026-53702 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) |
+| CVE-2026-53703 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) |
+| CVE-2026-53704 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5039](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5039) |
 
 ## Responsible use
 

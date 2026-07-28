@@ -193,31 +193,33 @@ Tests cover parsers and validators; they do not make real agent calls.
 
 Vulnerabilities CodeAuditor has helped discover and disclose:
 
-| CVE ID | Project | Year | Reference |
-|--------|---------|------|-----------|
-| CVE-2026-28780 | [httpd](https://github.com/apache/httpd) | 2026 | [GitHub](https://github.com/apache/httpd) |
-| CVE-2026-34032 | [httpd](https://github.com/apache/httpd) | 2026 | [GitHub](https://github.com/apache/httpd) |
-| CVE-2026-40312 | [ImageMagick](https://github.com/ImageMagick/ImageMagick) | 2026 | [GitHub](https://github.com/ImageMagick/ImageMagick) |
-| CVE-2026-40385 | [libexif](https://github.com/libexif/libexif) | 2026 | [GitHub](https://github.com/libexif/libexif) |
-| CVE-2026-40386 | [libexif](https://github.com/libexif/libexif) | 2026 | [GitHub](https://github.com/libexif/libexif) |
-| CVE-2026-7180 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
-| CVE-2026-8341 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3750](https://gitlab.com/qemu-project/qemu/-/work_items/3750) |
-| CVE-2026-8343 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3791](https://gitlab.com/qemu-project/qemu/-/work_items/3791) [#3807](https://gitlab.com/qemu-project/qemu/-/work_items/3807) [#3827](https://gitlab.com/qemu-project/qemu/-/work_items/3827) |
-| CVE-2026-8348 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3810](https://gitlab.com/qemu-project/qemu/-/work_items/3810) |
-| CVE-2026-9238 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3820](https://gitlab.com/qemu-project/qemu/-/work_items/3820) |
-| CVE-2026-15705 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3808](https://gitlab.com/qemu-project/qemu/-/work_items/3808) |
-| CVE-2026-41437 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3711](https://gitlab.com/qemu-project/qemu/-/work_items/3711) |
-| CVE-2026-41439 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3714](https://gitlab.com/qemu-project/qemu/-/work_items/3714) |
-| CVE-2026-48914 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [GitLab](https://gitlab.com/qemu-project/qemu) |
-| CVE-2026-48915 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3857](https://gitlab.com/qemu-project/qemu/-/work_items/3857) |
-| CVE-2026-61405 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3890](https://gitlab.com/qemu-project/qemu/-/work_items/3890) |
-| CVE-2026-61406 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3899](https://gitlab.com/qemu-project/qemu/-/work_items/3899) |
-| CVE-2026-61476 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3875](https://gitlab.com/qemu-project/qemu/-/work_items/3875) |
-| CVE-2026-63324 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | [#3984](https://gitlab.com/qemu-project/qemu/-/work_items/3984) |
-| CVE-2026-53701 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) |
-| CVE-2026-53702 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) |
-| CVE-2026-53703 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) |
-| CVE-2026-53704 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | [#5039](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5039) |
+Scores are public CVSS base scores (v3.1 where specified). NVD scores take precedence; when NVD has no score, the CNA/ADP or upstream disclosure score is used. `/` means no public numerical score was found.
+
+| CVE ID | Project | Year | CVSS Base Score | Reference |
+|--------|---------|------|------------|-----------|
+| CVE-2026-28780 | [httpd](https://github.com/apache/httpd) | 2026 | 9.8 | [GitHub](https://github.com/apache/httpd) |
+| CVE-2026-34032 | [httpd](https://github.com/apache/httpd) | 2026 | 5.3 | [GitHub](https://github.com/apache/httpd) |
+| CVE-2026-40312 | [ImageMagick](https://github.com/ImageMagick/ImageMagick) | 2026 | 5.5 | [GitHub](https://github.com/ImageMagick/ImageMagick) |
+| CVE-2026-40385 | [libexif](https://github.com/libexif/libexif) | 2026 | 7.1 | [GitHub](https://github.com/libexif/libexif) |
+| CVE-2026-40386 | [libexif](https://github.com/libexif/libexif) | 2026 | 7.1 | [GitHub](https://github.com/libexif/libexif) |
+| CVE-2026-7180 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | / | [GitLab](https://gitlab.com/qemu-project/qemu) |
+| CVE-2026-8341 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 6.5 | [#3750](https://gitlab.com/qemu-project/qemu/-/work_items/3750) |
+| CVE-2026-8343 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 5.3 | [#3791](https://gitlab.com/qemu-project/qemu/-/work_items/3791) [#3807](https://gitlab.com/qemu-project/qemu/-/work_items/3807) [#3827](https://gitlab.com/qemu-project/qemu/-/work_items/3827) |
+| CVE-2026-8348 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 4.4 | [#3810](https://gitlab.com/qemu-project/qemu/-/work_items/3810) |
+| CVE-2026-9238 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 5.5 | [#3820](https://gitlab.com/qemu-project/qemu/-/work_items/3820) |
+| CVE-2026-15705 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 5.3 | [#3808](https://gitlab.com/qemu-project/qemu/-/work_items/3808) |
+| CVE-2026-41437 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | / | [#3711](https://gitlab.com/qemu-project/qemu/-/work_items/3711) |
+| CVE-2026-41439 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | / | [#3714](https://gitlab.com/qemu-project/qemu/-/work_items/3714) |
+| CVE-2026-48914 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 6.7 | [GitLab](https://gitlab.com/qemu-project/qemu) |
+| CVE-2026-48915 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 6.1 | [#3857](https://gitlab.com/qemu-project/qemu/-/work_items/3857) |
+| CVE-2026-61405 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 6.0 | [#3890](https://gitlab.com/qemu-project/qemu/-/work_items/3890) |
+| CVE-2026-61406 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 6.5 | [#3899](https://gitlab.com/qemu-project/qemu/-/work_items/3899) |
+| CVE-2026-61476 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | 4.4 | [#3875](https://gitlab.com/qemu-project/qemu/-/work_items/3875) |
+| CVE-2026-63324 | [QEMU](https://gitlab.com/qemu-project/qemu) | 2026 | / | [#3984](https://gitlab.com/qemu-project/qemu/-/work_items/3984) |
+| CVE-2026-53701 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | 6.5 | [#5035](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5035) |
+| CVE-2026-53702 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | 6.5 | [#5036](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5036) |
+| CVE-2026-53703 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | 7.1 | [#5038](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5038) |
+| CVE-2026-53704 | [GStreamer](https://gitlab.freedesktop.org/gstreamer/gstreamer) | 2026 | 7.1 | [#5039](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/5039) |
 
 ## Responsible use
 

@@ -12,7 +12,13 @@ dependencies = [
     "codex-app-server-sdk @ https://codeload.github.com/openai/codex/tar.gz/6e838a19fa52f2c30442c5bd2913acd1e6fe4c9d#subdirectory=sdk/python",
     "textual>=0.50",
     "rich>=13.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "websockets>=14",
 ]
+
+[project.optional-dependencies]
+test = ["httpx", "pytest", "pytest-asyncio"]
 
 [project.scripts]
 code-auditor = "code_auditor.__main__:main"

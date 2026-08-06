@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>CodeAuditor</title>
+  <rect width="64" height="64" rx="10" fill="#0f141b"/>
+  <path d="M32 6 53 14v16c0 13-7.7 22.5-21 28C18.7 52.5 11 43 11 30V14Z"
+        fill="#111a22" stroke="#58d6eb" stroke-width="4" stroke-linejoin="round"/>
+  <path d="m27 21-8 11 8 11M37 21l8 11-8 11"
+        fill="none" stroke="#eef2f6" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M34.5 19 29.5 45" stroke="#58d6eb" stroke-width="3" stroke-linecap="round"/>
+</svg>

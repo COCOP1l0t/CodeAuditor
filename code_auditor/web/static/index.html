@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f141b" />
+  <title>CodeAuditor</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/vendor/xterm/xterm.css" />
+</head>
+<body>
+  <div class="layout">
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <img class="logo-mark" src="/static/icon.svg" alt="" aria-hidden="true" />
+      <span class="logo-text">CodeAuditor</span>
+    </div>
+    <nav id="tabs">
+      <a href="#/" class="tab" data-route="new">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        <span>New Audit</span>
+      </a>
+      <a href="#/history" class="tab" data-route="history">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span>History</span>
+      </a>
+      <a href="#/reproduction" class="tab" data-route="reproduction">
+        <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/></svg>
+        <span>Reproduction</span>
+      </a>
+      <a href="#/disclosures" class="tab" data-route="disclosures">
+        <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <span>Disclosures</span>
+      </a>
+      <a href="#/trash" class="tab" data-route="trash">
+        <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M8 6V4h8v2M19 6l-1 15H6L5 6"/><line x1="10" y1="10" x2="10" y2="17"/><line x1="14" y1="10" x2="14" y2="17"/></svg>
+        <span>Recycle Bin</span>
+        <span id="trash-nav-count" class="nav-count" hidden></span>
+      </a>
+      <a href="#/cves" class="tab" data-route="cves">
+        <svg viewBox="0 0 24 24"><path d="M8 3h8l5 5v8l-5 5H8l-5-5V8z"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
+        <span>CVEs</span>
+      </a>
+    </nav>
+    <div id="job-status-panel" class="sidebar-footer" data-state="idle">
+      <span class="sidebar-footer-label">Audit status</span>
+      <span id="job-badge" class="badge badge-idle">idle</span>
+    </div>
+  </aside>
+
+  <div id="workspace">
+  <main id="content-pane">
+    <div id="view-new">
+    <section class="panel" id="config-panel">
+      <h2>Audit Configuration</h2>
+      <p class="warning">
+        <strong>Repository update:</strong> Stage 0 runs <code>git pull</code> on the target repository before auditing.
+      </p>
+      <form id="audit-form">
+        <div class="form-grid">
+          <label>
+            Target repository
+            <select id="f-repo-select">
+              <option value="">— select a repository —</option>
+              <option value="__clone__">Clone a new repository URL…</option>
+            </select>
+            <span class="hint">Choose a managed checkout or clone a new one.</span>
+          </label>
+          <label id="f-git-url-label" hidden>
+            Git repository URL
+            <input type="text" name="git_url" id="f-git-url"
+                   maxlength="2048" autocomplete="off"
+                   pattern="(https://[^ ]+|git@[^ ]+:[^ ]+)"
+                   placeholder="https://github.com/user/repo.git" />
+            <span class="hint">HTTPS or git@host:path SSH URLs only.</span>
+          </label>
+          <label>
+            Max parallel agents
+            <input type="number" name="max_parallel" id="f-max-parallel"
+                   min="1" max="16" value="1" />
+          </label>
+          <label>
+            Wiki knowledge base
+            <select id="f-wiki-select">
+              <option value="">— none —</option>
+            </select>
+            <span class="hint">Optional local Wiki from ~/.code_auditor/wiki.</span>
+          </label>
+        </div>
+        <p class="hint">
+          Backend, model, DEBUG logging, output roots, and the Discovered
+          registry are loaded from <code id="f-config-path">~/.code_auditor/settings.json</code>.
+        </p>
+        <div class="button-row">
+          <button type="submit" id="btn-start" class="btn btn-start">Start Audit</button>
+          <button type="button" id="btn-stop" class="btn btn-stop" disabled>Stop</button>
+          <span id="form-error" class="error"></span>
+        </div>
+        <div id="repo-runs" class="repo-runs" hidden></div>
+      </form>
+    </section>
+
+    <section class="panel" id="stages-panel">
+      <h2>Stages</h2>
+      <table id="stages-table">
+        <thead>
+          <tr><th>#</th><th>Stage</th><th>Description</th><th>Status</th><th>Progress</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="logs-panel">
+      <header class="log-panel-header">
+        <div>
+          <h2>Logs</h2>
+          <span class="log-retention-note">Bounded live summary</span>
+        </div>
+        <div class="log-actions">
+          <button type="button" id="btn-full-agent-log" class="btn btn-compact">View full log</button>
+          <a class="btn btn-compact" href="/api/results/agent-log?download=true" download>Download</a>
+        </div>
+      </header>
+      <pre id="log-pane"></pre>
+    </section>
+
+    <section class="panel" id="results-panel" hidden>
+      <h2>Results</h2>
+      <p id="results-output-dir" class="dim"></p>
+      <div id="results-columns">
+        <div>
+          <h3>Vulnerabilities</h3>
+          <ul id="results-vulnerabilities" class="file-list"></ul>
+        </div>
+        <div>
+          <h3>PoC Reports</h3>
+          <ul id="results-pocs" class="file-list"></ul>
+        </div>
+        <div>
+          <h3>Disclosures</h3>
+          <ul id="results-disclosures" class="file-list"></ul>
+        </div>
+        <div>
+          <h3>Agent Logs</h3>
+          <ul id="results-agent-logs" class="file-list"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="viewer-panel" hidden>
+      <h2 id="viewer-title">File</h2>
+      <pre id="viewer-content"></pre>
+    </section>
+    </div><!-- /view-new -->
+
+    <div id="view-reproduction" hidden>
+      <section class="panel">
+        <h2>Standalone Reproduction</h2>
+        <p class="dim">
+          Retest one vulnerability whose History PoC status is exactly
+          <code>reproduced</code>. The source commit is checked out in an isolated
+          Git worktree; the original audit output is not modified.
+        </p>
+        <form id="reproduction-form">
+          <div class="form-grid">
+            <label>
+              Target project
+              <select id="r-target-select" required>
+                <option value="">— select a target project —</option>
+              </select>
+            </label>
+            <label>
+              Commit
+              <select id="r-commit-select" required disabled>
+                <option value="">— select a commit —</option>
+              </select>
+            </label>
+            <label>
+              Reproduced vulnerability
+              <select id="r-bug-select" required disabled>
+                <option value="">— select a reproduced bug —</option>
+              </select>
+              <span class="hint" id="r-bug-count">Loading candidates…</span>
+            </label>
+          </div>
+          <div id="r-bug-meta" class="meta-grid reproduction-meta" hidden></div>
+          <div class="button-row">
+            <button type="submit" id="r-btn-start" class="btn btn-start" disabled>Start Reproduction</button>
+            <button type="button" id="r-btn-stop" class="btn btn-stop" disabled>Stop</button>
+            <span id="r-form-error" class="error"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Stage</h2>
+        <table id="reproduction-stage-table">
+          <thead>
+            <tr><th>#</th><th>Stage</th><th>Description</th><th>Status</th><th>Progress</th></tr>
+          </thead>
+          <tbody>
+            <tr id="reproduction-stage-row">
+              <td>5</td><td>PoC</td><td class="stage-desc">Retest the selected vulnerability</td>
+              <td class="stage-status">Pending</td><td class="stage-progress"></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <header class="log-panel-header">
+          <div>
+            <h2>Logs</h2>
+            <span class="log-retention-note">Bounded live summary</span>
+          </div>
+          <div class="log-actions">
+            <button type="button" id="r-btn-full-agent-log" class="btn btn-compact">View full log</button>
+            <a class="btn btn-compact" href="/api/results/agent-log?download=true" download>Download</a>
+          </div>
+        </header>
+        <pre id="reproduction-log-pane"></pre>
+      </section>
+
+      <section class="panel" id="reproduction-results-panel" hidden>
+        <h2>Results</h2>
+        <p id="reproduction-results-output-dir" class="dim"></p>
+        <div id="results-columns">
+          <div>
+            <h3>Vulnerability</h3>
+            <ul id="reproduction-vulnerabilities" class="file-list"></ul>
+          </div>
+          <div>
+            <h3>PoC Report</h3>
+            <ul id="reproduction-pocs" class="file-list"></ul>
+          </div>
+          <div>
+            <h3>Agent Logs</h3>
+            <ul id="reproduction-agent-logs" class="file-list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="reproduction-viewer-panel" hidden>
+        <h2 id="reproduction-viewer-title">File</h2>
+        <pre id="reproduction-viewer-content"></pre>
+      </section>
+    </div><!-- /view-reproduction -->
+
+    <div id="view-history" hidden>
+      <section class="panel">
+        <h2>Audit History</h2>
+        <p id="history-message" class="registry-message dim" role="status"></p>
+        <div class="import-row">
+          <input type="text" id="import-output-dir"
+                 maxlength="4096"
+                 placeholder="~/.code_auditor/results/project/audit-output-commit" />
+          <button id="btn-import" class="btn">Import output directory</button>
+          <span id="import-error" class="error"></span>
+          <span id="import-ok" class="ok"></span>
+        </div>
+        <p class="dim">
+          Point at a single <code>audit-output-*</code> directory, or at a results
+          root to batch-import every output directory it contains. Projects
+          matching a cloned repo are linked automatically.
+        </p>
+        <table id="history-table">
+          <thead>
+            <tr>
+              <th>ID</th><th>Target</th><th>Commit</th><th>Started</th><th>Duration</th>
+              <th>Status</th><th>Backend</th>
+              <th>Reproduced Vulns</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div><!-- /view-history -->
+
+    <div id="view-disclosures" hidden>
+      <section class="panel">
+        <header class="registry-header">
+          <div>
+            <h2>Disclosure Registry</h2>
+            <p>Review database records, triage status, source evidence, and PoC access.</p>
+          </div>
+        </header>
+        <div class="registry-toolbar registry-toolbar-disclosures">
+          <label class="toolbar-search">
+            <span>Search</span>
+            <input id="disclosure-search" type="search" maxlength="256"
+                   autocomplete="off"
+                   placeholder="Title, CVE, CWE, location, trigger…">
+          </label>
+          <label class="toolbar-filter">
+            <span>Project</span>
+            <select id="disclosure-project">
+              <option value="">All projects</option>
+            </select>
+          </label>
+          <span id="disclosure-count" class="record-count" aria-live="polite"></span>
+          <div id="disclosure-chips" class="chips" aria-label="Disclosure status"></div>
+        </div>
+        <p id="disclosures-msg" class="registry-message dim" role="status"></p>
+        <div class="table-shell" tabindex="0" aria-label="Disclosure records">
+          <table id="disclosures-table">
+            <colgroup>
+              <col class="col-disclosure-status"><col class="col-disclosure-project">
+              <col class="col-disclosure-title"><col class="col-disclosure-cve">
+              <col class="col-disclosure-cwe"><col class="col-disclosure-commit">
+              <col class="col-disclosure-date"><col class="col-disclosure-actions">
+            </colgroup>
+            <thead>
+              <tr>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="status">Status</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="project">Project</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="title">Title</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="cve">CVE</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="cwe">CWE</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="commit">Commit</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="date">Date</button></th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div><!-- /view-disclosures -->
+
+    <div id="view-trash" hidden>
+      <section class="panel">
+        <header class="registry-header">
+          <div>
+            <h2>Disclosure Recycle Bin</h2>
+            <p>Deleted slop records remain recoverable for 30 days. On expiry, the linked Stage 6 disclosure directory is deleted; Stage 5 PoC files are retained.</p>
+          </div>
+        </header>
+        <div class="registry-toolbar registry-toolbar-trash">
+          <label class="toolbar-search">
+            <span>Search</span>
+            <input id="trash-search" type="search" maxlength="256"
+                   autocomplete="off" placeholder="Title, project, CWE…">
+          </label>
+          <label class="toolbar-filter">
+            <span>Project</span>
+            <select id="trash-project">
+              <option value="">All projects</option>
+            </select>
+          </label>
+          <span id="trash-count" class="record-count" aria-live="polite"></span>
+        </div>
+        <p id="trash-msg" class="registry-message dim" role="status"></p>
+        <div class="table-shell" tabindex="0" aria-label="Deleted Disclosure records">
+          <table id="trash-table">
+            <colgroup>
+              <col class="col-trash-deleted"><col class="col-trash-expiry">
+              <col class="col-trash-project"><col class="col-trash-title">
+              <col class="col-trash-status"><col class="col-trash-actions">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Deleted</th><th>Permanent deletion</th><th>Project</th>
+                <th>Title</th><th>Status</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div><!-- /view-trash -->
+
+    <div id="view-cves" hidden>
+      <section class="panel">
+        <header class="registry-header">
+          <div>
+            <h2>Local CVE Catalogue</h2>
+            <p>Curated CVE records linked to local Disclosure reports and runnable PoCs.</p>
+          </div>
+          <button type="button" id="btn-cve-import" class="btn">Import CVE</button>
+        </header>
+        <div class="registry-toolbar">
+          <label class="toolbar-filter">
+            <span>Project</span>
+            <select id="cve-project">
+              <option value="">All projects</option>
+            </select>
+          </label>
+          <span id="cve-count" class="record-count" aria-live="polite"></span>
+        </div>
+        <p class="registry-note">
+          CVEs are added explicitly by selecting one or more local Disclosure
+          reports and entering their public record information.
+        </p>
+        <div class="table-shell" tabindex="0" aria-label="Local CVE records">
+          <table id="cves-table">
+            <colgroup>
+              <col class="col-cve-id"><col class="col-cve-project">
+              <col class="col-cve-score"><col class="col-cve-severity">
+              <col class="col-cve-public"><col class="col-cve-local">
+              <col class="col-cve-actions">
+            </colgroup>
+            <thead>
+              <tr>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="cve">CVE</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="project">Project</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="score">CVSS</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="severity">Severity</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="public">Public disclosure</button></th>
+                <th aria-sort="none"><button type="button" class="sort-button" data-sort="local">Local Disclosure / PoC</button></th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div><!-- /view-cves -->
+
+    <dialog id="disclosure-edit-dialog" aria-labelledby="disclosure-edit-title">
+      <form id="disclosure-edit-form">
+        <h2 id="disclosure-edit-title">Edit Disclosure</h2>
+        <p id="disclosure-edit-identity" class="dialog-identity"></p>
+        <div class="form-grid">
+          <label>
+            Title
+            <input id="disclosure-edit-field-title" maxlength="512">
+          </label>
+          <label>
+            CWE
+            <input id="disclosure-edit-field-cwe" maxlength="512" placeholder="CWE-120">
+          </label>
+          <label id="disclosure-edit-cves-field" class="form-grid-wide" hidden>
+            Associated CVE(s)
+            <select id="disclosure-edit-cves" multiple size="6"></select>
+            <span class="dim cve-selection-help">
+              Confirmed Disclosures can be reassigned to CVEs from the same project.
+              Changes are reflected in both catalogues immediately.
+            </span>
+          </label>
+          <label class="form-grid-wide">
+            Location
+            <textarea id="disclosure-edit-field-location" maxlength="4096" rows="3"></textarea>
+          </label>
+          <label>
+            Vulnerability class
+            <input id="disclosure-edit-field-vulnerability-class" maxlength="1024">
+          </label>
+          <label>
+            Audit date
+            <input id="disclosure-edit-field-audit-date" type="date">
+          </label>
+          <label class="form-grid-wide">
+            Trigger
+            <textarea id="disclosure-edit-field-trigger" maxlength="8192" rows="4"></textarea>
+          </label>
+          <label class="form-grid-wide">
+            Summary
+            <textarea id="disclosure-edit-field-summary" maxlength="16384" rows="5"></textarea>
+          </label>
+          <label>
+            Repository URL
+            <input id="disclosure-edit-field-repo-url" type="url" maxlength="2048">
+          </label>
+          <label>
+            Audited commit
+            <input id="disclosure-edit-field-commit" maxlength="256">
+          </label>
+          <label>
+            Model backend
+            <input id="disclosure-edit-field-backend" maxlength="256">
+          </label>
+        </div>
+        <div class="button-row">
+          <button type="submit" id="btn-disclosure-edit-submit" class="btn btn-start">Save changes</button>
+          <button type="button" id="btn-disclosure-edit-cancel" class="btn">Cancel</button>
+          <span id="disclosure-edit-message" class="dim" role="status"></span>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="cve-import-dialog" aria-labelledby="cve-import-title">
+      <form id="cve-import-form">
+        <h2 id="cve-import-title">Import CVE</h2>
+        <label>
+          Local Disclosure report(s) <span class="required">*</span>
+          <select id="cve-disclosures" multiple size="9" required></select>
+        </label>
+        <p class="dim cve-selection-help">
+          Select one or more reports for the same project. Use Ctrl or Command to select multiple entries.
+        </p>
+        <div class="form-grid">
+          <label>
+            CVE ID <span class="required">*</span>
+            <input id="cve-id" required maxlength="32" placeholder="CVE-2026-12345">
+          </label>
+          <label>
+            CVSS score
+            <input id="cve-score" type="number" min="0" max="10" step="0.1" placeholder="7.5">
+          </label>
+          <label>
+            Severity
+            <select id="cve-severity">
+              <option value="">Not specified</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="critical">Critical</option>
+            </select>
+          </label>
+          <label>
+            CVE record URL
+            <input id="cve-url" type="url" maxlength="2048" placeholder="https://www.cve.org/CVERecord?id=...">
+          </label>
+          <label>
+            Project URL
+            <input id="cve-project-url" type="url" maxlength="2048" placeholder="https://example.org/project">
+          </label>
+          <div class="form-grid-wide cve-reference-editor">
+            <div class="cve-reference-heading">
+              <span>Disclosure sites</span>
+              <button type="button" id="btn-cve-reference-add" class="btn btn-compact">Add site</button>
+            </div>
+            <div id="cve-reference-list"></div>
+          </div>
+        </div>
+        <div class="button-row">
+          <button type="submit" id="btn-cve-import-submit" class="btn btn-start">Import</button>
+          <button type="button" id="btn-cve-import-cancel" class="btn">Cancel</button>
+          <span id="cve-import-message" class="dim" role="status"></span>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="trigger-graph-dialog" aria-labelledby="trigger-graph-title">
+      <div class="evidence-dialog-shell">
+        <header class="evidence-dialog-header">
+          <div>
+            <h2 id="trigger-graph-title">PoC trigger graph</h2>
+            <p id="trigger-graph-meta" class="dialog-identity"></p>
+          </div>
+          <button type="button" id="btn-trigger-graph-close" class="btn">Close</button>
+        </header>
+        <p id="trigger-graph-message" class="registry-message dim" role="status"></p>
+        <div id="trigger-graph-layout" class="trigger-graph-layout" hidden>
+          <div id="trigger-graph-canvas" class="trigger-graph-canvas"
+               tabindex="0" aria-label="Interactive PoC function call graph">
+            <svg id="trigger-graph-svg" role="img" aria-labelledby="trigger-graph-title"></svg>
+          </div>
+          <aside id="trigger-graph-details" class="trigger-graph-details"
+                 aria-live="polite">
+            <h3>Select a function node</h3>
+            <p class="dim">Node parameters and source/sink evidence appear here.</p>
+          </aside>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="asan-report-dialog" aria-labelledby="asan-report-title">
+      <div class="evidence-dialog-shell">
+        <header class="evidence-dialog-header">
+          <div>
+            <h2 id="asan-report-title">AddressSanitizer report</h2>
+            <p id="asan-report-meta" class="dialog-identity"></p>
+          </div>
+          <button type="button" id="btn-asan-report-close" class="btn">Close</button>
+        </header>
+        <p id="asan-report-message" class="registry-message dim" role="status"></p>
+        <pre id="asan-report-content" hidden></pre>
+      </div>
+    </dialog>
+
+    <div id="view-target" hidden>
+      <section class="panel">
+        <a href="#/history" class="back-link">← Back to history</a>
+        <h2 id="target-title">Target</h2>
+        <div id="target-meta" class="meta-grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Merged Vulnerabilities <span class="dim" id="target-vuln-count"></span></h2>
+        <table id="target-vulns-table">
+          <thead>
+            <tr>
+              <th>Run</th><th>ID</th><th>Severity</th><th>CVSS</th>
+              <th>CWE</th><th>Title</th><th>PoC</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="panel">
+        <h2>Merged Analysis Units <span class="dim" id="target-au-count"></span></h2>
+        <table id="target-aus-table">
+          <thead>
+            <tr><th>AU</th><th>Source runs</th><th>Files</th><th>Focus</th><th>Description</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div><!-- /view-target -->
+
+    <div id="view-run-detail" hidden>      <section class="panel">
+        <div class="history-run-header">
+          <div>
+            <a href="#/history" class="back-link">← Back to history</a>
+            <h2 id="run-detail-title">Run</h2>
+          </div>
+          <button type="button" id="btn-run-resume" class="btn btn-resume"
+                  data-resume-run hidden>Resume audit</button>
+        </div>
+        <p id="run-resume-message" class="registry-message dim" role="status"></p>
+        <div id="run-meta" class="meta-grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Vulnerabilities</h2>
+        <table id="run-vulns-table">
+          <thead>
+            <tr>
+              <th>ID</th><th>Severity</th><th>CVSS</th><th>CWE</th>
+              <th>Title</th><th>PoC</th><th>Disclosure</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="panel">
+        <h2>Analysis Units</h2>
+        <table id="run-aus-table">
+          <thead>
+            <tr><th>AU</th><th>Files</th><th>Focus</th><th>Description</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="panel" id="history-viewer-panel" hidden>
+        <h2 id="history-viewer-title">File</h2>
+        <pre id="history-viewer-content"></pre>
+      </section>
+    </div><!-- /view-run-detail -->
+  </main>
+
+  <div id="terminal-splitter" role="separator" aria-orientation="horizontal"
+       aria-label="Resize terminal panel" aria-valuemin="200" tabindex="0" hidden></div>
+  <section id="terminal-dock" aria-label="PoC test terminals" hidden>
+    <header class="terminal-dock-header">
+      <div>
+        <strong>PoC test terminals</strong>
+        <span class="dim">Interactive shells start in the selected Stage 5 PoC directory.</span>
+      </div>
+      <button type="button" id="btn-terminal-dock-close" class="btn" aria-label="Close all terminals">Close all</button>
+    </header>
+    <div id="terminal-tabs" role="tablist" aria-label="Open PoC terminals"></div>
+    <div id="terminal-panels"></div>
+  </section>
+  </div><!-- /workspace -->
+  </div><!-- /layout -->
+
+  <aside id="notification-center" class="notification-center" aria-label="Audit notifications" hidden>
+    <header>
+      <strong>Notifications</strong>
+      <button type="button" id="btn-clear-notifications" aria-label="Clear notifications">Clear</button>
+    </header>
+    <div id="notification-list" class="notification-list" aria-live="polite"></div>
+  </aside>
+
+  <script src="/static/vendor/xterm/xterm.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -8,9 +8,11 @@ from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, select_poc_model
 from ..logger import get_logger
+from ..poc_artifacts import ASAN_REPORT_FILENAME, TRIGGER_GRAPH_FILENAME
 from ..prompts import load_prompt
 from ..reproduction_status import is_failed_status, read_reproduction_status
-from ..utils import run_parallel_limited
+from ..utils import format_validation_issues, run_parallel_limited
+from ..validation.stage5 import validate_stage5_trigger_graph
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage5")
@@ -118,15 +120,73 @@ async def _run_reproduce(
         log_file=log_file,
     )
 
-    checkpoint.mark_complete(key)
-
     resolved_report = _resolve_reproduction_report(poc_dir)
     if _is_fp_report(resolved_report):
+        checkpoint.mark_complete(key)
         logger.info("Stage 5: %s marked as false positive.", vuln_id)
         return None
 
+    reproduced = bool(
+        resolved_report
+        and read_reproduction_status(resolved_report) == "reproduced"
+    )
+    if reproduced and resolved_report is not None:
+        resolved_poc_dir = os.path.dirname(resolved_report)
+        issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
+        if issues:
+            graph_path = os.path.join(resolved_poc_dir, TRIGGER_GRAPH_FILENAME)
+            logger.warning(
+                "Stage 5: Trigger graph validation failed for %s\n%s",
+                vuln_id,
+                format_validation_issues(issues),
+            )
+            repair_prompt = (
+                f"The Stage 5 trigger graph at `{graph_path}` is missing or invalid. "
+                "Create or repair it using only the call path verified while running "
+                "the PoC. Do not invent stack frames, parameter values, sanitizer "
+                "output, or runtime evidence. Fix every issue below:\n\n"
+                f"```\n{format_validation_issues(issues)}\n```"
+            )
+            await run_agent(
+                repair_prompt,
+                config,
+                cwd=config.target,
+                max_turns=15,
+                model=select_poc_model(config),
+                effort=_DEFAULT_EFFORT,
+                log_file=log_file,
+            )
+            issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
+            if issues:
+                logger.warning(
+                    "Stage 5: Trigger graph remains unavailable for %s\n%s",
+                    vuln_id,
+                    format_validation_issues(issues),
+                )
+
+    checkpoint.mark_complete(key)
+
     has_report = resolved_report is not None
-    logger.info("Stage 5: %s complete (report=%s)", vuln_id, has_report)
+    has_graph = bool(
+        reproduced
+        and resolved_report
+        and not validate_stage5_trigger_graph(
+            os.path.dirname(resolved_report), vuln_id
+        )
+    )
+    has_asan = bool(
+        resolved_report
+        and os.path.isfile(
+            os.path.join(os.path.dirname(resolved_report), ASAN_REPORT_FILENAME)
+        )
+    )
+    logger.info(
+        "Stage 5: %s complete (report=%s, graph=%s, asan=%s)",
+        vuln_id,
+        has_report,
+        has_graph,
+        has_asan,
+    )
     return resolved_report
 
 

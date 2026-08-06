@@ -65,6 +65,13 @@ async def run_stage2(
     logger.info("Stage 2: Starting codebase decomposition (target AU count: %d).", config.target_au_count)
 
     scope_modules, hot_spots = parse_auditing_focus(auditing_focus_path)
+    if config.target_au_count <= 0:
+        au_count_directive = (
+            "no fixed ceiling — select as many areas as genuinely warrant deep "
+            "security analysis, erring on the side of broader coverage"
+        )
+    else:
+        au_count_directive = str(config.target_au_count)
 
     logger.info("Stage 2: Running agent to enumerate, triage, and create analysis units.")
     prompt = load_prompt("stage2.md", {
@@ -73,7 +80,7 @@ async def run_stage2(
         "user_instructions": config.scope or "No additional scope constraints.",
         "scope_modules": scope_modules or "No scope information available.",
         "historical_hot_spots": hot_spots or "No historical data available.",
-        "target_au_count": str(config.target_au_count),
+        "target_au_count": au_count_directive,
         "wiki_context": build_wiki_context(config, stage=2),
     })
 

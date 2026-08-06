@@ -20,6 +20,12 @@ AGENT_RETRY_BASE_DELAY = 10  # seconds
 STATUS_CHECK_AGENT_TIMEOUT_SECONDS = 5 * 60
 STATUS_CHECK_LOG_MAX_CHARS = 200_000
 DEFAULT_CODEX_BIN = "/usr/local/bin/codex"
+AGENT_ACTIVITY_MAX_CHARS = 800
+AGENT_SYSTEM_ACTIVITY_INTERVAL_SECONDS = 5.0
+AGENT_NOISY_SYSTEM_EVENTS = {
+    "thinking_tokens": "Reasoning in progress",
+    "task_progress": "Task progress active",
+}
 
 logger = get_logger("agent")
 
@@ -372,6 +378,71 @@ def _open_agent_log(log_file: str | None) -> TextIO | None:
     return log_fh
 
 
+def _compact_agent_activity(value: object, max_chars: int = AGENT_ACTIVITY_MAX_CHARS) -> str:
+    """Return one bounded line suitable for terminal, file, and Web logs."""
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
+
+def _tool_input_summary(tool_name: str, tool_input: object) -> str:
+    """Describe a tool call without dumping file contents or arbitrary payloads."""
+    if not isinstance(tool_input, dict):
+        return ""
+    preferred_fields = {
+        "Bash": ("command", "description"),
+        "Read": ("file_path", "offset", "limit"),
+        "Glob": ("pattern", "path"),
+        "Grep": ("pattern", "path", "glob"),
+        "Write": ("file_path",),
+        "Edit": ("file_path",),
+        "WebFetch": ("url",),
+        "WebSearch": ("query",),
+    }.get(tool_name, ("file_path", "path", "pattern", "query", "url"))
+    fields = []
+    for field in preferred_fields:
+        value = tool_input.get(field)
+        if value in (None, "", [], {}):
+            continue
+        fields.append(f"{field}={_compact_agent_activity(value, 300)}")
+    return "; ".join(fields)
+
+
+def _record_agent_activity(log_fh: TextIO | None, activity: str) -> None:
+    """Persist one activity line and publish it through the normal Web log bridge."""
+    line = _compact_agent_activity(activity)
+    if not line:
+        return
+    if log_fh:
+        log_fh.write(f"[activity] {line}\n")
+        log_fh.flush()
+    logger.info("Agent: %s", line)
+
+
+def _codex_item_activity(method: str, payload: object) -> str | None:
+    """Summarize tool-like Codex app-server item lifecycle notifications."""
+    if method not in {"item/started", "item/completed"}:
+        return None
+    item = getattr(payload, "item", None)
+    if item is None:
+        return None
+    item_type = getattr(item, "type", "")
+    item_type = getattr(item_type, "value", item_type)
+    if item_type in {"", "agentMessage", "reasoning"}:
+        return None
+    phase = "Started" if method == "item/started" else "Completed"
+    if item_type == "commandExecution":
+        command = _compact_agent_activity(getattr(item, "command", ""), 500)
+        return f"{phase} command" + (f": {command}" if command else "")
+    if item_type in {"mcpToolCall", "dynamicToolCall"}:
+        server = _compact_agent_activity(getattr(item, "server", ""), 100)
+        tool = _compact_agent_activity(getattr(item, "tool", ""), 200)
+        name = "/".join(part for part in (server, tool) if part) or str(item_type)
+        return f"{phase} tool {name}"
+    return f"{phase} {item_type}"
+
+
 def _resolve_codex_bin() -> str:
     if not os.path.isfile(DEFAULT_CODEX_BIN):
         raise RuntimeError(f"Codex CLI binary not found: {DEFAULT_CODEX_BIN}")
@@ -526,18 +597,96 @@ async def _run_claude_agent(
 
                 async def collect_messages(parts: list[str]) -> str:
                     token = _AGENT_PROCESS_REGISTRAR.set(run_control.register_process)
+                    tool_names: dict[str, str] = {}
+                    last_system_activity_at: dict[str, float] = {}
                     try:
                         async for message in query(prompt=prompt, options=options):
                             if message is None:
                                 continue
-                            if hasattr(message, "content"):
-                                for block in message.content:
-                                    if hasattr(block, "text"):
-                                        parts.append(block.text)
+                            content = getattr(message, "content", None)
+                            if isinstance(content, list):
+                                for block in content:
+                                    text = getattr(block, "text", None)
+                                    if isinstance(text, str) and text:
+                                        parts.append(text)
                                         if log_fh:
-                                            log_fh.write(block.text)
+                                            log_fh.write(text)
                                             log_fh.write("\n")
                                             log_fh.flush()
+                                        _record_agent_activity(
+                                            None,
+                                            f"Response: {_compact_agent_activity(text)}",
+                                        )
+                                        continue
+
+                                    tool_name = getattr(block, "name", None)
+                                    tool_input = getattr(block, "input", None)
+                                    tool_id = getattr(block, "id", None)
+                                    if isinstance(tool_name, str) and tool_name:
+                                        if isinstance(tool_id, str):
+                                            tool_names[tool_id] = tool_name
+                                        detail = _tool_input_summary(tool_name, tool_input)
+                                        _record_agent_activity(
+                                            log_fh,
+                                            f"Started {tool_name}"
+                                            + (f": {detail}" if detail else ""),
+                                        )
+                                        continue
+
+                                    tool_use_id = getattr(block, "tool_use_id", None)
+                                    if isinstance(tool_use_id, str):
+                                        completed_tool = tool_names.get(
+                                            tool_use_id, "tool call"
+                                        )
+                                        outcome = (
+                                            "failed"
+                                            if getattr(block, "is_error", False)
+                                            else "completed"
+                                        )
+                                        _record_agent_activity(
+                                            log_fh,
+                                            f"{completed_tool} {outcome}",
+                                        )
+
+                            message_type = type(message).__name__
+                            if message_type == "SystemMessage":
+                                subtype = _compact_agent_activity(
+                                    getattr(message, "subtype", "session"), 100
+                                )
+                                activity = AGENT_NOISY_SYSTEM_EVENTS.get(subtype)
+                                if activity:
+                                    now = time.monotonic()
+                                    last_activity = last_system_activity_at.get(
+                                        subtype, 0.0
+                                    )
+                                    if (
+                                        now - last_activity
+                                        < AGENT_SYSTEM_ACTIVITY_INTERVAL_SECONDS
+                                    ):
+                                        continue
+                                    last_system_activity_at[subtype] = now
+                                    _record_agent_activity(log_fh, activity)
+                                else:
+                                    _record_agent_activity(
+                                        log_fh, f"Session event: {subtype}"
+                                    )
+                            elif message_type == "ResultMessage":
+                                turns = getattr(message, "num_turns", None)
+                                duration_ms = getattr(message, "duration_ms", None)
+                                is_error = bool(getattr(message, "is_error", False))
+                                result_parts = [
+                                    "Agent result",
+                                    "error" if is_error else "complete",
+                                ]
+                                if turns is not None:
+                                    result_parts.append(f"turns={turns}")
+                                if duration_ms is not None:
+                                    result_parts.append(
+                                        f"duration={float(duration_ms) / 1000:.1f}s"
+                                    )
+                                _record_agent_activity(
+                                    log_fh, " ".join(result_parts)
+                                )
                         return "\n".join(parts)
                     finally:
                         _AGENT_PROCESS_REGISTRAR.reset(token)
@@ -653,6 +802,11 @@ async def _run_codex_agent(
                         try:
                             async for event in stream:
                                 payload = event.payload
+                                activity = _codex_item_activity(
+                                    event.method, payload
+                                )
+                                if activity:
+                                    _record_agent_activity(log_fh, activity)
                                 if (
                                     event.method == "item/agentMessage/delta"
                                     and getattr(payload, "turn_id", None) == turn.id

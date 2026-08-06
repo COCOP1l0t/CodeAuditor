@@ -116,6 +116,18 @@ If the PoC does not trigger as expected, iterate:
 3. Revisit build configuration if needed — rebuild with different flags or instrumentation.
 4. Continue until the vulnerability triggers with clear evidence, or conclude it cannot be reproduced.
 
+#### 3.1 Standardized Runtime Evidence Files
+
+When AddressSanitizer is used and emits a report, preserve the real sanitizer
+output verbatim in:
+
+`__POC_DIR__/asan-report.txt`
+
+Use this exact filename. Include the complete relevant ASan report, including
+the error type, faulting stack, allocation/free stack when present, and the
+final summary. Do not create this file when ASan was not run or did not emit a
+report. Never synthesize, rewrite, or "clean up" sanitizer evidence.
+
 ### Step 4: Real-World Exploitability Assessment
 
 **Goal**: After the PoC triggers the vulnerability, critically assess whether the attack scenario is realistic under the default deployment of the target:
@@ -150,6 +162,76 @@ Write `__POC_DIR__/report.md` containing:
 - **Reproduction Status**: One of: `reproduced`, `partially-reproduced`, `not-reproduced`, `false-positive`
 
 The report must be accurate. Every claim must be supported by evidence. Do not extrapolate or speculate beyond what the evidence shows.
+
+### Step 5.1: Record the Verified PoC Trigger Graph
+
+For every `reproduced` Stage 5 result, write the function path actually
+exercised by the PoC to:
+
+`__POC_DIR__/trigger-graph.json`
+
+This is an evidence record, not an architecture diagram. Derive the path from
+the real debugger backtrace, sanitizer stack, instrumented trace, or
+breakpoint-assisted execution used during reproduction. Source inspection may
+clarify parameters and conditions, but must not be used to invent an unobserved
+runtime path.
+
+Use this versioned JSON shape:
+
+```json
+{
+  "schema_version": 1,
+  "finding_id": "__FINDING_ID__",
+  "title": "Short vulnerability title",
+  "trigger": "How attacker-controlled input reaches the target",
+  "evidence_basis": "Exact command and debugger/sanitizer/trace evidence used to verify this path",
+  "nodes": [
+    {
+      "id": "n1",
+      "function": "entry_function",
+      "location": "path/to/file.c:123",
+      "role": "source",
+      "description": "Receives attacker-controlled input",
+      "evidence": "Backtrace frame, breakpoint observation, or trace line",
+      "key_parameters": [
+        {
+          "name": "length",
+          "value": "65535",
+          "origin": "guest TX descriptor",
+          "security_role": "attacker-controlled length",
+          "description": "Propagates without validation"
+        }
+      ]
+    },
+    {
+      "id": "n2",
+      "function": "vulnerable_sink",
+      "location": "path/to/file.c:456",
+      "role": "sink",
+      "description": "Performs the unsafe memory operation",
+      "evidence": "ASan faulting frame or debugger observation",
+      "key_parameters": []
+    }
+  ],
+  "edges": [
+    {
+      "from": "n1",
+      "to": "n2",
+      "label": "calls",
+      "condition": "length exceeds the destination capacity",
+      "attacker_controlled": true
+    }
+  ]
+}
+```
+
+Node `role` must be one of `trigger`, `source`, `propagation`, `guard`,
+`sink`, or `source-and-sink`. Use stable node IDs, include at least one
+trigger/source and one sink, and ensure the edges contain a reachable path
+between them. Record security-relevant values and origins in `key_parameters`,
+especially lengths, indices, pointers, object state, validation conditions,
+and the final sink arguments. Keep the graph focused on the PoC trigger path;
+omit unrelated callers.
 
 ### Step 6: Handle Failed Reproduction
 

@@ -70,9 +70,9 @@ Write a triage manifest to `__RESULT_DIR__/triage.json` — a JSON array where e
 ```
 
 **Selection rules:**
-- At most **__TARGET_AU_COUNT__** areas may have `selected` set to `true`.
-- __TARGET_AU_COUNT__ is a hard ceiling, not a target. Select only areas that are most vulnerability-prone according to the Auditing Focus and genuinely warrant deep security analysis — this could be 5, 15, or __TARGET_AU_COUNT__ depending on the project.
-- Every selected area will consume one or more sub-agent slots for deep analysis. Be selective: prefer fewer, well-targeted areas over broad but shallow coverage.
+- Selection ceiling: **__TARGET_AU_COUNT__**.
+- When a numeric ceiling is given, it is a hard ceiling, not a target. Select only areas that are most vulnerability-prone according to the Auditing Focus and genuinely warrant deep security analysis.
+- Every selected area will consume one or more sub-agent slots for deep analysis. Prefer well-targeted areas, but do not leave genuinely vulnerability-prone areas unselected just to keep the count small.
 - **Exclude modules not in default compilation or default runtime configuration.** If a module is only compiled when a non-default build flag, feature gate, or `./configure` option is enabled, or only loaded/activated through non-default runtime configuration, mark it `selected: false`.
 - Every area must have a `rationale` explaining why it was selected or excluded.
 
@@ -109,6 +109,6 @@ Do not create analysis units for areas that were not selected in the triage.
 - [ ] Code grouped into functional areas with approximate LOC counts
 - [ ] Each area assessed for bug-hunting value using the Auditing Focus
 - [ ] Triage manifest written to `__RESULT_DIR__/triage.json` with rationale for each area
-- [ ] No more than __TARGET_AU_COUNT__ areas selected; only areas that genuinely warrant deep analysis
+- [ ] Selection respects the stated ceiling; only areas that genuinely warrant deep analysis
 - [ ] AU files created only for selected areas, written as `AU-{N}.json`
 - [ ] Each AU has a clear description and specific, actionable focus

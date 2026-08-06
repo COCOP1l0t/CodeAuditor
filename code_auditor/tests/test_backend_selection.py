@@ -28,6 +28,24 @@ from code_auditor.config import (
 from code_auditor.tui import TUIManager, TUIState, _TUILogHandler, _make_config_table, _visible_log_lines
 
 
+@pytest.fixture(autouse=True)
+def _stub_history_persistence(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Prevent main() tests from writing to the real history database."""
+    calls: list[dict] = []
+
+    def fake_persist(db_path, config, status, error, started_at):  # type: ignore[no-untyped-def]
+        calls.append({
+            "db_path": db_path,
+            "config": config,
+            "status": status,
+            "error": error,
+            "started_at": started_at,
+        })
+
+    monkeypatch.setattr(main_module, "_persist_run_safely", fake_persist)
+    return calls
+
+
 def test_cli_backend_defaults_to_claude() -> None:
     args = _build_parser().parse_args(["--target", "."])
 
@@ -61,15 +79,11 @@ def test_cli_accepts_wiki_path() -> None:
     assert args.wiki == "/tmp/wiki"
 
 
-def test_cli_accepts_discovered_path() -> None:
-    args = _build_parser().parse_args([
-        "--target",
-        ".",
-        "--discovered",
-        "/tmp/bugs.html",
-    ])
-
-    assert args.discovered == "/tmp/bugs.html"
+def test_cli_rejects_removed_discovered_option() -> None:
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            ["--target", ".", "--discovered", "/tmp/bugs.html"]
+        )
 
 
 def test_cli_accepts_tui_flag() -> None:
@@ -109,80 +123,6 @@ def test_main_maps_wiki_path_to_config(
     main_module.main()
 
     assert captured["config"].wiki_path == str(wiki.resolve())
-
-
-def test_main_maps_omitted_discovered_to_target_reproduced_bugs_html(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-) -> None:  # type: ignore[no-untyped-def]
-    captured: dict[str, AuditConfig] = {}
-    target = tmp_path / "target"
-    target.mkdir()
-
-    async def fake_run_audit(config: AuditConfig) -> None:
-        captured["config"] = config
-
-    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
-    monkeypatch.setattr(sys, "argv", [
-        "code-auditor",
-        "--target",
-        str(target),
-    ])
-
-    main_module.main()
-
-    assert captured["config"].discovered_path == str((target / "reproduced-bugs.html").resolve())
-
-
-def test_main_maps_explicit_discovered_to_resolved_file(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-) -> None:  # type: ignore[no-untyped-def]
-    captured: dict[str, AuditConfig] = {}
-    target = tmp_path / "target"
-    discovered = tmp_path / "missing-parent" / "bugs.html"
-    target.mkdir()
-
-    async def fake_run_audit(config: AuditConfig) -> None:
-        captured["config"] = config
-
-    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
-    monkeypatch.setattr(sys, "argv", [
-        "code-auditor",
-        "--target",
-        str(target),
-        "--discovered",
-        str(discovered),
-    ])
-
-    main_module.main()
-
-    assert captured["config"].discovered_path == str(discovered.resolve())
-
-
-def test_main_rejects_existing_directory_as_discovered_path(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    target = tmp_path / "target"
-    discovered = tmp_path / "discovered-dir"
-    target.mkdir()
-    discovered.mkdir()
-
-    monkeypatch.setattr(sys, "argv", [
-        "code-auditor",
-        "--target",
-        str(target),
-        "--discovered",
-        str(discovered),
-    ])
-
-    with pytest.raises(SystemExit) as exc:
-        main_module.main()
-
-    assert exc.value.code == 1
-    assert capsys.readouterr().err == f"Error: Discovered path is a directory: {discovered.resolve()}\n"
 
 
 def test_main_rejects_missing_wiki_path(
@@ -288,15 +228,15 @@ def test_main_enables_default_agent_timeout(
     assert captured["config"].agent_timeout_seconds == DEFAULT_AGENT_TIMEOUT_SECONDS
 
 
-def test_main_defaults_output_dir_to_local_dated_audit_output(
+def test_main_defaults_output_dir_to_results_dir_with_commit_stamp(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]
     captured: dict[str, AuditConfig] = {}
 
-    class FakeDate:
+    class FakeDateTime:
         @classmethod
-        def today(cls):  # type: ignore[no-untyped-def]
+        def now(cls):  # type: ignore[no-untyped-def]
             return cls()
 
         def strftime(self, _format: str) -> str:
@@ -305,7 +245,8 @@ def test_main_defaults_output_dir_to_local_dated_audit_output(
     async def fake_run_audit(config: AuditConfig) -> None:
         captured["config"] = config
 
-    monkeypatch.setattr(main_module, "date", FakeDate, raising=False)
+    # tmp_path is not a git repo, so the stamp falls back to the date.
+    monkeypatch.setattr("code_auditor.repos.datetime", FakeDateTime)
     monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
     monkeypatch.setattr(sys, "argv", [
         "code-auditor",
@@ -315,7 +256,12 @@ def test_main_defaults_output_dir_to_local_dated_audit_output(
 
     main_module.main()
 
-    assert captured["config"].output_dir == str(tmp_path / "audit-output-20300102")
+    import os
+
+    expected = os.path.expanduser(
+        f"~/.code_auditor/results/{tmp_path.name}/audit-output-20300102"
+    )
+    assert captured["config"].output_dir == expected
 
 
 def test_main_keeps_explicit_output_dir(
@@ -340,6 +286,93 @@ def test_main_keeps_explicit_output_dir(
     main_module.main()
 
     assert captured["config"].output_dir == str(explicit_output)
+
+
+def test_main_records_run_in_history_db(
+    _stub_history_persistence: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    async def fake_run_audit(config: AuditConfig) -> None:
+        pass
+
+    db_path = str(tmp_path / "history.db")
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(tmp_path),
+        "--db",
+        db_path,
+    ])
+
+    main_module.main()
+
+    assert len(_stub_history_persistence) == 1
+    call = _stub_history_persistence[0]
+    assert call["db_path"] == db_path
+    assert call["status"] == "done"
+    assert call["error"] == ""
+    assert call["config"].target == str(tmp_path)
+
+
+def test_main_records_failed_run_in_history_db(
+    _stub_history_persistence: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    async def fake_run_audit(config: AuditConfig) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--target",
+        str(tmp_path),
+        "--db",
+        str(tmp_path / "history.db"),
+    ])
+
+    with pytest.raises(SystemExit):
+        main_module.main()
+
+    assert len(_stub_history_persistence) == 1
+    assert _stub_history_persistence[0]["status"] == "failed"
+    assert _stub_history_persistence[0]["error"] == "boom"
+
+
+def test_cli_accepts_repo_url() -> None:
+    args = _build_parser().parse_args(["--repo-url", "https://github.com/u/r.git"])
+
+    assert args.repo_url == "https://github.com/u/r.git"
+
+
+def test_main_with_repo_url_clones_and_audits(
+    _stub_history_persistence: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, AuditConfig] = {}
+
+    async def fake_run_audit(config: AuditConfig) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr(main_module, "run_audit", fake_run_audit)
+    monkeypatch.setattr(
+        main_module, "ensure_repo_sync", lambda url: str(tmp_path)
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "code-auditor",
+        "--repo-url",
+        "https://github.com/u/r.git",
+        "--db",
+        str(tmp_path / "history.db"),
+    ])
+
+    main_module.main()
+
+    assert captured["config"].target == str(tmp_path)
+    assert _stub_history_persistence[0]["status"] == "done"
 
 
 def test_main_exits_130_on_keyboard_interrupt(
@@ -907,6 +940,164 @@ def test_claude_backend_keeps_claude_code_settings_sources(monkeypatch: pytest.M
     asyncio.run(run_case())
 
 
+def test_claude_backend_streams_bounded_tool_activity_to_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run_case() -> None:
+        class FakeClaudeCodeOptions:
+            def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                self.__dict__.update(kwargs)
+
+        class SystemMessage:
+            subtype = "init"
+
+        class ToolUseBlock:
+            id = "tool-1"
+            name = "Edit"
+            input = {
+                "file_path": "/tmp/project/src/a.c",
+                "new_string": "secret file contents must not be logged",
+            }
+
+        class ToolResultBlock:
+            tool_use_id = "tool-1"
+            is_error = False
+
+        class TextBlock:
+            text = "Finished reviewing the affected path."
+
+        class AssistantMessage:
+            def __init__(self, content: list[object]) -> None:
+                self.content = content
+
+        class UserMessage:
+            def __init__(self, content: list[object]) -> None:
+                self.content = content
+
+        class ResultMessage:
+            num_turns = 3
+            duration_ms = 2500
+            is_error = False
+
+        async def fake_query(*, prompt: str, options: FakeClaudeCodeOptions):  # type: ignore[no-untyped-def]
+            yield SystemMessage()
+            yield AssistantMessage([ToolUseBlock()])
+            yield UserMessage([ToolResultBlock()])
+            yield AssistantMessage([TextBlock()])
+            yield ResultMessage()
+
+        monkeypatch.setattr(
+            agent,
+            "_load_claude_sdk",
+            lambda: (FakeClaudeCodeOptions, fake_query),
+        )
+        config = AuditConfig(
+            target="/tmp/project",
+            output_dir=str(tmp_path),
+            backend="claude",
+        )
+        log_file = tmp_path / "agent.log"
+
+        with caplog.at_level(logging.INFO, logger="code_auditor.agent"):
+            result = await agent._run_claude_agent(
+                "prompt",
+                config,
+                cwd="/tmp/project",
+                log_file=str(log_file),
+            )
+
+        assert result == "Finished reviewing the affected path."
+        persisted = log_file.read_text(encoding="utf-8")
+        assert "[activity] Session event: init" in persisted
+        assert "Started Edit: file_path=/tmp/project/src/a.c" in persisted
+        assert "Edit completed" in persisted
+        assert "Finished reviewing the affected path." in persisted
+        assert "secret file contents" not in persisted
+        web_messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "Agent: Started Edit" in web_messages
+        assert "Agent: Edit completed" in web_messages
+        assert "Agent: Response: Finished reviewing" in web_messages
+        assert "Agent result complete turns=3 duration=2.5s" in web_messages
+
+    asyncio.run(run_case())
+
+
+def test_claude_backend_rate_limits_thinking_token_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run_case() -> None:
+        class FakeClaudeCodeOptions:
+            def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                self.__dict__.update(kwargs)
+
+        class SystemMessage:
+            subtype = "thinking_tokens"
+
+        class TextBlock:
+            text = "Analysis complete."
+
+        class AssistantMessage:
+            content = [TextBlock()]
+
+        class ResultMessage:
+            num_turns = 1
+            duration_ms = 100
+            is_error = False
+
+        async def fake_query(*, prompt: str, options: FakeClaudeCodeOptions):  # type: ignore[no-untyped-def]
+            for _ in range(20_000):
+                yield SystemMessage()
+            yield AssistantMessage()
+            yield ResultMessage()
+
+        monkeypatch.setattr(
+            agent,
+            "_load_claude_sdk",
+            lambda: (FakeClaudeCodeOptions, fake_query),
+        )
+        config = AuditConfig(
+            target="/tmp/project",
+            output_dir=str(tmp_path),
+            backend="claude",
+        )
+        log_file = tmp_path / "agent.log"
+
+        with caplog.at_level(logging.INFO, logger="code_auditor.agent"):
+            result = await agent._run_claude_agent(
+                "prompt",
+                config,
+                cwd="/tmp/project",
+                log_file=str(log_file),
+            )
+
+        assert result == "Analysis complete."
+        persisted = log_file.read_text(encoding="utf-8")
+        assert persisted.count("Reasoning in progress") == 1
+        assert "thinking_tokens" not in persisted
+        web_messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert web_messages.count("Agent: Reasoning in progress") == 1
+
+    asyncio.run(run_case())
+
+
+def test_codex_activity_summary_tracks_command_lifecycle() -> None:
+    payload = types.SimpleNamespace(
+        item=types.SimpleNamespace(type="commandExecution", command="rg -n sink src")
+    )
+
+    assert agent._codex_item_activity("item/started", payload) == (
+        "Started command: rg -n sink src"
+    )
+    assert agent._codex_item_activity("item/completed", payload) == (
+        "Completed command: rg -n sink src"
+    )
+    assert agent._codex_item_activity("item/agentMessage/delta", payload) is None
+
+
 def test_project_declares_textual_tui_dependencies() -> None:
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
 
@@ -921,14 +1112,12 @@ def test_tui_backend_is_textual_app() -> None:
     assert issubclass(tui_module.CodeAuditorApp, App)
 
 
-def test_tui_configure_displays_discovered_path() -> None:
+def test_tui_configure_does_not_display_discovered_path() -> None:
     manager = TUIManager()
-    discovered_path = "/tmp/project/reproduced-bugs.html"
 
     manager.configure(
         target="/tmp/project",
         output_dir="/tmp/output",
-        discovered_path=discovered_path,
         wiki_path=None,
         backend="claude",
         model=None,
@@ -939,8 +1128,8 @@ def test_tui_configure_displays_discovered_path() -> None:
     console.print(_make_config_table(manager._state))
     rendered = console.export_text(styles=False)
 
-    assert "Discovered" in rendered
-    assert discovered_path in rendered
+    assert "Discovered" not in rendered
+    assert "reproduced-bugs" not in rendered
 
 
 def _render_stage_panel(state: TUIState, *, width: int = 100) -> str:

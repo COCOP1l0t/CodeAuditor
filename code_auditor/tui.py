@@ -80,7 +80,6 @@ class TUIState:
     """Shared state consumed by the live dashboard render function."""
     target: str = ""
     output_dir: str = ""
-    discovered_path: str = ""
     wiki_path: str = ""
     backend: str = ""
     model: str = ""
@@ -137,7 +136,6 @@ def _make_config_table(state: TUIState) -> Table:
     table.add_column("Value", style=BOLD)
     table.add_row("Target", state.target)
     table.add_row("Output", state.output_dir)
-    table.add_row("Discovered", state.discovered_path)
     table.add_row("Wiki", state.wiki_path or "—")
     table.add_row("Backend", f"{state.backend}  ({state.model or 'default'})")
     table.add_row("Parallel", str(state.max_parallel))
@@ -523,7 +521,7 @@ class TUIManager:
     Usage::
 
         tui = TUIManager()
-        tui.configure(target="/path", output_dir="...", discovered_path="...", wiki_path="...", backend="claude", ...)
+        tui.configure(target="/path", output_dir="...", wiki_path="...", backend="claude", ...)
         tui.start()
 
         # Inside orchestrator:
@@ -568,7 +566,6 @@ class TUIManager:
         *,
         target: str,
         output_dir: str,
-        discovered_path: str,
         wiki_path: str | None,
         backend: str,
         model: str | None,
@@ -576,7 +573,6 @@ class TUIManager:
     ) -> None:
         self._state.target = target
         self._state.output_dir = output_dir
-        self._state.discovered_path = discovered_path
         self._state.wiki_path = wiki_path or ""
         self._state.backend = backend
         self._state.model = model or "default"

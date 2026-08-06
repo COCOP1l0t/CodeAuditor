@@ -9,17 +9,11 @@ from typing import Any
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
-from ..config import AuditConfig, resolve_discovered_path, select_poc_model
-from ..discovered import (
-    append_entries,
-    build_dedupe_key,
-    build_discovered_entry,
-    collect_repo_snapshot,
-    read_discovered_entries,
-    read_discovered_keys,
-)
+from ..config import AuditConfig, select_poc_model
+from ..disclosures import build_dedupe_key
 from ..logger import get_logger
 from ..prompts import load_prompt
+from ..repos import capture_repo_identity
 from ..reproduction_status import is_failed_status, is_reproduced_status, read_reproduction_status
 from ..utils import run_parallel_limited
 from ..wiki import build_wiki_context
@@ -182,13 +176,17 @@ def _candidate_label(candidate: _DisclosureCandidate) -> str:
     return candidate.vuln_id or candidate.title or candidate.report_path
 
 
-def _filter_discovered_duplicates(
+def _filter_known_duplicates(
     stage5_reports: list[str],
     config: AuditConfig,
     repo_url: str,
-    discovered_path: str,
+    existing_entries: tuple[dict[str, Any], ...],
 ) -> list[_DisclosureCandidate]:
-    existing_keys = read_discovered_keys(discovered_path)
+    existing_keys = {
+        str(entry.get("dedupe_key") or "")
+        for entry in existing_entries
+        if entry.get("dedupe_key")
+    }
     seen_keys: set[str] = set()
     candidates: list[_DisclosureCandidate] = []
 
@@ -255,11 +253,10 @@ def _extract_json_object(text: str) -> str | None:
 
 async def _filter_semantic_duplicates(
     candidates: list[_DisclosureCandidate],
-    discovered_path: str,
+    existing_entries: tuple[dict[str, Any], ...],
     config: AuditConfig,
 ) -> list[_DisclosureCandidate]:
-    """Use an LLM agent to compare candidates against existing HTML entries for semantic duplication."""
-    existing_entries = read_discovered_entries(discovered_path)
+    """Compare candidates against database-backed Disclosure metadata."""
     if not existing_entries:
         return candidates
 
@@ -344,91 +341,6 @@ async def _filter_semantic_duplicates(
         len(candidates),
     )
     return filtered
-
-
-def _existing_artifact(disclosure_report: str, filename: str) -> str | None:
-    path = Path(disclosure_report).parent / filename
-    return str(path) if path.exists() else None
-
-
-def _extract_email_subject(email_path: str | None) -> str | None:
-    """Extract the Subject line from a disclosure email.txt.
-
-    Handles both standard RFC 822 folded headers (continuation lines start
-    with whitespace) and LLM-generated subjects wrapped by ``fold -s -w 72``
-    where continuation lines do not start with whitespace.
-    """
-    if not email_path:
-        return None
-    try:
-        content = Path(email_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    lines = content.splitlines()
-    for i, line in enumerate(lines):
-        if line.lower().startswith("subject:"):
-            parts = [line.split(":", 1)[1].strip()]
-            for next_line in lines[i + 1 :]:
-                if not next_line.strip():
-                    break
-                if next_line[0] in " \t":
-                    parts.append(next_line.strip())
-                    continue
-                # Heuristic: a new header line looks like "Header-Name: value".
-                # Stop collecting if we see one; otherwise treat as wrapped
-                # subject text produced by ``fold -s -w 72``.
-                if re.match(r"^[A-Za-z-]+:\s", next_line):
-                    break
-                parts.append(next_line.strip())
-            return " ".join(parts)
-    return None
-
-
-def _append_discovered_entries(
-    successes: list[tuple[_DisclosureCandidate, str]],
-    repo_snapshot: dict[str, str],
-    discovered_path: str,
-) -> None:
-    if not successes:
-        return
-
-    latest_keys = read_discovered_keys(discovered_path)
-    entries: list[str] = []
-    for candidate, disclosure_report in successes:
-        if candidate.dedupe_key in latest_keys:
-            logger.info(
-                "Stage 6: Not recording %s because it was already added to %s.",
-                _candidate_label(candidate),
-                discovered_path,
-            )
-            continue
-
-        email_path = _existing_artifact(disclosure_report, "email.txt")
-        email_title = _extract_email_subject(email_path)
-        if not email_title:
-            logger.warning(
-                "Stage 6: Skipping %s because disclosure email subject is missing."
-                " The bug reproducing process is broken.",
-                _candidate_label(candidate),
-            )
-            continue
-
-        entries.append(
-            build_discovered_entry(
-                candidate.finding,
-                repo_snapshot,
-                discovered_path=discovered_path,
-                stage4_finding_path=candidate.finding_path,
-                stage5_report_path=candidate.report_path,
-                stage6_report_path=disclosure_report,
-                stage6_email_path=email_path,
-                stage6_zip_path=_existing_artifact(disclosure_report, "disclosure.zip"),
-                stage6_email_title=email_title,
-            )
-        )
-        latest_keys.add(candidate.dedupe_key)
-
-    append_entries(discovered_path, entries)
 
 
 def _filter_reproduced(stage5_reports: list[str]) -> list[str]:
@@ -540,26 +452,22 @@ async def run_stage6(
         logger.info("Stage 6: No reproduced vulnerabilities to prepare disclosures for.")
         return []
 
-    repo_snapshot = collect_repo_snapshot(config.target)
-    repo_snapshot["llm_backend"] = config.backend
-    repo_snapshot["llm_model"] = select_poc_model(config)
-    repo_url = repo_snapshot.get("repo_url", "")
-    discovered_path = resolve_discovered_path(config)
-    candidates = _filter_discovered_duplicates(
+    repo_url = capture_repo_identity(config.target).get("repo_url", "")
+    candidates = _filter_known_duplicates(
         reproduced,
         config,
         repo_url,
-        discovered_path,
+        config.known_disclosures,
     )
     if not candidates:
         logger.info(
-            "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after discovered-bug dedupe."
+            "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after database dedupe."
         )
         return []
 
     candidates = await _filter_semantic_duplicates(
         candidates,
-        discovered_path,
+        config.known_disclosures,
         config,
     )
     if not candidates:
@@ -577,7 +485,6 @@ async def run_stage6(
     )
 
     disclosure_reports: list[str] = []
-    successful_disclosures: list[tuple[_DisclosureCandidate, str]] = []
     for i, (status, value, error) in enumerate(results):
         if i >= len(candidates):
             continue
@@ -586,9 +493,6 @@ async def run_stage6(
             continue
         if value:
             disclosure_reports.append(value)
-            successful_disclosures.append((candidates[i], value))
-
-    _append_discovered_entries(successful_disclosures, repo_snapshot, discovered_path)
 
     logger.info(
         "Stage 6 complete. %d disclosure packages prepared (from %d reproduced vulnerabilities).",

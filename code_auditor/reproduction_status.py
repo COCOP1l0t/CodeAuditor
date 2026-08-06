@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-REPRODUCED_STATUSES = {"reproduced", "partially-reproduced"}
-FAILED_STATUSES = {"not-reproduced", "false-positive"}
+REPRODUCED_STATUSES = {"reproduced"}
+FAILED_STATUSES = {"partially-reproduced", "not-reproduced", "false-positive"}
 VALID_STATUSES = REPRODUCED_STATUSES | FAILED_STATUSES
 
 _STATUS_PATTERN = re.compile(

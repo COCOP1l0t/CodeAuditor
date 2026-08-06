@@ -55,8 +55,13 @@ def _git_pull(target: str) -> None:
 
 
 async def run_setup(config: AuditConfig) -> None:
-    if _is_git_repo(config.target):
+    if _is_git_repo(config.target) and config.update_repo:
         _git_pull(config.target)
+    elif _is_git_repo(config.target):
+        logger.info(
+            "Resuming pinned source checkout; skipping git pull for %s.",
+            config.target,
+        )
 
     directories = [
         config.output_dir,

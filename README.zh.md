@@ -85,24 +85,62 @@ code-auditor --target /path/to/project [options]
 
 | 标志 | 说明 |
 |------|------|
-| **`--target`** | **必需。** 要审计的项目根目录。 |
-| `--output-dir` | 输出目录（默认：`{target}/audit-output-YYYYMMDD`，使用当前本地日期）。 |
-| `--discovered` | 阶段 6 使用的已复现漏洞 HTML 文件（默认：`{target}/reproduced-bugs.html`）。传入路径可覆盖这个跨运行记录的读取和更新位置。 |
+| **`--target`** | **必需**（除非使用 `--web` 或 `--repo-url`）。要审计的项目根目录。 |
+| `--repo-url` | Git 仓库 URL。首次使用时克隆到 `~/.code_auditor/repo/{host}/{owner}/{repo}`，之后复用该检出（阶段 0 会用 `git pull` 保持更新）；克隆目录即为审计目标。 |
+| `--output-dir` | 输出目录（默认：`~/.code_auditor/results/{repo}/audit-output-{commit}` —— 同一 repo+commit 始终复用同一目录，同一 commit 的多次审计自然合并续跑；非 git 目标回退为日期戳）。 |
 | `--wiki` | 只读 LLM wiki 知识库目录。CodeAuditor 将其视为只读，并为智能体提供阶段特定的 wiki 搜索指导。 |
 | `--max-parallel` | 最大并发智能体数（默认：`1`）。 |
 | `--backend` | 智能体后端：`claude` 或 `codex`（默认：`claude`）。 |
 | `--model` | 后端模型覆盖。Claude 默认为 `claude-sonnet-4-6`；Codex 使用本地 Codex 配置默认值，除非另行指定。 |
-| `--target-au-count` | 阶段 2 的目标分析单元数量（默认：`10`）。 |
+| `--target-au-count` | 阶段 2 的目标分析单元数量（默认：`-1` = 不设上限，尽可能探索所有值得深入分析的单元）。 |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR`（默认：`INFO`）。 |
 | `--tui` | 启动交互式 TUI 仪表盘，替代纯日志输出。 |
+| `--web` | 启动 Web 界面，审计参数在浏览器中填写（见下文）。 |
+| `--host` | Web 界面绑定地址（默认：`127.0.0.1`；使用 `0.0.0.0` 可暴露到网络）。 |
+| `--port` | Web 界面绑定端口（默认：`8000`）。 |
+| `--db` | 审计历史 SQLite 数据库路径（默认：`~/.code_auditor/audits.db`）。 |
 
 **粗体** 选项为必需。
 
+### 审计历史数据库
+
+每次审计运行 —— 经典 CLI、TUI 或 Web 模式 —— 都会记录到本地 SQLite 数据库（默认 `~/.code_auditor/audits.db`，可用 `--db` 覆盖）。每条运行通过**目标身份**精确定位被审计的代码：仓库名、HEAD commit 和子仓库 commit（另有分支、origin URL、dirty 标记作为上下文），在审计结束时（即阶段 0 的 `git pull` 之后）采集。身份信息哈希为 `target_key`，同一代码状态的多次审计可以归组，不同 commit 的审计绝不混淆。运行记录还包含配置快照、状态、时间戳、分析单元、评估后的 vulnerabilities（严重级别、CVSS、CWE、数据流轨迹、跨运行去重键）、PoC 复现状态和披露包路径。持久化失败不会影响审计本身（仅记录警告日志）。
+
+Web 界面的 **History** 标签页列出所有已记录的运行（跨项目）。运行详情页和目标合并页只显示 PoC 状态严格为 `reproduced` 的漏洞，并展示严重级别及原始报告链接；`partially-reproduced` 按复现失败处理。阶段 3 findings 被视为中间产物，不在 Web 界面展示。此功能上线前的已有输出目录可通过 History 标签页的 *Import output directory*（或 `POST /api/history/import`）补录进库：既可以指向单个 `audit-output-*` 目录，也可以指向所配置受管结果根目录下的目录并批量导入其中所有输出目录。根目录之外的导入会被拒绝；项目名与 `~/.code_auditor/repo/` 下已克隆仓库匹配的会自动关联到该仓库。
+
+**Disclosures** 标签页完全以 `~/.code_auditor/audits.db` 为数据源。运行完成或导入时，所有本地 Stage 6 报告都会按项目和稳定漏洞身份自动写入或更新 `disclosed_bugs`，不再存在独立 HTML 登记表或手动文件同步。每行显示审核状态（`unreviewed` / `reported` / `confirmed` / `rejected` / `duplicated` / `triage` / `bug` / `slop`）、项目、CWE、被审计 commit 和日期。`confirmed` 行通过同一稳定身份关联公开 CVE；已登记的 Stage 5 产物则提供交互式 PoC 终端。审核状态和产物索引存放在 SQLite 中，报告、邮件草稿、ZIP 与 PoC 证据仍是 Stage 5/6 输出目录中的普通文件，而不是数据库 BLOB。
+
+分析单元（阶段 2 的分解结果）也会按运行的目标身份持久化到数据库。当新审计在任何模式下针对同一个 repo+commit 启动时，会合并所有匹配运行中的不同分析单元并写入输出目录，让阶段 2 复用合并后的覆盖范围，而不再重新分解。只有定义完全等价的 AU 才会折叠；文件或审计重点不同的重叠 AU 会继续保留，并记录其来源运行。运行详情页展示该次运行的分析单元，并链接到同一目标的其他运行；目标合并视图（`#/target/…`）同时展示合并后的 AU 和所有匹配运行中已复现的漏洞，按严重级别排序并标注来源运行。
+
+### Web 界面
+
+```bash
+code-auditor --web [--host 127.0.0.1] [--port 8000]
+```
+
+然后在浏览器中打开 `http://127.0.0.1:8000`。**New Audit** 只提供 `~/.code_auditor/repo/` 下已有的受管仓库，或输入新的 HTTPS/Git-over-SSH URL 并克隆到该目录；Web API 不接受任意本地目标目录。Web 审计的输出目录默认为 `~/.code_auditor/results/<repo>/audit-output-<commit>/`，同一 repo+commit 总是在同一输出目录中续跑。可启动和停止审计、实时查看阶段进度与日志流（通过 SSE 推送），并浏览 vulnerabilities、PoC 报告和披露文件。**CVEs** 侧边栏显示公开 CVE 记录、项目、CVSS、上游披露网站链接、关联的本地 confirmed Disclosure 与本地 PoC。在 CVE、confirmed Disclosure、单次运行或合并 target 中点击 **Terminal**，会在 Web 页面打开由服务端 PTY 支持的交互式 xterm，并自动进入该漏洞的 `stage5-pocs/<id>/` 目录；页面可同时打开多个终端。**Reproduction** 侧栏通过目标项目、commit、具体漏洞三级下拉框筛选 History 中严格为 `reproduced` 的漏洞，并显示所选漏洞当前的 PoC 状态；启动后会在 `~/.code_auditor/reproductions/` 下使用独立 Git worktree 检出原审计 commit，仅重新运行阶段 5，不修改原审计输出。
+
+Backend、Model、日志级别和所有 Web 受管输出路径都是服务端配置，浏览器请求不能覆盖。Web 首次启动时会创建权限为 `0600` 的 `~/.code_auditor/settings.json`；日志级别默认为 `DEBUG`，模型默认值由所配置的 Backend 决定。既有 `~/.code_auditor/web-config.json` 会先经过校验，再自动迁移到新文件名。需要调整时直接编辑 `settings.json`：
+
+```json
+{
+  "backend": "claude",
+  "model": null,
+  "log_level": "DEBUG",
+  "max_parallel": 1,
+  "repos_dir": "~/.code_auditor/repo",
+  "results_dir": "~/.code_auditor/results",
+  "reproductions_dir": "~/.code_auditor/reproductions"
+}
+```
+
+Wiki 路径有意不进入该配置文件。Web 界面直接扫描 `~/.code_auditor/wiki/` 并提供可选的本地 Wiki 下拉框；Git checkout 或包含 `index.md` 的目录会被识别为一个 Wiki。如果目录或匹配 Wiki 不存在，则本次审计的 Wiki 为空。Reproduction 仅在历史记录中的 Wiki 仍位于该本地受管列表时复用它。
+
+受管路径会被校验为必须位于 `~/.code_auditor` 内。浏览器请求体拒绝未知字段；仓库和 Wiki 选择会与服务端受管列表精确匹配；克隆 URL 仅允许经过校验的 HTTPS 或 Git-over-SSH 远程地址；产物路径只能位于对应输出目录中。PoC 终端仅接受数据库中状态精确为 `reproduced`、且位于受管 results 根目录下的漏洞；终端 WebSocket 还要求随机的逐服务会话令牌与浏览器同源连接。同一时刻只能运行一个审计或独立复现任务。除非有意暴露界面，否则请保持默认的 `127.0.0.1` 绑定 —— Web 界面可以启动智能体运行，阶段 0 会执行 `git pull`，PoC 终端则提供漏洞产物目录中的交互式 shell。
+
 智能体默认使用 20 分钟的语义超时循环。如果某个智能体运行超过 20 分钟，CodeAuditor 会启动一个状态检查智能体来分析该智能体的 `agent.log`；当状态检查认为分析已经完成时，CodeAuditor 会终止原后端进程。否则会再等待 20 分钟并重复检查。
 
-默认情况下，阶段 6 会创建或更新 `{target}/reproduced-bugs.html`。在生成披露材料前，阶段 6 会读取该文件，并跳过带有匹配去重元数据的已复现漏洞。阶段 6 成功写出新的已复现漏洞披露材料后，会把新的 HTML 条目追加到同一个文件。使用 `--discovered /path/to/reproduced-bugs.html` 可改为读取并更新其他 HTML 文件。
-
-该 HTML 记录为每个已复现漏洞使用一个可折叠区块。每个区块都有可见的审核状态标签，并带有一致的机器可读状态字段，支持 `unreviewed`、`reported`、`confirmed`、`rejected`、`duplicated`。
+阶段 6 开始前，Web 审计会从 SQLite 获得既有 Disclosure 索引，用于精确和语义去重。阶段 6 本身只生成披露包；运行结束后，输出扫描器直接把记录写入 SQLite。CLI、TUI、Web 设置与浏览器请求都不再包含登记表路径选项。
 
 运行会自动从检查点标记恢复 —— 删除输出目录（或其 `.markers/` 子目录）以开始全新的审计。
 
@@ -158,7 +196,7 @@ code-auditor \
 └── .markers/          # --resume 的检查点标记
 ```
 
-阶段 6 默认还会创建或更新 `{target}/reproduced-bugs.html`。这个目标根目录下的文件不在 `{output-dir}` 中，除非您通过 `--discovered` 指向其他位置。
+已完成或导入的运行会把 Stage 6 披露包直接索引到 SQLite；所有模式都写入上述相同的 Stage 6 文件产物。
 
 ## 项目结构
 
@@ -166,15 +204,20 @@ code-auditor \
 code_auditor/
 ├── __main__.py          # CLI 入口点
 ├── config.py            # AuditConfig 和数据类
+├── cves.py              # 公开 CVE 目录及 Disclosure 身份关联
+├── disclosures.py       # 稳定 Disclosure 身份与元数据辅助
+├── db.py                # SQLite 审计历史与 Disclosure 目录
 ├── orchestrator.py      # 顺序阶段运行器
 ├── agent.py             # 后端封装 + 验证重试循环
 ├── prompts.py           # 支持 __KEY__ 替换的提示加载器
 ├── checkpoint.py        # 基于标记的检查点/恢复
+├── repos.py             # Git URL → ~/.code_auditor/repo/ 克隆/复用辅助
 ├── logger.py            # 日志辅助工具
 ├── utils.py             # 并行 + 文件辅助工具
 ├── stages/              # stage0 – stage6
 ├── parsing/             # 从智能体输出中提取结构化数据
 ├── validation/          # 每阶段输出验证器
+├── web/                 # FastAPI Web 界面（--web）：服务端、任务管理、SSE、静态页面
 └── tests/
 prompts/                 # stage1.md – stage6.md 提示模板
 ```
@@ -192,8 +235,6 @@ pytest -k stage2             # 按名称过滤
 ## 已发现漏洞
 
 CodeAuditor 帮助发现和披露的漏洞：
-
-评分为公开的 CVSS 基础分（来源明确时为 v3.1）。优先采用 NVD 评分；NVD 未评分时，采用 CNA/ADP 或上游披露中公开的评分。严重程度遵循 CVSS 定性区间：Critical（9.0–10.0）、High（7.0–8.9）、Medium（4.0–6.9）、Low（0.1–3.9）和 None（0.0）。`/` 表示未找到公开的数值评分。
 
 | CVE ID | 项目 | 年份 | CVSS 基础分 | 严重程度 | 参考 |
 |--------|------|------|-------------|----------|------|

@@ -85,24 +85,62 @@ code-auditor --target /path/to/project [options]
 
 | Flag | Description |
 |------|-------------|
-| **`--target`** | **Required.** Root directory of the project to audit. |
-| `--output-dir` | Output directory (default: `{target}/audit-output-YYYYMMDD`, using the current local date). |
-| `--discovered` | Reproduced bugs HTML file used by Stage 6 (default: `{target}/reproduced-bugs.html`). Pass a path to override where this cross-run record is read and updated. |
+| **`--target`** | **Required** unless `--web` or `--repo-url` is used. Root directory of the project to audit. |
+| `--repo-url` | Git repository URL. Cloned into `~/.code_auditor/repo/{host}/{owner}/{repo}` on first use and reused afterwards (Stage 0 keeps it updated with `git pull`); the clone becomes the audit target. |
+| `--output-dir` | Output directory (default: `~/.code_auditor/results/{repo}/audit-output-{commit}` — the same repo+commit always reuses one directory, so repeated audits of a commit merge and resume; non-git targets fall back to a date stamp). |
 | `--wiki` | LLM wiki knowledge base directory. CodeAuditor treats it as read-only and gives agents stage-specific wiki search guidance. |
 | `--max-parallel` | Max concurrent agents (default: `1`). |
 | `--backend` | Agent backend: `claude` or `codex` (default: `claude`). |
 | `--model` | Backend model override. Claude defaults to `claude-sonnet-4-6`; Codex uses the local Codex config default unless specified. |
-| `--target-au-count` | Target number of analysis units for Stage 2 (default: `10`). |
+| `--target-au-count` | Target number of analysis units for Stage 2 (default: `-1` = no ceiling, explore as many units as genuinely warrant deep analysis). |
 | `--log-level` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` (default: `INFO`). |
 | `--tui` | Launch the interactive TUI dashboard instead of plain log output. |
+| `--web` | Launch the web UI; audit parameters are entered in the browser (see below). |
+| `--host` | Web UI bind host (default: `127.0.0.1`; use `0.0.0.0` to expose on the network). |
+| `--port` | Web UI bind port (default: `8000`). |
+| `--db` | Audit history SQLite database path (default: `~/.code_auditor/audits.db`). |
 
 **Bold** options are required.
 
+### Audit history database
+
+Every audit run — classic CLI, TUI, or web mode — is recorded in a local SQLite database (default `~/.code_auditor/audits.db`, override with `--db`). Each run is pinned to the exact code that was audited by a **target identity**: repository name, HEAD commit, and submodule commits (plus branch, origin URL, and a dirty flag for context), captured at the end of the audit (i.e. after stage 0's `git pull`). The identity is hashed into a `target_key`, so multiple audits of the same code state can be grouped, and audits of different commits never mix. Runs also store the configuration snapshot, status, timestamps, analysis units, evaluated vulnerabilities (severity, CVSS, CWE, data-flow trace, cross-run dedupe key), PoC reproduction statuses, and disclosure package paths. Persistence failures never affect the audit itself (a warning is logged instead).
+
+The web UI's **History** tab lists all recorded runs across projects. Run and merged-target detail pages show only vulnerabilities whose PoC status is exactly `reproduced`, together with severity badges and links into the original report files. `partially-reproduced` is treated as an unsuccessful reproduction. Stage 3 findings are intermediate artifacts and are not displayed. Existing output directories from before this feature can be backfilled from the History tab via *Import output directory* (or `POST /api/history/import`): point it at a single `audit-output-*` directory, or at a directory under the configured managed results root to batch-import every output directory it contains. Imports outside that root are rejected; projects whose name matches a cloned repo under `~/.code_auditor/repo/` are linked automatically.
+
+The **Disclosures** tab is fully backed by `~/.code_auditor/audits.db`. Recording or importing a run automatically upserts every local Stage 6 report into `disclosed_bugs`, keyed by its stable project and vulnerability identity; no separate HTML registry or manual file sync is involved. Each row shows its review status (`unreviewed` / `reported` / `confirmed` / `rejected` / `duplicated` / `triage` / `bug` / `slop`), project, CWE, audited commit, and date. Confirmed rows are joined to public CVE records by the same stable identity, and a registered Stage 5 artifact provides an interactive PoC terminal. Review status and artifact indexes stay in SQLite, while the report, email draft, ZIP, and PoC evidence remain ordinary files under the run's Stage 5/6 output directories rather than database BLOBs.
+
+Analysis units (stage 2 decompositions) are also persisted in the database, keyed by the run's target identity. When a new audit starts on a repo+commit that was audited before — in any mode — distinct analysis units from all matching runs are merged and seeded into the output directory, so stage 2 can reuse the combined coverage instead of re-running decomposition. Only completely equivalent AU definitions are folded together; overlapping units with different files or audit guidance remain distinct, and their source runs are retained. Run detail pages show each run's analysis units and link to other runs of the same target. The merged target view (`#/target/…`) shows both the merged AUs and reproduced vulnerabilities from every matching run, sorted by severity and attributed to their source run.
+
+### Web UI
+
+```bash
+code-auditor --web [--host 127.0.0.1] [--port 8000]
+```
+
+Then open `http://127.0.0.1:8000` in a browser. **New Audit** offers only managed repositories already cloned under `~/.code_auditor/repo/`, or a new HTTPS/Git-over-SSH URL to clone there; arbitrary local target directories are not accepted by the Web API. Web audits write to `~/.code_auditor/results/<repo>/audit-output-<commit>/` by default, so the same repo+commit always resumes in the same output directory. You can start and stop the audit, watch stage progress and live logs (streamed over SSE), and browse vulnerabilities, PoC reports, and disclosure files. The **CVE** sidebar lists the curated public CVE record, project, CVSS, upstream disclosure links, matching confirmed local Disclosure, and matching local PoCs. A **Terminal** action on a CVE, confirmed Disclosure, run, or merged-target vulnerability opens an interactive xterm window backed by a server PTY whose initial directory is that vulnerability's `stage5-pocs/<id>/` directory. Multiple terminals can be open at once. The **Reproduction** sidebar narrows exactly reproduced History vulnerabilities through target-project, commit, and vulnerability selectors, then displays the selected vulnerability's current PoC status. Starting the retest reruns only Stage 5 at the recorded source commit in an isolated Git worktree under `~/.code_auditor/reproductions/`; it does not modify the original audit output.
+
+Backend, model, logging, and all managed output paths are server-side settings and are never accepted from browser requests. On first Web startup CodeAuditor creates `~/.code_auditor/settings.json` with mode `0600`; logging defaults to `DEBUG`, and the default model is selected by the configured backend. An existing `~/.code_auditor/web-config.json` is validated and migrated to the new filename. Edit `settings.json` directly to change server-side Web settings:
+
+```json
+{
+  "backend": "claude",
+  "model": null,
+  "log_level": "DEBUG",
+  "max_parallel": 1,
+  "repos_dir": "~/.code_auditor/repo",
+  "results_dir": "~/.code_auditor/results",
+  "reproductions_dir": "~/.code_auditor/reproductions"
+}
+```
+
+Wiki paths are intentionally absent from this configuration. The Web UI scans `~/.code_auditor/wiki/` directly and offers an optional local Wiki dropdown; a Git checkout or a directory containing `index.md` is treated as one Wiki. If the directory or matching Wiki does not exist, the audit runs without Wiki context. Reproduction reuses a recorded Wiki only while it remains in this managed local list.
+
+Managed paths are validated to remain inside `~/.code_auditor`. Browser request bodies reject unknown fields, repository and Wiki selections are resolved against server-managed lists, clone URLs are restricted to validated HTTPS or Git-over-SSH remotes, and artifact paths are confined to their corresponding output directories. PoC terminals accept only database-backed, exactly reproduced vulnerabilities below the managed results root; their WebSockets require a random per-server token and a same-origin browser connection. Only one audit or standalone reproduction can run at a time. Keep the default `127.0.0.1` bind unless you intentionally want to expose the UI — the web UI can launch agent runs, Stage 0 executes `git pull`, and PoC terminal windows provide an interactive shell in vulnerability artifact directories.
+
 Agent runs use a 20-minute semantic timeout cycle by default. If an agent is still running after 20 minutes, CodeAuditor starts a status-checking subagent to inspect that agent's `agent.log`; when the checker determines the analysis is already finished, CodeAuditor kills the original backend process. Otherwise, it waits another 20 minutes and repeats the check.
 
-By default, Stage 6 creates or updates `{target}/reproduced-bugs.html`. Before generating disclosures, Stage 6 reads this file and skips reproduced bugs with matching dedupe metadata. After Stage 6 successfully writes disclosure output for a new reproduced bug, it appends a new HTML entry to the same file. Use `--discovered /path/to/reproduced-bugs.html` to read and update a different HTML file.
-
-The HTML record uses one collapsible section per reproduced bug. Each section carries a visible review status tag and matching machine-readable status fields for `unreviewed`, `reported`, `confirmed`, `rejected`, or `duplicated`.
+Before Stage 6 starts, a Web audit receives the existing SQLite Disclosure index for exact and semantic duplicate detection. Stage 6 itself creates only the report package; once the run finishes, the output scanner records it directly in SQLite without a registry-path option in CLI, TUI, Web settings, or browser requests.
 
 Runs resume from checkpoint markers automatically — delete the output directory (or its `.markers/` subdirectory) to start a fresh audit.
 
@@ -158,7 +196,7 @@ code-auditor \
 └── .markers/          # checkpoint markers for --resume
 ```
 
-Stage 6 also creates or updates `{target}/reproduced-bugs.html` by default. This target-root file is outside `{output-dir}` unless you point `--discovered` somewhere else.
+Completed and imported runs index their Stage 6 packages directly in SQLite. All modes write the same Stage 6 filesystem artifacts shown above.
 
 ## Project layout
 
@@ -166,15 +204,20 @@ Stage 6 also creates or updates `{target}/reproduced-bugs.html` by default. This
 code_auditor/
 ├── __main__.py          # CLI entry point
 ├── config.py            # AuditConfig and dataclasses
+├── cves.py              # Public CVE catalogue and disclosure identity links
+├── disclosures.py       # Stable Disclosure identities and metadata helpers
+├── db.py                # SQLite audit history and Disclosure catalogue
 ├── orchestrator.py      # Sequential stage runner
 ├── agent.py             # Backend wrappers + validation retry loop
 ├── prompts.py           # Prompt loader with __KEY__ substitution
 ├── checkpoint.py        # Marker-based checkpoint/resume
+├── repos.py             # Git URL → ~/.code_auditor/repo/ clone/reuse helpers
 ├── logger.py            # Logging helper
 ├── utils.py             # Parallelism + file helpers
 ├── stages/              # stage0 – stage6
 ├── parsing/             # Structured extraction from agent output
 ├── validation/          # Per-stage output validators
+├── web/                 # FastAPI web UI (--web): server, job manager, SSE, static page
 └── tests/
 prompts/                 # stage1.md – stage6.md prompt templates
 ```
@@ -192,8 +235,6 @@ Tests cover parsers and validators; they do not make real agent calls.
 ## Vulnerabilities Found
 
 Vulnerabilities CodeAuditor has helped discover and disclose:
-
-Scores are public CVSS base scores (v3.1 where specified). NVD scores take precedence; when NVD has no score, the CNA/ADP or upstream disclosure score is used. Severity follows the CVSS qualitative scale: Critical (9.0–10.0), High (7.0–8.9), Medium (4.0–6.9), Low (0.1–3.9), and None (0.0). `/` means no public numerical score was found.
 
 | CVE ID | Project | Year | CVSS Base Score | Severity | Reference |
 |--------|---------|------|-----------------|----------|-----------|

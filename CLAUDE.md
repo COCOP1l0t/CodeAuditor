@@ -18,18 +18,22 @@ pip install -e .
 # Run an audit
 code-auditor --target /path/to/project [options]
 
-# Required
+# Required (unless --web or --repo-url)
 #   --target           Root directory of the project to audit
+#   --repo-url         Git URL cloned into ~/.code_auditor/repo/ and audited
 
 # Common options
-#   --output-dir       Output directory (default: {target}/audit-output-YYYYMMDD)
-#   --discovered       Reproduced bugs HTML file (default: {target}/reproduced-bugs.html)
+#   --output-dir       Output directory (default: ~/.code_auditor/results/{repo}/audit-output-{commit})
 #   --wiki             Read-only LLM wiki knowledge base directory
 #   --max-parallel     Max concurrent agents (default: 1)
 #   --backend          Agent backend: claude | codex (default: claude)
 #   --model            Model override (Claude default: claude-sonnet-4-6; Codex default: gpt-5.4)
-#   --target-au-count  Target number of analysis units for stage 2 (default: 10)
+#   --target-au-count  Target number of analysis units for stage 2 (default: -1 = no ceiling)
 #   --tui              Launch the interactive TUI dashboard
+#   --web              Launch the web UI (server settings: ~/.code_auditor/settings.json)
+#   --host             Web UI bind host (default: 127.0.0.1)
+#   --port             Web UI bind port (default: 8000)
+#   --db               Audit history SQLite DB (default: ~/.code_auditor/audits.db)
 #   --log-level        DEBUG|INFO|WARNING|ERROR (default: INFO)
 ```
 
@@ -61,6 +65,9 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
 - **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
+- **Web settings boundary**: backend/model/log level and managed paths come only from `~/.code_auditor/settings.json`; browser requests cannot override them
+- **Web Wiki discovery**: optional Wikis are discovered from `~/.code_auditor/wiki/` and selected by opaque local name; `wiki_path` is not a Web config field
+- **Disclosure storage boundary**: SQLite owns Disclosure metadata, review status, dedupe identity, and artifact indexes; Stage 5/6 reports remain filesystem artifacts and there is no registry-path setting
 
 ## Project layout
 
@@ -68,15 +75,22 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 code_auditor/
 ├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
 ├── config.py            # AuditConfig, Module, AnalysisUnit, ValidationIssue dataclasses
+├── disclosures.py       # Stable Disclosure identity + email metadata helpers
+├── db.py                # SQLite audit history: AuditStore, schema, output-dir scanner,
+│                        #   AU persistence/reuse (seed_analysis_units)
 ├── orchestrator.py      # Sequential stage runner
 ├── agent.py             # claude-code-sdk wrapper + validation retry loop
 ├── prompts.py           # load_prompt() with __KEY__ substitution
 ├── checkpoint.py        # File/marker-based checkpoint/resume
+├── repos.py             # Git URL → ~/.code_auditor/repo/ mirror (clone + reuse)
 ├── logger.py            # stdlib logging wrapper
 ├── utils.py             # run_parallel_limited, file helpers, severity sort
 ├── stages/              # stage0–stage6 (one file per stage)
 ├── parsing/             # stage2.py — extract structured data from agent output
 ├── validation/          # common.py + stage1–stage6 — validate agent output format
+├── web/                 # FastAPI web UI (--web): server.py endpoints, job.py single-job
+│                        #   manager, progress.py EventBus/SSE + duck-typed tui reporter,
+│                        #   static/ vanilla-JS page
 └── tests/
 prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
 ```

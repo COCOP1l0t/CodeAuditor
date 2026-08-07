@@ -2001,19 +2001,8 @@ class AuditStore:
         *,
         deleted_at: float | None = None,
     ) -> bool:
-        """Move one manually classified slop record into recoverable trash."""
+        """Move one active Disclosure into recoverable trash."""
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT review_status, deleted_at FROM disclosed_bugs
-                WHERE project = ? AND dedupe_key = ?
-                """,
-                (project, dedupe_key),
-            ).fetchone()
-            if row is None or row["deleted_at"] is not None:
-                return False
-            if row["review_status"] != "slop":
-                raise ValueError("Only slop Disclosures can be moved to trash.")
             cursor = conn.execute(
                 """
                 UPDATE disclosed_bugs
@@ -2030,7 +2019,7 @@ class AuditStore:
         return cursor.rowcount > 0
 
     def restore_disclosure(self, project: str, dedupe_key: str) -> bool:
-        """Restore one Disclosure from trash with its prior slop status intact."""
+        """Restore one Disclosure from trash with its prior status intact."""
         with self._connect() as conn:
             cursor = conn.execute(
                 """

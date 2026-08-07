@@ -941,10 +941,7 @@ def create_app(
 
     @app.post("/api/disclosures/trash")
     def trash_disclosure(request: DisclosureIdentityRequest) -> dict:
-        try:
-            moved = store.trash_disclosure(request.project, request.dedupe_key)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        moved = store.trash_disclosure(request.project, request.dedupe_key)
         if not moved:
             raise HTTPException(status_code=404, detail="Disclosure not found.")
         return {

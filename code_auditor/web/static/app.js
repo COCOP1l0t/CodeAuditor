@@ -1944,20 +1944,18 @@ async function loadDisclosures() {
       editButton.setAttribute("aria-label", `Edit ${e.title || e.dedupe_key}`);
       editButton.addEventListener("click", () => openDisclosureEditDialog(e));
       actionContainer.appendChild(editButton);
-      if (e.review_status === "slop") {
-        const deleteButton = document.createElement("button");
-        deleteButton.type = "button";
-        deleteButton.className = "btn btn-delete";
-        deleteButton.textContent = "Delete";
-        deleteButton.setAttribute(
-          "aria-label",
-          `Move ${e.title || e.dedupe_key} to the recycle bin`
-        );
-        deleteButton.addEventListener("click", () =>
-          moveDisclosureToTrash(e, deleteButton)
-        );
-        actionContainer.appendChild(deleteButton);
-      }
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "btn btn-delete";
+      deleteButton.textContent = "Delete";
+      deleteButton.setAttribute(
+        "aria-label",
+        `Move ${e.title || e.dedupe_key} to the recycle bin`
+      );
+      deleteButton.addEventListener("click", () =>
+        moveDisclosureToTrash(e, deleteButton)
+      );
+      actionContainer.appendChild(deleteButton);
       tbody.appendChild(tr);
 
       const details = document.createElement("tr");
@@ -2144,7 +2142,8 @@ async function loadTrash() {
         `<td class="date-cell">${escapeHtml(trashDeadline(entry))}</td>` +
         `<td class="project-cell">${escapeHtml(entry.project)}</td>` +
         `<td class="title-cell">${escapeHtml(entry.title) || "—"}</td>` +
-        `<td><span class="badge badge-disc-slop">${escapeHtml(entry.review_status)}</span></td>` +
+        `<td><span class="badge badge-disc-${escapeHtml(entry.review_status)}">` +
+        `${escapeHtml(entry.review_status)}</span></td>` +
         `<td class="action-cell"><div class="row-actions"></div></td>`;
       const restore = document.createElement("button");
       restore.type = "button";

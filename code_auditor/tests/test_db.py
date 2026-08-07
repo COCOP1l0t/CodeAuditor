@@ -1001,7 +1001,7 @@ def test_cve_import_candidates_only_include_confirmed_disclosures(tmp_path) -> N
     ]
 
 
-def test_slop_disclosure_trash_restore_and_expiry(tmp_path) -> None:
+def test_disclosure_trash_restore_and_expiry(tmp_path) -> None:
     out = _make_disclosure_output(tmp_path / "qemu")
     db_path = tmp_path / "history.db"
     store = AuditStore(str(db_path))
@@ -1017,16 +1017,12 @@ def test_slop_disclosure_trash_restore_and_expiry(tmp_path) -> None:
     stage6_log.write_text("keep the non-disclosure Stage 6 log", encoding="utf-8")
     stage5_report = out / "stage5-pocs" / "H-01" / "report.md"
 
-    with pytest.raises(ValueError, match="Only slop"):
-        store.trash_disclosure("qemu", key)
-    assert store.set_disclosed_status("qemu", key, "slop")
-
     deleted_at = time.time()
     assert store.trash_disclosure("qemu", key, deleted_at=deleted_at)
     assert store.list_disclosed() == []
     trashed = store.list_disclosure_trash()
     assert len(trashed) == 1
-    assert trashed[0]["review_status"] == "slop"
+    assert trashed[0]["review_status"] == "unreviewed"
     assert trashed[0]["deleted_at"] == deleted_at
     assert trashed[0]["purge_at"] == deleted_at + DISCLOSURE_TRASH_RETENTION_SECONDS
     assert store.get_disclosed_artifact("qemu", key, 0) is None
@@ -1034,7 +1030,7 @@ def test_slop_disclosure_trash_restore_and_expiry(tmp_path) -> None:
 
     assert store.restore_disclosure("qemu", key)
     assert store.list_disclosure_trash() == []
-    assert store.list_disclosed()[0]["review_status"] == "slop"
+    assert store.list_disclosed()[0]["review_status"] == "unreviewed"
 
     assert store.trash_disclosure("qemu", key)
     with sqlite3.connect(db_path) as conn:
@@ -1055,6 +1051,41 @@ def test_slop_disclosure_trash_restore_and_expiry(tmp_path) -> None:
         assert conn.execute(
             "SELECT disclosures_count FROM runs"
         ).fetchone()[0] == 0
+
+
+def test_confirmed_disclosure_trash_preserves_cve_link_for_restore(tmp_path) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    disclosure = store.list_disclosed()[0]
+    key = disclosure["dedupe_key"]
+    assert store.set_disclosed_status("qemu", key, "confirmed")
+    store.import_cve(
+        {
+            "cve_id": "CVE-2026-8348",
+            "cve_url": "https://www.cve.org/CVERecord?id=CVE-2026-8348",
+            "dedupe_keys": [key],
+        }
+    )
+
+    assert store.trash_disclosure("qemu", key)
+    assert store.list_disclosed() == []
+    assert store.list_cves() == []
+    assert store.list_disclosure_trash()[0]["cves"] == [
+        {
+            "cve_id": "CVE-2026-8348",
+            "cve_url": "https://www.cve.org/CVERecord?id=CVE-2026-8348",
+        }
+    ]
+
+    assert store.restore_disclosure("qemu", key)
+    restored = store.list_disclosed()[0]
+    assert restored["review_status"] == "confirmed"
+    assert [cve["cve_id"] for cve in restored["cves"]] == ["CVE-2026-8348"]
+    assert [cve["cve_id"] for cve in store.list_cves()] == ["CVE-2026-8348"]
 
 
 def test_expired_disclosure_never_deletes_unregistered_stage6_path(tmp_path) -> None:

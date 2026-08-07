@@ -780,6 +780,7 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "openDisclosureEditDialog" in script.text
     assert "disclosureCvesReady" in script.text
     assert "moveDisclosureToTrash" in script.text
+    assert 'if (e.review_status === "slop")' not in script.text
     assert "restoreDisclosure" in script.text
     assert "refreshTrashCount" in script.text
     assert "openCveDialog" in script.text
@@ -1727,7 +1728,22 @@ def test_api_disclosures_list_search_and_status(tmp_path) -> None:
     assert res.status_code == 422  # pydantic Literal validation
 
 
-def test_api_slop_disclosure_moves_to_trash_and_restores(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "review_status",
+    [
+        "unreviewed",
+        "reported",
+        "confirmed",
+        "rejected",
+        "duplicated",
+        "triage",
+        "bug",
+        "slop",
+    ],
+)
+def test_api_any_disclosure_moves_to_trash_and_restores(
+    tmp_path, review_status: str
+) -> None:
     app = _make_app(tmp_path)
     app.state.store.import_output_dir(_make_output_dir(tmp_path))
     client = TestClient(app)
@@ -1737,12 +1753,8 @@ def test_api_slop_disclosure_moves_to_trash_and_restores(tmp_path) -> None:
         "dedupe_key": entry["dedupe_key"],
     }
 
-    rejected = client.post("/api/disclosures/trash", json=identity)
-    assert rejected.status_code == 400
-    assert "slop" in rejected.json()["detail"]
-
     assert client.post(
-        "/api/disclosures/status", json={**identity, "status": "slop"}
+        "/api/disclosures/status", json={**identity, "status": review_status}
     ).status_code == 200
     moved = client.post("/api/disclosures/trash", json=identity)
     assert moved.status_code == 200
@@ -1753,7 +1765,7 @@ def test_api_slop_disclosure_moves_to_trash_and_restores(tmp_path) -> None:
     assert trash["total"] == 1
     assert trash["matches"] == 1
     assert trash["projects"] == ["test-project"]
-    assert trash["entries"][0]["review_status"] == "slop"
+    assert trash["entries"][0]["review_status"] == review_status
     assert trash["entries"][0]["purge_at"] > trash["entries"][0]["deleted_at"]
     assert client.get(
         "/api/disclosures/artifact",
@@ -1767,7 +1779,7 @@ def test_api_slop_disclosure_moves_to_trash_and_restores(tmp_path) -> None:
     assert restored.status_code == 200
     active = client.get("/api/disclosures").json()["entries"]
     assert len(active) == 1
-    assert active[0]["review_status"] == "slop"
+    assert active[0]["review_status"] == review_status
     assert client.get("/api/disclosures/trash").json()["total"] == 0
 
 

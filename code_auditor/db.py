@@ -971,6 +971,54 @@ class AuditStore:
         if row and row["output_dir"]:
             self.persist_artifacts(run_id, row["output_dir"])
 
+    def cancel_running_run(
+        self,
+        run_id: int,
+        error: str,
+        *,
+        ended_at: float | None = None,
+    ) -> bool:
+        """Atomically make one orphaned running audit resumable."""
+        finished_at = time.time() if ended_at is None else ended_at
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE runs
+                SET status = ?, error = ?, ended_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (RUN_CANCELLED, error, finished_at, run_id, RUN_RUNNING),
+            )
+            return cursor.rowcount == 1
+
+    def cancel_running_runs(
+        self,
+        error: str,
+        *,
+        ended_at: float | None = None,
+    ) -> list[int]:
+        """Make all running rows left by a previous Web worker resumable."""
+        finished_at = time.time() if ended_at is None else ended_at
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM runs WHERE status = ? ORDER BY id",
+                    (RUN_RUNNING,),
+                ).fetchall()
+            ]
+            if run_ids:
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, error = ?, ended_at = ?
+                    WHERE status = ?
+                    """,
+                    (RUN_CANCELLED, error, finished_at, RUN_RUNNING),
+                )
+        return run_ids
+
     def resume_cancelled_run(self, run_id: int) -> bool:
         """Atomically move one cancelled run back to the running state.
 

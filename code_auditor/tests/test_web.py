@@ -180,6 +180,49 @@ async def test_stop_cancels_running_job(tmp_path, monkeypatch) -> None:
     assert manager.stop() is False
 
 
+async def test_shutdown_cancels_and_persists_running_audit(
+    tmp_path, monkeypatch
+) -> None:
+    started = asyncio.Event()
+
+    async def fake_run_audit(config, tui=None):
+        started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    store = job_module.AuditStore(str(tmp_path / "history.db"))
+    manager = AuditJobManager(store=store)
+    await manager.start(AuditStartParams(target=str(tmp_path)))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    run_id = manager.status()["run_id"]
+
+    await manager.shutdown()
+
+    assert manager.state == STATE_CANCELLED
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["status"] == RUN_CANCELLED
+    assert "Web worker exited" in run["error"]
+    assert run["ended_at"] is not None
+
+
+async def test_status_releases_busy_state_without_a_live_task(tmp_path) -> None:
+    store = job_module.AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(
+        AuditConfig(target=str(tmp_path), output_dir=str(tmp_path / "output"))
+    )
+    manager = AuditJobManager(store=store)
+    manager.kind = "audit"
+    manager.state = STATE_RUNNING
+    manager._run_id = run_id
+    manager._task = None
+
+    status = manager.status()
+
+    assert status["state"] == STATE_CANCELLED
+    assert store.get_run(run_id)["status"] == RUN_CANCELLED
+
+
 async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     tmp_path, monkeypatch
 ) -> None:
@@ -1196,6 +1239,26 @@ def test_api_history_empty(tmp_path) -> None:
     assert body["runs"] == []
     assert body["total"] == 0
     assert body["db_path"].endswith("history.db")
+
+
+def test_app_startup_recovers_interrupted_running_history(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    run_id = app.state.store.create_run(
+        AuditConfig(
+            target=str(tmp_path),
+            output_dir=str(tmp_path / "audit-output-interrupted"),
+        ),
+        started_at=100.0,
+    )
+
+    with TestClient(app) as client:
+        detail = client.get(f"/api/history/{run_id}").json()
+        scheduler = client.get("/api/audit/status").json()
+
+    assert detail["status"] == RUN_CANCELLED
+    assert "Web worker exited" in detail["error"]
+    assert detail["ended_at"] is not None
+    assert scheduler["state"] == "idle"
 
 
 def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> None:

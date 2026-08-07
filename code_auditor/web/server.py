@@ -397,10 +397,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        manager.recover_interrupted_runs()
         purge_task = asyncio.create_task(purge_disclosure_trash())
         try:
             yield
         finally:
+            await manager.shutdown()
             purge_task.cancel()
             with suppress(asyncio.CancelledError):
                 await purge_task

@@ -374,6 +374,28 @@ def test_resume_cancelled_run_reuses_same_history_row(tmp_path) -> None:
     assert runs[0]["id"] == run_id
 
 
+def test_cancel_running_runs_only_recovers_active_rows(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    interrupted_id = store.create_run(
+        _make_config(tmp_path, out), started_at=100.0
+    )
+    done_id = store.create_run(_make_config(tmp_path, out), started_at=200.0)
+    store.finish_run(done_id, RUN_DONE, ended_at=250.0)
+
+    recovered = store.cancel_running_runs("worker exited", ended_at=300.0)
+
+    assert recovered == [interrupted_id]
+    interrupted = store.get_run(interrupted_id)
+    assert interrupted is not None
+    assert interrupted["status"] == RUN_CANCELLED
+    assert interrupted["error"] == "worker exited"
+    assert interrupted["ended_at"] == 300.0
+    assert store.get_run(done_id)["status"] == RUN_DONE
+    assert store.cancel_running_runs("again") == []
+    assert store.resume_cancelled_run(interrupted_id)
+
+
 def test_import_output_dir(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))

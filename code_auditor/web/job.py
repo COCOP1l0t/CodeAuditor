@@ -51,6 +51,11 @@ JOB_REPRODUCTION = "reproduction"
 
 DEFAULT_REPRODUCTIONS_DIR = os.path.join("~", ".code_auditor", "reproductions")
 RESUME_GIT_TIMEOUT_SECONDS = 60.0
+SHUTDOWN_TASK_TIMEOUT_SECONDS = 15.0
+INTERRUPTED_AUDIT_ERROR = (
+    "Audit interrupted because its Web worker exited before recording a terminal "
+    "state. Resume this run from History."
+)
 
 
 class JobConflictError(Exception):
@@ -275,7 +280,86 @@ class AuditJobManager:
         self.reproduction_candidate: dict | None = None
         self.reproduction_reports: list[str] = []
 
+    def recover_interrupted_runs(self) -> list[int]:
+        """Recover database rows that no task in this Web worker can own."""
+        if self.store is None:
+            return []
+        if (
+            self.state in BUSY_STATES
+            and self._task is not None
+            and not self._task.done()
+        ):
+            return []
+        run_ids = self.store.cancel_running_runs(INTERRUPTED_AUDIT_ERROR)
+        if run_ids:
+            logger.warning(
+                "Recovered interrupted audit run(s) as cancelled: %s.",
+                ", ".join(f"#{run_id}" for run_id in run_ids),
+            )
+        return run_ids
+
+    def _reconcile_task_state(self) -> bool:
+        """Release a busy scheduler state whose asyncio task has disappeared."""
+        if self.state not in BUSY_STATES:
+            return False
+        if self._task is not None and not self._task.done():
+            return False
+        self.state = STATE_CANCELLED
+        self.error = self.error or INTERRUPTED_AUDIT_ERROR
+        self.ended_at = time.time()
+        self._remove_log_handler()
+        if self.store is not None and self._run_id is not None:
+            self.store.cancel_running_run(
+                self._run_id,
+                self.error,
+                ended_at=self.ended_at,
+            )
+        self.bus.publish(
+            {
+                "type": "job",
+                "kind": self.kind,
+                "status": self.state,
+                "error": self.error,
+            }
+        )
+        logger.warning("Released an interrupted %s scheduler task.", self.kind or "job")
+        return True
+
+    async def shutdown(self) -> None:
+        """Persist a resumable terminal state before the Web worker exits."""
+        self._reconcile_task_state()
+        if self.state not in BUSY_STATES or self._task is None:
+            return
+        self.error = INTERRUPTED_AUDIT_ERROR
+        task = self._task
+        task.cancel()
+        done, _ = await asyncio.wait(
+            {task}, timeout=SHUTDOWN_TASK_TIMEOUT_SECONDS
+        )
+        if not done:
+            self.state = STATE_CANCELLED
+            self.ended_at = time.time()
+            self._remove_log_handler()
+            if self.store is not None and self._run_id is not None:
+                self.store.cancel_running_run(
+                    self._run_id,
+                    self.error,
+                    ended_at=self.ended_at,
+                )
+            logger.error(
+                "Audit task did not stop within %.0f seconds; persisted it as cancelled.",
+                SHUTDOWN_TASK_TIMEOUT_SECONDS,
+            )
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Audit task raised while shutting down: %s", exc)
+
     async def start(self, params: AuditStartParams) -> None:
+        self._reconcile_task_state()
         if self.state in BUSY_STATES:
             raise JobConflictError("An audit is already running.")
         if bool(params.git_url) == bool(params.target):
@@ -328,6 +412,7 @@ class AuditJobManager:
         wikis_dir: str = DEFAULT_WIKIS_DIR,
     ) -> None:
         """Start restoring a cancelled audit in its original output directory."""
+        self._reconcile_task_state()
         if self.state in BUSY_STATES:
             raise JobConflictError("An audit or reproduction is already running.")
         if self.store is None:
@@ -498,7 +583,6 @@ class AuditJobManager:
                 )
         except asyncio.CancelledError:
             self.state = STATE_CANCELLED
-            self.error = ""
             logger.info("Cancelled audit restoration stopped.")
             self._finish_restore_attempt()
             return
@@ -536,6 +620,7 @@ class AuditJobManager:
 
     async def start_reproduction(self, params: ReproductionStartParams) -> None:
         """Retest one exactly reproduced History vulnerability in isolation."""
+        self._reconcile_task_state()
         if self.state in BUSY_STATES:
             raise JobConflictError("An audit or reproduction is already running.")
         if self.store is None:
@@ -685,6 +770,9 @@ class AuditJobManager:
             self.error = str(e)
             logger.exception("Audit failed: %s", e)
         finally:
+            if self.state in BUSY_STATES:
+                self.state = STATE_CANCELLED
+                self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
             self._remove_log_handler()
             if self.store is not None and self._run_id is not None:
@@ -770,6 +858,9 @@ class AuditJobManager:
             self.error = str(e)
             logger.exception("Reproduction failed: %s", e)
         finally:
+            if self.state in BUSY_STATES:
+                self.state = STATE_CANCELLED
+                self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
             self._remove_log_handler()
             self.bus.publish(
@@ -783,12 +874,15 @@ class AuditJobManager:
 
     def stop(self) -> bool:
         """Cancel the running audit. Returns False if nothing is running."""
+        self._reconcile_task_state()
         if self.state not in BUSY_STATES or self._task is None:
             return False
+        self.error = ""
         self._task.cancel()
         return True
 
     def status(self) -> dict:
+        self._reconcile_task_state()
         return {
             "kind": self.kind,
             "state": self.state,

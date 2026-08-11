@@ -40,6 +40,11 @@ const reproductionViewerPanel = $("reproduction-viewer-panel");
 
 let jobState = "idle";
 let jobKind = "audit";
+// Run detail page live/static tracking: when the displayed run is not the
+// active job, the Results panel shows that run's recorded artifacts and live
+// job updates must not clobber them.
+let activeAuditRunId = null;
+let runDetailStatic = false;
 let reproductionCandidates = [];
 let configuredGitUrl = "";
 let managedResultsDir = "";
@@ -162,9 +167,10 @@ async function loadWikis() {
 async function updateRepositoryChoice() {
   const repository = $("f-repo-select").value;
   const cloning = repository === "__clone__";
-  $("f-git-url-label").hidden = !cloning;
-  $("f-git-url").required = cloning;
-  if (!cloning) $("f-git-url").value = "";
+  const gitUrlInput = $("f-git-url");
+  gitUrlInput.disabled = !cloning;
+  gitUrlInput.required = cloning;
+  if (!cloning) gitUrlInput.value = "";
   if (!repository || cloning) {
     $("repo-runs").hidden = true;
     return;
@@ -173,6 +179,16 @@ async function updateRepositoryChoice() {
 }
 
 $("f-repo-select").addEventListener("change", updateRepositoryChoice);
+
+// ── New Audit dialog ────────────────────────────────────────────────────────
+const newAuditDialog = $("new-audit-dialog");
+$("btn-new-audit").addEventListener("click", async () => {
+  formError.textContent = "";
+  await Promise.all([loadRepos(), loadWikis()]);
+  updateRepositoryChoice();
+  newAuditDialog.showModal();
+});
+$("btn-new-audit-cancel").addEventListener("click", () => newAuditDialog.close());
 
 async function loadRepoRuns(repository) {
   const box = $("repo-runs");
@@ -244,6 +260,11 @@ form.addEventListener("submit", async (e) => {
     }
     const data = await res.json();
     setJobState(data.state || "running", data.error, data.kind || "audit");
+    activeAuditRunId = data.run_id || null;
+    newAuditDialog.close();
+    // The new run is tracked in History; open its detail page (which shows
+    // Stages, Logs, and Results live) when the row already exists.
+    location.hash = data.run_id ? `#/run/${data.run_id}` : "#/history";
   } catch (err) {
     formError.textContent = `Start failed: ${err}`;
   }
@@ -486,8 +507,8 @@ function setJobState(state, error, kind) {
   if (kind) jobKind = kind;
   jobState = state;
   jobStatusPanel.dataset.state = state;
-  jobBadge.textContent =
-    (jobKind ? `${jobKind}: ` : "") + state + (error ? `: ${error}` : "");
+  jobBadge.textContent = (jobKind ? `${jobKind}: ` : "") + state;
+  jobBadge.title = error || "";
   jobBadge.className = `badge badge-${state}`;
   btnStart.disabled = isJobBusy(state);
   reproductionBtnStart.disabled = isJobBusy(state);
@@ -503,7 +524,8 @@ function setJobState(state, error, kind) {
       clearLogBuffer(reproductionLogPane);
       reproductionResultsPanel.hidden = true;
       reproductionViewerPanel.hidden = true;
-    } else {
+    } else if (!runDetailStatic) {
+      // A static run detail page keeps its own recorded stages/logs.
       resetStages();
       clearLogBuffer(logPane);
       resultsPanel.hidden = true;
@@ -830,6 +852,7 @@ $("btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(false
 $("r-btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(true));
 
 async function loadResults() {
+  if (runDetailStatic) return; // static run detail loads its own artifacts
   try {
     const res = await fetch("/api/results");
     if (!res.ok) return;
@@ -845,9 +868,28 @@ async function loadResults() {
   }
 }
 
+async function loadStaticRunResults(run) {
+  const viewer = (path) => viewHistoryFile(run.id, path);
+  try {
+    const res = await fetch(`/api/history/${run.id}/results`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    $("results-output-dir").textContent = `Output: ${baseName(data.output_dir)}`;
+    fillFileList("results-vulnerabilities", data.vulnerabilities, viewer);
+    fillFileList("results-pocs", data.poc_reports, viewer);
+    fillFileList("results-disclosures", data.disclosures, viewer);
+    fillFileList("results-agent-logs", data.agent_logs, viewer);
+    resultsPanel.hidden = false;
+  } catch {
+    resultsPanel.hidden = true;
+  }
+}
+
 function fillFileList(id, files, viewer = viewFile) {
   const ul = $(id);
   ul.innerHTML = "";
+  const count = $(`${id}-count`);
+  if (count) count.textContent = `(${(files || []).length})`;
   for (const f of files || []) {
     const li = document.createElement("li");
     const a = document.createElement("a");
@@ -1017,6 +1059,9 @@ function setResumeMessage(message, isError = false) {
     node.textContent = message;
     node.classList.toggle("error", isError);
     node.classList.toggle("dim", !isError);
+    if (message && isError && !node.closest("[hidden]")) {
+      node.scrollIntoView({ block: "nearest" });
+    }
   }
 }
 
@@ -1046,8 +1091,13 @@ async function resumeCancelledAudit(runId, button) {
       return;
     }
     setJobState(data.state || "running", data.error, data.kind || "audit");
-    location.hash = "#/";
-    route();
+    activeAuditRunId = data.run_id || Number(runId) || null;
+    // Stay on the run detail page: it now shows the live Stages/Logs.
+    if (location.hash === `#/run/${runId}`) {
+      loadRunDetail(runId);
+    } else {
+      location.hash = `#/run/${runId}`;
+    }
   } catch (error) {
     setResumeMessage(`Resume failed: ${error}`, true);
     if (button) button.disabled = false;
@@ -1191,6 +1241,9 @@ async function loadRunDetail(runId) {
   resumeButton.hidden = true;
   resumeButton.dataset.resumeRun = "";
   resumeButton.onclick = null;
+  const stopButton = $("btn-run-stop");
+  stopButton.hidden = true;
+  stopButton.onclick = null;
   setResumeMessage("");
   let run;
   try {
@@ -1206,8 +1259,56 @@ async function loadRunDetail(runId) {
     return;
   }
 
+  // Decide whether this run is the live job: then the shared Stages/Logs/
+  // Results panels follow the SSE stream; otherwise they show the run's own
+  // recorded artifacts.
+  let status = null;
+  try {
+    const res = await fetch("/api/audit/status");
+    if (res.ok) status = await res.json();
+  } catch {
+    status = null;
+  }
+  activeAuditRunId = status?.run_id || null;
+  const isLive =
+    !!status &&
+    isJobBusy(status.state) &&
+    (status.kind || "audit") === "audit" &&
+    status.run_id === run.id;
+  runDetailStatic = !isLive;
+
+  // Stages and Logs only make sense while the audit is actually running;
+  // finished runs show their recorded Results instead.
+  $("stages-panel").hidden = !isLive;
+  $("logs-panel").hidden = !isLive;
+  if (isLive) {
+    stopButton.hidden = false;
+    stopButton.onclick = async () => {
+      try {
+        await fetch("/api/audit/stop", { method: "POST" });
+      } catch {
+        // status stream reconciles the state
+      }
+    };
+    resetStages();
+    for (const s of status.stages || []) {
+      updateStage(s.stage, s.status, s.detail);
+      updateProgress(s.stage, s.items_done, s.items_total);
+    }
+    renderLogBuffer(logPane, logBufferFor(logPane));
+    $("btn-download-agent-log").href = "/api/results/agent-log?download=true";
+    resultsPanel.hidden = true;
+    viewerPanel.hidden = true;
+  } else {
+    await loadStaticRunResults(run);
+  }
+
   $("run-detail-title").textContent = `Run #${run.id} — ${repoDisplay(run)}`;
-  if (run.status === "cancelled") {
+  if (
+    run.status === "cancelled" ||
+    run.status === "failed" ||
+    (run.status === "done" && run.error)
+  ) {
     resumeButton.hidden = false;
     resumeButton.dataset.resumeRun = String(run.id);
     resumeButton.disabled = isJobBusy();
@@ -1220,7 +1321,8 @@ async function loadRunDetail(runId) {
     submodules = [];
   }
   const meta = [
-    ["Status", run.status + (run.error ? `: ${run.error}` : "")],
+    ["Status", run.status],
+    ["Error", run.error ? (run.error.length > 300 ? run.error.slice(0, 300) + "…" : run.error) : "—"],
     ["Target", repoDisplay(run)],
     ["Repo", run.repo_name || "—"],
     ["Branch", run.branch || "—"],
@@ -1285,12 +1387,16 @@ async function loadRunDetail(runId) {
 
   const vtbody = document.querySelector("#run-vulns-table tbody");
   vtbody.innerHTML = "";
-  for (const v of run.vulnerabilities || []) {
+  // Only vulnerabilities whose PoC reproduced are listed here.
+  const allVulns = run.vulnerabilities || [];
+  const dlLink = (path, label) =>
+    `<a href="/api/history/${run.id}/file?path=${encodeURIComponent(path)}&download=true" download>${label}</a>`;
+  for (const v of allVulns) {
     const tr = document.createElement("tr");
     const cwes = parseJsonList(v.cwe_ids).join(", ");
     const disclosure = v.disclosure_report_path
-      ? `<a href="#" class="disclosure-artifact-link" data-file="${escapeHtml(v.disclosure_report_path)}">report</a>` +
-        (v.disclosure_zip_path ? ` <a href="#" class="disclosure-artifact-link" data-file="${escapeHtml(v.disclosure_zip_path)}">zip</a>` : "")
+      ? dlLink(v.disclosure_report_path, "report") +
+        (v.disclosure_zip_path ? ` ${dlLink(v.disclosure_zip_path, "zip")}` : "")
       : "—";
     tr.innerHTML =
       `<td>${escapeHtml(v.vuln_id)}</td><td class="sev-cell"></td><td>${escapeHtml(v.cvss_score ?? "—")}</td>` +
@@ -1312,8 +1418,8 @@ async function loadRunDetail(runId) {
       `<pre class="raw-json">${escapeHtml(v.raw_json)}</pre></details></td>`;
     vtbody.appendChild(details);
   }
-  if (!run.vulnerabilities || run.vulnerabilities.length === 0) {
-    vtbody.innerHTML = `<tr><td colspan="7" class="dim">No vulnerabilities recorded.</td></tr>`;
+  if (allVulns.length === 0) {
+    vtbody.innerHTML = `<tr><td colspan="7" class="dim">No reproduced vulnerabilities recorded.</td></tr>`;
   }
 
   // Wire file links to the history file endpoint.
@@ -2962,7 +3068,6 @@ function route() {
   const runMatch = hash.match(/^#\/run\/(\d+)$/);
   const targetMatch = hash.match(/^#\/target\/(.+)$/);
   const views = {
-    new: $("view-new"),
     history: $("view-history"),
     reproduction: $("view-reproduction"),
     detail: $("view-run-detail"),
@@ -2982,7 +3087,10 @@ function route() {
       if (t.dataset.route === "history") t.classList.add("tab-active");
     });
     loadRunDetail(runMatch[1]);
-  } else if (targetMatch) {
+    return;
+  }
+
+  if (targetMatch) {
     views.target.hidden = false;
     tabs.forEach((t) => {
       if (t.dataset.route === "history") t.classList.add("tab-active");
@@ -3012,17 +3120,14 @@ function route() {
       if (t.dataset.route === "cves") t.classList.add("tab-active");
     });
     loadCves();
-  } else if (hash.startsWith("#/history")) {
+  } else {
+    // "#/" and anything unknown lands on History; audits are created from
+    // the New Audit dialog and inspected from History rows.
     views.history.hidden = false;
     tabs.forEach((t) => {
       if (t.dataset.route === "history") t.classList.add("tab-active");
     });
     loadHistory();
-  } else {
-    views.new.hidden = false;
-    tabs.forEach((t) => {
-      if (t.dataset.route === "new") t.classList.add("tab-active");
-    });
   }
 }
 
@@ -3038,6 +3143,7 @@ async function boot() {
   try {
     const res = await fetch("/api/audit/status");
     const status = await res.json();
+    activeAuditRunId = status.run_id || null;
     if (status.state && status.state !== "idle") {
       setJobState(status.state, status.error, status.kind || "audit");
       for (const s of status.stages || []) {

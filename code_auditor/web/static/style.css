@@ -292,9 +292,31 @@ tr.stage-done .stage-status {
 }
 
 #results-columns {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.results-group {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.35rem 0.6rem;
+}
+
+.results-group > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.92rem;
+  list-style-position: inside;
+  user-select: none;
+}
+
+.results-group > summary:hover {
+  color: var(--accent);
+}
+
+.results-group .file-list {
+  margin-top: 0.4rem;
 }
 
 .file-list {
@@ -406,6 +428,17 @@ tr.stage-done .stage-status {
   font-size: 0.92rem;
   border-left: 3px solid transparent;
   transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+button.tab {
+  width: 100%;
+  background: none;
+  border-top: none;
+  border-right: none;
+  border-bottom: none;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
 }
 
 .tab svg {
@@ -668,6 +701,24 @@ tr.run-row:hover {
 
 .history-run-header h2 {
   margin-bottom: 0;
+}
+
+.history-run-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* The New Audit form lives inside a dialog; strip the panel chrome there. */
+#new-audit-dialog .panel {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+
+#f-git-url:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .history-action {
@@ -1092,7 +1143,8 @@ th[aria-sort="descending"] .sort-button::after {
 #cve-import-dialog,
 #disclosure-edit-dialog,
 #trigger-graph-dialog,
-#asan-report-dialog {
+#asan-report-dialog,
+#new-audit-dialog {
   width: min(860px, calc(100vw - 2rem));
   max-height: calc(100vh - 2rem);
   overflow: auto;
@@ -1106,14 +1158,16 @@ th[aria-sort="descending"] .sort-button::after {
 #cve-import-dialog::backdrop,
 #disclosure-edit-dialog::backdrop,
 #trigger-graph-dialog::backdrop,
-#asan-report-dialog::backdrop {
+#asan-report-dialog::backdrop,
+#new-audit-dialog::backdrop {
   background: rgba(0, 0, 0, 0.68);
 }
 
 #cve-import-dialog h2,
 #disclosure-edit-dialog h2,
 #trigger-graph-dialog h2,
-#asan-report-dialog h2 {
+#asan-report-dialog h2,
+#new-audit-dialog h2 {
   margin-top: 0;
 }
 
@@ -1400,13 +1454,15 @@ th[aria-sort="descending"] .sort-button::after {
   white-space: normal;
 }
 
-#disclosures-table .details-row td {
+#disclosures-table .details-row td,
+#run-vulns-table .details-row td {
   padding: 0.45rem 0.72rem 0.7rem;
   vertical-align: top;
   background: rgba(255, 255, 255, 0.012);
 }
 
-#disclosures-table .details-row summary {
+#disclosures-table .details-row summary,
+#run-vulns-table .details-row summary {
   width: max-content;
   padding: 0.15rem 0;
 }

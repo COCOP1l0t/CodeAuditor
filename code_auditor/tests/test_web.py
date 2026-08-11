@@ -1504,6 +1504,59 @@ async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch)
     }
 
 
+def test_run_stage_summary_uses_checkpoint_markers(tmp_path) -> None:
+    from code_auditor.web.server import _run_stage_summary
+
+    out = tmp_path / "audit-output-x"
+    markers = out / ".markers"
+    markers.mkdir(parents=True)
+    for name in ("stage2", "stage3-AU-1", "stage3-AU-2"):
+        (markers / name).touch()
+    run = {
+        "output_dir": str(out),
+        "status": "done",
+        "analysis_units": [{"au_id": "AU-1"}, {"au_id": "AU-2"}],
+        "vulnerabilities": [],
+        "poc_issues": [],
+        "reproduced_vulns_count": 0,
+    }
+
+    stages = {s["stage"]: s for s in _run_stage_summary(run)}
+
+    assert stages[0]["status"] == "done"
+    assert stages[1]["status"] == "pending"
+    assert stages[2]["status"] == "done"
+    assert stages[3]["status"] == "done"
+    assert stages[3]["items_done"] == 2
+    assert stages[3]["items_total"] == 2
+    # No fallback to artifact presence once markers exist.
+    assert stages[5]["status"] == "pending"
+
+
+def test_run_stage_summary_marks_partial_failed_run(tmp_path) -> None:
+    from code_auditor.web.server import _run_stage_summary
+
+    out = tmp_path / "audit-output-y"
+    markers = out / ".markers"
+    markers.mkdir(parents=True)
+    (markers / "stage3-AU-1").touch()
+    run = {
+        "output_dir": str(out),
+        "status": "failed",
+        "analysis_units": [{"au_id": "AU-1"}, {"au_id": "AU-2"}],
+        "vulnerabilities": [],
+        "poc_issues": [],
+        "reproduced_vulns_count": 0,
+    }
+
+    stages = {s["stage"]: s for s in _run_stage_summary(run)}
+
+    assert stages[3]["status"] == "failed"
+    assert stages[3]["items_done"] == 1
+    assert stages[3]["items_total"] == 2
+    assert stages[4]["status"] == "pending"
+
+
 def test_api_history_import_and_detail(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     client = TestClient(_make_app(tmp_path))
@@ -1524,6 +1577,25 @@ def test_api_history_import_and_detail(tmp_path) -> None:
     assert detail["vulnerabilities"][0]["cvss_score"] == 8.1
     assert detail["vulnerabilities"][0]["poc_status"] == "reproduced"
 
+    # No checkpoint markers: stage summary falls back to artifact presence.
+    stages = {s["stage"]: s for s in detail["stages"]}
+    assert stages[0]["status"] == "done"
+    assert stages[1]["status"] == "pending"
+    assert stages[2]["status"] == "pending"
+    assert stages[4]["status"] == "done"
+    assert stages[5]["status"] == "done"
+    assert stages[6]["status"] == "done"
+
+    res = client.get(f"/api/history/{run_id}/results")
+    assert res.status_code == 200
+    results = res.json()
+    assert results["vulnerabilities"] == ["stage4-vulnerabilities/H-01.json"]
+    assert results["poc_reports"] == ["stage5-pocs/H-01/report.md"]
+    assert results["disclosures"]
+
+    res = client.get("/api/history/9999/results")
+    assert res.status_code == 404
+
     res = client.get("/api/history")
     assert res.json()["total"] == 1
 
@@ -1533,6 +1605,14 @@ def test_api_history_import_and_detail(tmp_path) -> None:
     )
     assert res.status_code == 200
     assert "Test vuln" in res.text
+
+    res = client.get(
+        f"/api/history/{run_id}/file",
+        params={"path": "stage4-vulnerabilities/H-01.json", "download": "true"},
+    )
+    assert res.status_code == 200
+    assert "attachment" in res.headers["content-disposition"]
+    assert 'filename="H-01.json"' in res.headers["content-disposition"]
 
     res = client.get("/api/reproduction/candidates")
     assert res.status_code == 200

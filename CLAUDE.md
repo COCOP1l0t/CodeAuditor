@@ -71,6 +71,7 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 - **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
 - **Web settings boundary**: backend/model/log level and managed paths come only from `~/.code_auditor/settings.json`; browser requests cannot override them
 - **Logging tiers**: INFO is reserved for stage-level milestones (`Stage N: ...`); per-tool-call agent activity, subagent lifecycle, and per-file validation results log at DEBUG and always persist to the task's `agent.log` regardless of level
+- **Web layout**: audits are created from the "New Audit" sidebar dialog; `#/` lands on History and every run row opens a detail page (`#/run/{id}`) with Stages, Logs, and Results — live via SSE when the run is the active job, otherwise reconstructed from checkpoint markers (`server._run_stage_summary`) and `/api/history/{id}/results`
 - **Web Wiki discovery**: optional Wikis are discovered from `~/.code_auditor/wiki/` and selected by opaque local name; `wiki_path` is not a Web config field
 - **Disclosure storage boundary**: SQLite owns Disclosure metadata, review status, dedupe identity, and artifact indexes; Stage 5/6 reports remain filesystem artifacts and there is no registry-path setting
 

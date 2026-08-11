@@ -17,10 +17,10 @@
       <span class="logo-text">CodeAuditor</span>
     </div>
     <nav id="tabs">
-      <a href="#/" class="tab" data-route="new">
+      <button type="button" class="tab" id="btn-new-audit">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
         <span>New Audit</span>
-      </a>
+      </button>
       <a href="#/history" class="tab" data-route="history">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         <span>History</span>
@@ -51,9 +51,9 @@
 
   <div id="workspace">
   <main id="content-pane">
-    <div id="view-new">
+    <dialog id="new-audit-dialog" aria-labelledby="new-audit-title">
     <section class="panel" id="config-panel">
-      <h2>Audit Configuration</h2>
+      <h2 id="new-audit-title">New Audit</h2>
       <p class="warning">
         <strong>Repository update:</strong> Stage 0 runs <code>git pull</code> on the target repository before auditing.
       </p>
@@ -67,13 +67,13 @@
             </select>
             <span class="hint">Choose a managed checkout or clone a new one.</span>
           </label>
-          <label id="f-git-url-label" hidden>
+          <label id="f-git-url-label">
             Git repository URL
             <input type="text" name="git_url" id="f-git-url"
-                   maxlength="2048" autocomplete="off"
+                   maxlength="2048" autocomplete="off" disabled
                    pattern="(https://[^ ]+|git@[^ ]+:[^ ]+)"
                    placeholder="https://github.com/user/repo.git" />
-            <span class="hint">HTTPS or git@host:path SSH URLs only.</span>
+            <span class="hint">HTTPS or git@host:path SSH URLs only. Available after choosing "Clone a new repository URL…".</span>
           </label>
           <label>
             Max parallel agents
@@ -95,64 +95,106 @@
         <div class="button-row">
           <button type="submit" id="btn-start" class="btn btn-start">Start Audit</button>
           <button type="button" id="btn-stop" class="btn btn-stop" disabled>Stop</button>
+          <button type="button" id="btn-new-audit-cancel" class="btn">Cancel</button>
           <span id="form-error" class="error"></span>
         </div>
         <div id="repo-runs" class="repo-runs" hidden></div>
       </form>
     </section>
+    </dialog>
 
-    <section class="panel" id="stages-panel">
-      <h2>Stages</h2>
-      <table id="stages-table">
-        <thead>
-          <tr><th>#</th><th>Stage</th><th>Description</th><th>Status</th><th>Progress</th></tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+    <div id="view-run-detail" hidden>      <section class="panel">
+        <div class="history-run-header">
+          <div>
+            <a href="#/history" class="back-link">← Back to history</a>
+            <h2 id="run-detail-title">Run</h2>
+          </div>
+          <div class="history-run-actions">
+            <button type="button" id="btn-run-stop" class="btn btn-stop" hidden>Stop</button>
+            <button type="button" id="btn-run-resume" class="btn btn-resume"
+                    data-resume-run hidden>Resume audit</button>
+          </div>
+        </div>
+        <p id="run-resume-message" class="registry-message dim" role="status"></p>
+        <div id="run-meta" class="meta-grid"></div>
+      </section>
+      <section class="panel" id="stages-panel">
+        <h2>Stages</h2>
+        <table id="stages-table">
+          <thead>
+            <tr><th>#</th><th>Stage</th><th>Description</th><th>Status</th><th>Progress</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section class="panel" id="logs-panel">
-      <header class="log-panel-header">
-        <div>
-          <h2>Logs</h2>
-          <span class="log-retention-note">Bounded live summary</span>
-        </div>
-        <div class="log-actions">
-          <button type="button" id="btn-full-agent-log" class="btn btn-compact">View full log</button>
-          <a class="btn btn-compact" href="/api/results/agent-log?download=true" download>Download</a>
-        </div>
-      </header>
-      <pre id="log-pane"></pre>
-    </section>
+      <section class="panel" id="logs-panel">
+        <header class="log-panel-header">
+          <div>
+            <h2>Logs</h2>
+            <span class="log-retention-note">Bounded live summary</span>
+          </div>
+          <div class="log-actions">
+            <button type="button" id="btn-full-agent-log" class="btn btn-compact">View full log</button>
+            <a class="btn btn-compact" id="btn-download-agent-log" href="/api/results/agent-log?download=true" download>Download</a>
+          </div>
+        </header>
+        <pre id="log-pane"></pre>
+      </section>
 
-    <section class="panel" id="results-panel" hidden>
-      <h2>Results</h2>
-      <p id="results-output-dir" class="dim"></p>
-      <div id="results-columns">
-        <div>
-          <h3>Vulnerabilities</h3>
-          <ul id="results-vulnerabilities" class="file-list"></ul>
+      <section class="panel" id="results-panel" hidden>
+        <h2>Results</h2>
+        <p id="results-output-dir" class="dim"></p>
+        <div id="results-columns">
+          <details class="results-group">
+            <summary>Vulnerabilities <span class="dim results-count" id="results-vulnerabilities-count"></span></summary>
+            <ul id="results-vulnerabilities" class="file-list"></ul>
+          </details>
+          <details class="results-group">
+            <summary>PoC Reports <span class="dim results-count" id="results-pocs-count"></span></summary>
+            <ul id="results-pocs" class="file-list"></ul>
+          </details>
+          <details class="results-group">
+            <summary>Disclosures <span class="dim results-count" id="results-disclosures-count"></span></summary>
+            <ul id="results-disclosures" class="file-list"></ul>
+          </details>
+          <details class="results-group">
+            <summary>Agent Logs <span class="dim results-count" id="results-agent-logs-count"></span></summary>
+            <ul id="results-agent-logs" class="file-list"></ul>
+          </details>
         </div>
-        <div>
-          <h3>PoC Reports</h3>
-          <ul id="results-pocs" class="file-list"></ul>
-        </div>
-        <div>
-          <h3>Disclosures</h3>
-          <ul id="results-disclosures" class="file-list"></ul>
-        </div>
-        <div>
-          <h3>Agent Logs</h3>
-          <ul id="results-agent-logs" class="file-list"></ul>
-        </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="panel" id="viewer-panel" hidden>
-      <h2 id="viewer-title">File</h2>
-      <pre id="viewer-content"></pre>
-    </section>
-    </div><!-- /view-new -->
+      <section class="panel" id="viewer-panel" hidden>
+        <h2 id="viewer-title">File</h2>
+        <pre id="viewer-content"></pre>
+      </section>
+      <section class="panel">
+        <h2>Vulnerabilities</h2>
+        <table id="run-vulns-table">
+          <thead>
+            <tr>
+              <th>ID</th><th>Severity</th><th>CVSS</th><th>CWE</th>
+              <th>Title</th><th>PoC</th><th>Disclosure</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="panel">
+        <h2>Analysis Units</h2>
+        <table id="run-aus-table">
+          <thead>
+            <tr><th>AU</th><th>Files</th><th>Focus</th><th>Description</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="panel" id="history-viewer-panel" hidden>
+        <h2 id="history-viewer-title">File</h2>
+        <pre id="history-viewer-content"></pre>
+      </section>
+    </div><!-- /view-run-detail -->
 
     <div id="view-reproduction" hidden>
       <section class="panel">
@@ -598,45 +640,6 @@
         </table>
       </section>
     </div><!-- /view-target -->
-
-    <div id="view-run-detail" hidden>      <section class="panel">
-        <div class="history-run-header">
-          <div>
-            <a href="#/history" class="back-link">← Back to history</a>
-            <h2 id="run-detail-title">Run</h2>
-          </div>
-          <button type="button" id="btn-run-resume" class="btn btn-resume"
-                  data-resume-run hidden>Resume audit</button>
-        </div>
-        <p id="run-resume-message" class="registry-message dim" role="status"></p>
-        <div id="run-meta" class="meta-grid"></div>
-      </section>
-      <section class="panel">
-        <h2>Vulnerabilities</h2>
-        <table id="run-vulns-table">
-          <thead>
-            <tr>
-              <th>ID</th><th>Severity</th><th>CVSS</th><th>CWE</th>
-              <th>Title</th><th>PoC</th><th>Disclosure</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </section>
-      <section class="panel">
-        <h2>Analysis Units</h2>
-        <table id="run-aus-table">
-          <thead>
-            <tr><th>AU</th><th>Files</th><th>Focus</th><th>Description</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </section>
-      <section class="panel" id="history-viewer-panel" hidden>
-        <h2 id="history-viewer-title">File</h2>
-        <pre id="history-viewer-content"></pre>
-      </section>
-    </div><!-- /view-run-detail -->
   </main>
 
   <div id="terminal-splitter" role="separator" aria-orientation="horizontal"

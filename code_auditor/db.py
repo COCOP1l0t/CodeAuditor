@@ -237,6 +237,8 @@ _RUN_EXTRA_COLUMNS = {
     "dirty": '"dirty" INTEGER DEFAULT 0',
     "submodules": '"submodules" TEXT DEFAULT \'[]\'',
     "target_key": '"target_key" TEXT DEFAULT \'\'',
+    "models_used": '"models_used" TEXT DEFAULT \'[]\'',
+    "usage_stats": '"usage_stats" TEXT DEFAULT \'{}\'',
 }
 
 _DISCLOSED_BUGS_V2_SCHEMA = """
@@ -950,6 +952,8 @@ class AuditStore:
         status: str,
         error: str = "",
         ended_at: float | None = None,
+        models_used: list[str] | None = None,
+        usage_stats: dict[str, float] | None = None,
     ) -> None:
         finished_at = ended_at or time.time()
         with self._connect() as conn:
@@ -968,6 +972,16 @@ class AuditStore:
                 "UPDATE runs SET status = ?, error = ?, ended_at = ? WHERE id = ?",
                 (status, error, finished_at, run_id),
             )
+            if models_used is not None:
+                conn.execute(
+                    "UPDATE runs SET models_used = ? WHERE id = ?",
+                    (json.dumps(models_used, ensure_ascii=False), run_id),
+                )
+            if usage_stats is not None:
+                conn.execute(
+                    "UPDATE runs SET usage_stats = ? WHERE id = ?",
+                    (json.dumps(usage_stats, ensure_ascii=False), run_id),
+                )
         if row and row["output_dir"]:
             self.persist_artifacts(run_id, row["output_dir"])
 
@@ -1052,8 +1066,14 @@ class AuditStore:
             self.set_run_identity(run_id, identity)
         with self._connect() as conn:
             conn.execute(
-                "UPDATE runs SET error = ?, ended_at = ? WHERE id = ?",
-                (error, ended_at or time.time(), run_id),
+                "UPDATE runs SET error = ?, ended_at = ?, models_used = ?, usage_stats = ? WHERE id = ?",
+                (
+                    error,
+                    ended_at or time.time(),
+                    json.dumps(config.models_used, ensure_ascii=False),
+                    json.dumps(config.usage_stats, ensure_ascii=False),
+                    run_id,
+                ),
             )
         self.persist_artifacts(run_id, config.output_dir)
         return run_id

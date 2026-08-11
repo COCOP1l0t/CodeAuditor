@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import date
@@ -43,13 +44,73 @@ class AuditConfig:
     known_disclosures: tuple[dict[str, Any], ...] = field(
         default_factory=tuple, repr=False
     )
+    # Model ids actually used by agent invocations, in first-use order.
+    models_used: list[str] = field(default_factory=list, repr=False)
+    # Runtime-only accumulator of token/cost usage across agent invocations.
+    # Keys: agent_calls, input_tokens, output_tokens,
+    # cache_creation_input_tokens, cache_read_input_tokens, cost_usd.
+    usage_stats: dict[str, float] = field(default_factory=dict, repr=False)
+
+
+def local_claude_model(
+    settings_path: str | None = None,
+    keys: tuple[str, ...] = ("ANTHROPIC_MODEL",),
+) -> str | None:
+    """Read the model id from the local Claude config, fresh on every call.
+
+    The Claude Code CLI is configured through ``~/.claude/settings.json``;
+    its ``env`` section maps ``ANTHROPIC_MODEL`` (and the per-tier
+    ``ANTHROPIC_DEFAULT_*_MODEL`` variants) to the provider's current model
+    id. Reading it at each call keeps audits on the configured model even
+    when the provider renames ids — a stored copy goes stale.
+    """
+    path = settings_path or os.path.join(
+        os.path.expanduser("~"), ".claude", "settings.json"
+    )
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    env = data.get("env")
+    if isinstance(env, dict):
+        for key in keys:
+            value = env.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if "ANTHROPIC_MODEL" in keys:
+        top_level = data.get("model")
+        if isinstance(top_level, str) and top_level.strip():
+            return top_level.strip()
+    return None
+
+
+def resolve_agent_model(config: AuditConfig, model: str | None = None) -> str:
+    """Resolve the effective model id for one agent invocation.
+
+    Priority: explicit per-call model > local Claude config (claude backend)
+    > stored config value > built-in default.
+    """
+    if model:
+        return model
+    if config.backend == "claude":
+        return local_claude_model() or config.model or DEFAULT_CLAUDE_MODEL
+    return config.model or DEFAULT_CODEX_MODEL
 
 
 def select_poc_model(config: AuditConfig) -> str:
+    if config.backend == "claude":
+        return (
+            local_claude_model(
+                keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL")
+            )
+            or config.model
+            or DEFAULT_CLAUDE_POC_MODEL
+        )
     if config.model:
         return config.model
-    if config.backend == "claude":
-        return DEFAULT_CLAUDE_POC_MODEL
     if config.backend == "codex":
         return DEFAULT_CODEX_POC_MODEL
     raise ValueError(f"Unsupported agent backend: {config.backend}")

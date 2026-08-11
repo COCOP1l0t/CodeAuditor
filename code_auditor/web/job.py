@@ -21,6 +21,7 @@ from ..checkpoint import CheckpointManager
 from ..config import (
     DEFAULT_AGENT_TIMEOUT_SECONDS,
     AuditConfig,
+    local_claude_model,
     resolve_wiki_arg,
 )
 from ..db import RUN_CANCELLED, AuditStore, compute_target_key
@@ -485,11 +486,32 @@ class AuditJobManager:
             update_repo=False,
             log_level=str(run.get("log_level") or "INFO"),
             backend=backend,  # type: ignore[arg-type]
-            model=run.get("model") or None,
+            # Do not pin the recorded model id: providers rename models, so
+            # resolve it fresh from the local Claude config at agent time.
+            model=None,
             target_au_count=target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             known_disclosures=tuple(self.store.disclosure_dedupe_index()),
         )
+        # Carry forward the original session's accounting: finish_run writes
+        # config.models_used / config.usage_stats wholesale, so seed them from
+        # the run row or the earlier session's models/costs would be lost.
+        try:
+            prior_models = json.loads(str(run.get("models_used") or "[]"))
+        except ValueError:
+            prior_models = []
+        if isinstance(prior_models, list):
+            config.models_used.extend(str(m) for m in prior_models)
+        try:
+            prior_usage = json.loads(str(run.get("usage_stats") or "{}"))
+        except ValueError:
+            prior_usage = {}
+        if isinstance(prior_usage, dict):
+            for key, value in prior_usage.items():
+                try:
+                    config.usage_stats[str(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
         params = AuditStartParams(
             target=target,
             output_dir=output_dir,
@@ -714,13 +736,25 @@ class AuditJobManager:
             resume=True,
             log_level=params.log_level,
             backend=params.backend,  # type: ignore[arg-type]
-            model=params.model,
+            model=self._resolve_model(params),
             target_au_count=params.target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             known_disclosures=tuple(
                 self.store.disclosure_dedupe_index() if self.store else ()
             ),
         )
+
+    @staticmethod
+    def _resolve_model(params: AuditStartParams) -> str | None:
+        """Resolve the effective model for config creation.
+
+        For the claude backend, prefer the model resolved from
+        ``~/.claude/settings.json`` so the stored ``run.model`` reflects the
+        model agents will actually use, not the web settings fallback.
+        """
+        if params.backend == "claude":
+            return local_claude_model() or params.model
+        return params.model
 
     def _create_run_row(self, config: AuditConfig) -> None:
         if self.store is None:
@@ -778,7 +812,12 @@ class AuditJobManager:
             if self.store is not None and self._run_id is not None:
                 try:
                     self.store.finish_run(
-                        self._run_id, self.state, self.error, self.ended_at
+                        self._run_id,
+                        self.state,
+                        self.error,
+                        self.ended_at,
+                        models_used=list(config.models_used) if config else None,
+                        usage_stats=dict(config.usage_stats) if config else None,
                     )
                 except Exception as e:
                     logger.warning("Failed to update history database run row: %s", e)
@@ -892,6 +931,8 @@ class AuditJobManager:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "run_id": self._run_id,
+            "models_used": list(self.config.models_used) if self.config else [],
+            "usage_stats": dict(self.config.usage_stats) if self.config else {},
             "stages": self.reporter.snapshot() if self.reporter else [],
             "reproduction_candidate": self.reproduction_candidate,
             "reproduction_reports": self.reproduction_reports,

@@ -253,6 +253,8 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         "branch": identity["branch"],
         "commit": identity["commit"],
         "target_key": compute_target_key(identity),
+        "models_used": '["old-model"]',
+        "usage_stats": '{"agent_calls": 5, "input_tokens": 900, "cost_usd": 0.5}',
     }
 
     class FakeStore:
@@ -274,7 +276,7 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         def seed_analysis_units(self, target_key, output_dir):
             return 0
 
-        def finish_run(self, run_id, status, error, ended_at):
+        def finish_run(self, run_id, status, error, ended_at, models_used=None, usage_stats=None):
             self.finished.append((run_id, status, error, ended_at))
 
     audited = []
@@ -323,6 +325,14 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     assert audited[0].output_dir == str(output)
     assert audited[0].resume is True
     assert audited[0].update_repo is False
+    # Accounting from the original session is carried into the resumed run so
+    # the finish update extends it instead of overwriting it.
+    assert audited[0].models_used == ["old-model"]
+    assert audited[0].usage_stats == {
+        "agent_calls": 5.0,
+        "input_tokens": 900.0,
+        "cost_usd": 0.5,
+    }
     assert store.finished[0][0:3] == (17, STATE_DONE, "")
 
 
@@ -1184,6 +1194,7 @@ def test_api_full_job_lifecycle_and_results(tmp_path, monkeypatch) -> None:
         "default_audit_output_dir",
         lambda target, results_dir=None: str(tmp_path / "out"),
     )
+    monkeypatch.setattr(job_module, "local_claude_model", lambda *a, **kw: None)
 
     app = _make_app(tmp_path)
     client = TestClient(app)

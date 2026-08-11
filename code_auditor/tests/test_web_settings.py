@@ -21,7 +21,6 @@ def test_load_web_settings_creates_secure_debug_defaults(tmp_path: Path) -> None
 
     assert config_path.is_file()
     assert settings.backend == "claude"
-    assert settings.model is None
     assert settings.log_level == "DEBUG"
     assert settings.repos_dir == str(state_dir / "repo")
     assert settings.results_dir == str(state_dir / "results")
@@ -36,7 +35,6 @@ def test_load_web_settings_reads_valid_server_configuration(tmp_path: Path) -> N
     configured = WebSettings.for_state_dir(
         str(tmp_path),
         backend="codex",
-        model="gpt-5.5",
         max_parallel=4,
     )
     config_path.write_text(
@@ -47,7 +45,6 @@ def test_load_web_settings_reads_valid_server_configuration(tmp_path: Path) -> N
     settings = load_web_settings(str(config_path))
 
     assert settings.backend == "codex"
-    assert settings.model == "gpt-5.5"
     assert settings.log_level == "DEBUG"
     assert settings.max_parallel == 4
     assert os.stat(config_path).st_mode & 0o777 == 0o600
@@ -72,7 +69,6 @@ def test_load_web_settings_removes_legacy_managed_paths(tmp_path: Path) -> None:
     "override",
     [
         {"backend": "shell"},
-        {"model": "model; rm -rf"},
         {"log_level": "TRACE"},
         {"max_parallel": 0},
         {"results_dir": "/tmp/outside-managed-state"},

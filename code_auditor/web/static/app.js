@@ -972,6 +972,44 @@ function parseJsonList(text) {
   }
 }
 
+function modelsUsedDisplay(run) {
+  const models = parseJsonList(run.models_used);
+  return models.length ? models.join(", ") : run.model || "";
+}
+
+function fmtTokenCount(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
+function parseJsonObject(text) {
+  try {
+    const v = JSON.parse(text || "{}");
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+function usageStatsDisplay(run) {
+  const stats = typeof run.usage_stats === "object" && run.usage_stats !== null
+    ? run.usage_stats
+    : parseJsonObject(run.usage_stats);
+  const input = Number(stats.input_tokens || 0);
+  const output = Number(stats.output_tokens || 0);
+  const cost = Number(stats.cost_usd || 0);
+  const parts = [];
+  if (input || output) {
+    parts.push(`${fmtTokenCount(input)} in / ${fmtTokenCount(output)} out`);
+  }
+  if (cost > 0) {
+    parts.push(`$${cost.toFixed(2)}`);
+  }
+  return parts.join(" · ");
+}
+
 function setResumeMessage(message, isError = false) {
   for (const id of ["history-message", "run-resume-message"]) {
     const node = $(id);
@@ -1037,7 +1075,8 @@ async function loadHistory() {
             ? "—"
             : fmtDuration(run.started_at, run.ended_at),
         { kind: "status" },
-        run.model ? `${run.backend} (${run.model})` : run.backend || "—",
+        run.backend || "—",
+        usageStatsDisplay(run) || "—",
         run.reproduced_vulns_count,
       ];
       for (const c of cells) {
@@ -1086,12 +1125,12 @@ async function loadHistory() {
     }
     if (!data.runs || data.runs.length === 0) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td colspan="9" class="dim">No audit runs recorded yet.</td>`;
+      tr.innerHTML = `<td colspan="10" class="dim">No audit runs recorded yet.</td>`;
       tbody.appendChild(tr);
     }
   } catch (e) {
     tbody.innerHTML =
-      `<tr><td colspan="9" class="error">Failed to load history: ` +
+      `<tr><td colspan="10" class="error">Failed to load history: ` +
       `${escapeHtml(String(e))}</td></tr>`;
   }
 }
@@ -1188,11 +1227,13 @@ async function loadRunDetail(runId) {
         : "—",
     ],
     ["Output", baseName(run.output_dir)],
-    ["Backend", run.model ? `${run.backend} (${run.model})` : run.backend || "—"],
+    ["Backend", run.backend || "—"],
+    ["Models used", modelsUsedDisplay(run) || "—"],
+    ["Tokens / Cost", usageStatsDisplay(run) || "—"],
     ["Started", fmtTime(run.started_at)],
     ["Ended", fmtTime(run.ended_at)],
     ["Duration", run.status === "imported" ? "—" : fmtDuration(run.started_at, run.ended_at)],
-    ["Reproduced vulnerabilities", String((run.vulnerabilities || []).length)],
+    ["Reproduced vulnerabilities", String(run.reproduced_vulns_count ?? (run.vulnerabilities || []).length)],
   ];
   $("run-meta").innerHTML = meta
     .map(([k, v]) => `<span class="meta-key">${escapeHtml(k)}</span><span class="meta-val">${escapeHtml(v)}</span>`)

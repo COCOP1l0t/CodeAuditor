@@ -11,9 +11,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Protocol, TextIO
 from uuid import uuid4
 
-from .config import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, AuditConfig, ValidationIssue
+from .config import AuditConfig, ValidationIssue, resolve_agent_model
 from .logger import get_logger
-from .utils import format_validation_issues
+from .utils import format_validation_issues, record_agent_usage
 
 AGENT_MAX_RETRIES = 3
 AGENT_RETRY_BASE_DELAY = 10  # seconds
@@ -577,7 +577,7 @@ async def _run_claude_agent(
         allowed_tools=tools,
         permission_mode="bypassPermissions",
         max_turns=max_turns,
-        model=model or config.model or DEFAULT_CLAUDE_MODEL,
+        model=resolve_agent_model(config, model),
         cwd=cwd,
         add_dirs=add_dirs,
         extra_args=extra_args,
@@ -671,6 +671,11 @@ async def _run_claude_agent(
                                         log_fh, f"Session event: {subtype}"
                                     )
                             elif message_type == "ResultMessage":
+                                record_agent_usage(
+                                    config,
+                                    getattr(message, "usage", None),
+                                    getattr(message, "total_cost_usd", None),
+                                )
                                 turns = getattr(message, "num_turns", None)
                                 duration_ms = getattr(message, "duration_ms", None)
                                 is_error = bool(getattr(message, "is_error", False))
@@ -710,6 +715,37 @@ async def _run_claude_agent(
             log_fh.close()
 
 
+def _codex_usage_dict(payload: Any) -> dict[str, Any] | None:
+    """Best-effort extraction of a Codex token-usage breakdown as a dict."""
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        data = payload
+    else:
+        model_dump = getattr(payload, "model_dump", None)
+        if callable(model_dump):
+            data = model_dump()
+        else:
+            data = {
+                key: getattr(payload, key)
+                for key in (
+                    "totalTokens",
+                    "inputTokens",
+                    "cachedInputTokens",
+                    "outputTokens",
+                    "reasoningOutputTokens",
+                )
+                if getattr(payload, key, None) is not None
+            }
+    # A TokenUsage notification wraps the breakdown under last/total; the
+    # cumulative "total" is the number worth accounting.
+    for key in ("total", "token_usage", "tokenUsage"):
+        inner = data.get(key) if isinstance(data, dict) else None
+        if inner is not None:
+            return _codex_usage_dict(inner)
+    return data or None
+
+
 async def _run_codex_agent(
     prompt: str,
     config: AuditConfig,
@@ -730,7 +766,7 @@ async def _run_codex_agent(
     if max_turns != 30:
         logger.debug("Codex backend runs one SDK turn per invocation; max_turns is not mapped directly.")
 
-    selected_model = model or config.model or DEFAULT_CODEX_MODEL
+    selected_model = resolve_agent_model(config, model)
     codex_bin = _resolve_codex_bin()
     sandbox_policy = codex_sdk.sandbox_policy_cls.model_validate({"type": "dangerFullAccess"})
     codex_effort = codex_sdk.reasoning_effort_cls(effort) if effort else None
@@ -799,9 +835,12 @@ async def _run_codex_agent(
                         stream = turn.stream()
                         completed = None
                         text_parts: list[str] = []
+                        token_usage: dict[str, Any] | None = None
                         try:
                             async for event in stream:
                                 payload = event.payload
+                                if event.method.lower().endswith("tokenusage/updated"):
+                                    token_usage = _codex_usage_dict(payload) or token_usage
                                 activity = _codex_item_activity(
                                     event.method, payload
                                 )
@@ -839,6 +878,12 @@ async def _run_codex_agent(
                                 if error_msg:
                                     raise RuntimeError(error_msg)
                                 raise RuntimeError(f"turn failed with status {status_val}")
+                        if token_usage is None and turn_obj is not None:
+                            token_usage = _codex_usage_dict(
+                                getattr(turn_obj, "usage", None)
+                            )
+                        # Codex reports tokens but no dollar cost.
+                        record_agent_usage(config, token_usage, None)
 
                         if log_fh:
                             log_fh.write("\n")
@@ -877,11 +922,9 @@ async def run_agent(
     if config.backend not in ("codex", "claude"):
         raise ValueError(f"Unsupported agent backend: {config.backend}")
 
-    selected_model = (
-        model
-        or config.model
-        or (DEFAULT_CODEX_MODEL if config.backend == "codex" else DEFAULT_CLAUDE_MODEL)
-    )
+    selected_model = resolve_agent_model(config, model)
+    if selected_model not in config.models_used:
+        config.models_used.append(selected_model)
     subagent_id = uuid4().hex[:8]
     started_at = time.monotonic()
     status = "failed"

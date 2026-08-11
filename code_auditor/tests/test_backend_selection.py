@@ -13,6 +13,7 @@ import pytest
 
 from code_auditor import __main__ as main_module
 from code_auditor import agent
+from code_auditor import config as config_module
 from code_auditor import logger as logger_module
 from code_auditor import tui as tui_module
 from code_auditor.__main__ import _build_parser
@@ -504,7 +505,10 @@ def test_select_poc_model_prefers_global_model_override(
     backend: AgentBackend,
     config_model: str | None,
     expected_model: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Isolate from the developer's real ~/.claude/settings.json.
+    monkeypatch.setattr(config_module, "local_claude_model", lambda **_: None)
     config = AuditConfig(
         target="/tmp/project",
         output_dir="/tmp/output",
@@ -513,6 +517,46 @@ def test_select_poc_model_prefers_global_model_override(
     )
 
     assert select_poc_model(config) == expected_model
+
+
+def test_select_poc_model_prefers_local_claude_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        config_module, "local_claude_model", lambda **_: "fresh-local-model"
+    )
+    config = AuditConfig(
+        target="/tmp/project",
+        output_dir="/tmp/output",
+        backend="claude",
+        model="stale-stored-model",
+    )
+
+    assert select_poc_model(config) == "fresh-local-model"
+
+
+def test_local_claude_model_reads_env_keys(tmp_path) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"env": {"ANTHROPIC_MODEL": "main-model", '
+        '"ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-model"}}',
+        encoding="utf-8",
+    )
+
+    assert config_module.local_claude_model(str(settings)) == "main-model"
+    assert (
+        config_module.local_claude_model(
+            str(settings), keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL")
+        )
+        == "opus-model"
+    )
+
+
+def test_local_claude_model_handles_missing_or_invalid_file(tmp_path) -> None:
+    assert config_module.local_claude_model(str(tmp_path / "nope.json")) is None
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json", encoding="utf-8")
+    assert config_module.local_claude_model(str(bad)) is None
 
 
 def test_resolve_codex_bin_uses_default_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -1020,6 +1064,63 @@ def test_claude_backend_streams_bounded_tool_activity_to_logs(
         assert "Agent: Edit completed" in web_messages
         assert "Agent: Response: Finished reviewing" in web_messages
         assert "Agent result complete turns=3 duration=2.5s" in web_messages
+        # Agent activity is DEBUG-only: INFO stays at stage-level milestones.
+        assert all(record.levelno < logging.INFO for record in caplog.records)
+
+    asyncio.run(run_case())
+
+
+def test_claude_backend_records_result_usage_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_case() -> None:
+        class FakeClaudeCodeOptions:
+            def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                self.__dict__.update(kwargs)
+
+        class TextBlock:
+            text = "done"
+
+        class AssistantMessage:
+            content = [TextBlock()]
+
+        class ResultMessage:
+            num_turns = 1
+            duration_ms = 100
+            is_error = False
+            usage = {
+                "input_tokens": 1200,
+                "output_tokens": 300,
+                "cache_read_input_tokens": 5000,
+            }
+            total_cost_usd = 0.042
+
+        async def fake_query(*, prompt: str, options: FakeClaudeCodeOptions):  # type: ignore[no-untyped-def]
+            yield AssistantMessage()
+            yield ResultMessage()
+
+        monkeypatch.setattr(
+            agent,
+            "_load_claude_sdk",
+            lambda: (FakeClaudeCodeOptions, fake_query),
+        )
+        config = AuditConfig(
+            target="/tmp/project",
+            output_dir=str(tmp_path),
+            backend="claude",
+        )
+
+        result = await agent._run_claude_agent("prompt", config, cwd="/tmp/project")
+
+        assert result == "done"
+        assert config.usage_stats == {
+            "agent_calls": 1,
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "cache_read_input_tokens": 5000,
+            "cost_usd": 0.042,
+        }
 
     asyncio.run(run_case())
 

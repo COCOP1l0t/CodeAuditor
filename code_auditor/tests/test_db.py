@@ -197,6 +197,62 @@ def test_scan_output_dir_ignores_invalid_trigger_graph(tmp_path) -> None:
     assert poc["trigger_graph_path"] == ""
 
 
+def test_record_run_stores_models_used(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    config = _make_config(tmp_path, out)
+    config.models_used.extend(["model-a", "model-b"])
+    store = AuditStore(str(tmp_path / "history.db"))
+
+    run_id = store.record_run(config, status=RUN_DONE)
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert json.loads(run["models_used"]) == ["model-a", "model-b"]
+
+
+def test_finish_run_updates_models_used(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(_make_config(tmp_path, out), started_at=100.0)
+
+    store.finish_run(run_id, RUN_DONE, models_used=["model-a"])
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert json.loads(run["models_used"]) == ["model-a"]
+
+
+def test_record_run_stores_usage_stats(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    config = _make_config(tmp_path, out)
+    config.usage_stats.update(
+        {"agent_calls": 3, "input_tokens": 1500, "output_tokens": 250, "cost_usd": 0.05}
+    )
+    store = AuditStore(str(tmp_path / "history.db"))
+
+    run_id = store.record_run(config, status=RUN_DONE)
+
+    run = store.get_run(run_id)
+    assert run is not None
+    stats = json.loads(run["usage_stats"])
+    assert stats["agent_calls"] == 3
+    assert stats["input_tokens"] == 1500
+    assert stats["output_tokens"] == 250
+    assert stats["cost_usd"] == 0.05
+
+
+def test_finish_run_updates_usage_stats(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(_make_config(tmp_path, out), started_at=100.0)
+
+    store.finish_run(run_id, RUN_DONE, usage_stats={"agent_calls": 1, "cost_usd": 0.01})
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert json.loads(run["usage_stats"]) == {"agent_calls": 1, "cost_usd": 0.01}
+
+
 def test_scan_output_dir_missing_dir_returns_empty(tmp_path) -> None:
     artifacts = scan_output_dir(str(tmp_path / "nope"))
     assert artifacts == {

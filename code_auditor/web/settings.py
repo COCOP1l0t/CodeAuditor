@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,10 +14,8 @@ DEFAULT_STATE_DIR = os.path.join("~", ".code_auditor")
 DEFAULT_SETTINGS_PATH = os.path.join(DEFAULT_STATE_DIR, "settings.json")
 LEGACY_WEB_CONFIG_FILENAME = "web-config.json"
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
-_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
 _CONFIG_KEYS = {
     "backend",
-    "model",
     "log_level",
     "max_parallel",
     "repos_dir",
@@ -36,7 +33,6 @@ class WebSettings:
     config_path: str
     state_dir: str
     backend: str
-    model: str | None
     log_level: str
     max_parallel: int
     repos_dir: str
@@ -49,7 +45,6 @@ class WebSettings:
         state_dir: str,
         *,
         backend: str = DEFAULT_BACKEND,
-        model: str | None = None,
         log_level: str = "DEBUG",
         max_parallel: int = 1,
     ) -> "WebSettings":
@@ -59,7 +54,6 @@ class WebSettings:
             os.path.join(root, "settings.json"),
             {
                 "backend": backend,
-                "model": model,
                 "log_level": log_level,
                 "max_parallel": max_parallel,
                 "repos_dir": os.path.join(root, "repo"),
@@ -71,7 +65,6 @@ class WebSettings:
     def serialized(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
-            "model": self.model,
             "log_level": self.log_level,
             "max_parallel": self.max_parallel,
             "repos_dir": self.repos_dir,
@@ -113,6 +106,7 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
             raise WebSettingsError("Web settings must be a JSON object.")
         raw.pop("wiki_path", None)
         raw.pop("discovered_path", None)
+        raw.pop("model", None)
         unknown = sorted(set(raw) - _CONFIG_KEYS)
         if unknown:
             raise WebSettingsError(f"Unknown web settings: {', '.join(unknown)}")
@@ -145,12 +139,14 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
     )
     raw.pop("wiki_path", None)
     raw.pop("discovered_path", None)
+    # model is now resolved from ~/.claude/settings.json at agent call time.
+    removed_model = raw.pop("model", None) is not None
     unknown = sorted(set(raw) - _CONFIG_KEYS)
     if unknown:
         raise WebSettingsError(
             f"Unknown web settings: {', '.join(unknown)}"
         )
-    if removed_legacy_paths and not migrated_legacy_file:
+    if (removed_legacy_paths or removed_model) and not migrated_legacy_file:
         _write_settings_file(config_path, {**defaults, **raw})
     os.chmod(config_path, 0o600)
     return _validate_settings(config_path, {**defaults, **raw})
@@ -161,13 +157,6 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
     backend = raw.get("backend")
     if backend not in {"claude", "codex"}:
         raise WebSettingsError("backend must be 'claude' or 'codex'.")
-    model = raw.get("model")
-    if model == "":
-        model = None
-    if model is not None and (
-        not isinstance(model, str) or _MODEL_RE.fullmatch(model) is None
-    ):
-        raise WebSettingsError("model contains unsupported characters.")
     log_level = raw.get("log_level")
     if not isinstance(log_level, str) or log_level.upper() not in _LOG_LEVELS:
         raise WebSettingsError("log_level must be DEBUG, INFO, WARNING, or ERROR.")
@@ -189,7 +178,6 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         config_path=os.path.realpath(config_path),
         state_dir=state_dir,
         backend=backend,
-        model=model,
         log_level=log_level.upper(),
         max_parallel=max_parallel,
         repos_dir=managed_paths["repos_dir"],

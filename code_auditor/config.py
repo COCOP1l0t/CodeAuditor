@@ -44,6 +44,9 @@ class AuditConfig:
     known_disclosures: tuple[dict[str, Any], ...] = field(
         default_factory=tuple, repr=False
     )
+    # Runtime-only collector for per-task agent failures (stage3-6). Entries
+    # are summarized into the run record's error field at the end of the audit.
+    task_errors: list[str] = field(default_factory=list, repr=False)
     # Model ids actually used by agent invocations, in first-use order.
     models_used: list[str] = field(default_factory=list, repr=False)
     # Runtime-only accumulator of token/cost usage across agent invocations.

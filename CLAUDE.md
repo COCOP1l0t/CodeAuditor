@@ -62,12 +62,14 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 - **Prompt templates**: `prompts/stageN.md` with `__KEY__` placeholders, loaded via `prompts.py:load_prompt()`
 - **Directive injection**: Stage 1 produces auditing focus and vulnerability criteria directives; injected into Stage 2 (scope/hot-spots), Stage 3 (both), and Stage 4 (vuln criteria only)
 - **Validation + retry**: Each agent output is validated; on failure, a repair prompt is sent (up to `max_retries`)
+- **Task failure surfacing**: Failed parallel sub-tasks are collected in `config.task_errors`; any failure marks the run `failed` with a summary in the `error` field. Agent error results (e.g. API 429 quota exhaustion) raise instead of passing silently, and non-retryable errors fail fast without retries. Web History offers Resume for cancelled, failed, and done-with-errors runs.
 - **Model resolution**: The model id is resolved fresh on every agent call — explicit per-call model > local `~/.claude/settings.json` (`env.ANTHROPIC_MODEL`, PoC stages prefer `ANTHROPIC_DEFAULT_OPUS_MODEL`) > stored config value > built-in default (`config.resolve_agent_model` / `select_poc_model`). Models actually used accumulate in `config.models_used` and are persisted to the run's `models_used` column for the Web UI.
 - **Usage accounting**: Every agent invocation's token usage and dollar cost (Claude `ResultMessage`, Codex `tokenUsage` events) accumulate in `config.usage_stats` via `utils.record_agent_usage()` and are persisted to the run's `usage_stats` JSON column; shown in Web History and the run detail page.
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
 - **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
 - **Web settings boundary**: backend/model/log level and managed paths come only from `~/.code_auditor/settings.json`; browser requests cannot override them
+- **Logging tiers**: INFO is reserved for stage-level milestones (`Stage N: ...`); per-tool-call agent activity, subagent lifecycle, and per-file validation results log at DEBUG and always persist to the task's `agent.log` regardless of level
 - **Web Wiki discovery**: optional Wikis are discovered from `~/.code_auditor/wiki/` and selected by opaque local name; `wiki_path` is not a Web config field
 - **Disclosure storage boundary**: SQLite owns Disclosure metadata, review status, dedupe identity, and artifact indexes; Stage 5/6 reports remain filesystem artifacts and there is no registry-path setting
 

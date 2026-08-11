@@ -1094,6 +1094,12 @@ async function loadHistory() {
           badge.className = `badge badge-${run.status}`;
           badge.textContent = run.status;
           td.appendChild(badge);
+          if (run.status === "done" && run.error) {
+            const warn = document.createElement("span");
+            warn.textContent = " ⚠";
+            warn.title = run.error;
+            td.appendChild(warn);
+          }
         } else {
           td.textContent = c ?? "—";
         }
@@ -1101,7 +1107,11 @@ async function loadHistory() {
       }
       const actionCell = document.createElement("td");
       actionCell.className = "history-action";
-      if (run.status === "cancelled") {
+      if (
+        run.status === "cancelled" ||
+        run.status === "failed" ||
+        (run.status === "done" && run.error)
+      ) {
         const resumeButton = document.createElement("button");
         resumeButton.type = "button";
         resumeButton.className = "btn btn-resume";

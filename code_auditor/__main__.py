@@ -20,6 +20,7 @@ from .logger import configure_logging, get_logger
 from .orchestrator import run_audit
 from .repos import default_audit_output_dir, ensure_repo_sync
 from .tui import TUIManager
+from .utils import summarize_task_errors
 
 logger = get_logger("main")
 
@@ -202,6 +203,8 @@ def main() -> None:
             try:
                 _seed_aus_safely(args.db, config)
                 await run_audit(config, tui=tui)
+                error = summarize_task_errors(config.task_errors)
+                status = RUN_FAILED if error else RUN_DONE
             except asyncio.CancelledError:
                 status = RUN_CANCELLED
                 raise
@@ -235,7 +238,14 @@ def main() -> None:
             _persist_run_safely(args.db, config, RUN_FAILED, str(e), started_at)
             print(f"\nError: {e}", file=sys.stderr)
             sys.exit(1)
-        _persist_run_safely(args.db, config, RUN_DONE, "", started_at)
+        task_error_summary = summarize_task_errors(config.task_errors)
+        _persist_run_safely(
+            args.db,
+            config,
+            RUN_FAILED if task_error_summary else RUN_DONE,
+            task_error_summary,
+            started_at,
+        )
 
 
 if __name__ == "__main__":

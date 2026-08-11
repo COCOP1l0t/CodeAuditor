@@ -12,7 +12,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from code_auditor.config import AuditConfig
-from code_auditor.db import RUN_CANCELLED, compute_target_key
+from code_auditor.db import RUN_CANCELLED, RUN_DONE, compute_target_key
 from code_auditor.web import create_app
 from code_auditor.web import job as job_module
 from code_auditor.web.job import (
@@ -404,6 +404,92 @@ async def test_resume_cancelled_job_keeps_run_cancelled_when_checkout_fails(
     assert manager.state == STATE_FAILED
     assert manager.error == "Cannot restore recorded checkout"
     assert store.resumed == []
+
+
+async def test_resume_cancelled_job_auto_stashes_dirty_checkout(
+    tmp_path, monkeypatch
+) -> None:
+    target = tmp_path / "repo" / "example.com" / "team" / "project"
+    output = tmp_path / "results" / "project" / "audit-output-deadbeef"
+    target.mkdir(parents=True)
+    output.mkdir(parents=True)
+    identity = {
+        "repo_name": "project",
+        "repo_url": "https://example.com/team/project.git",
+        "branch": "main",
+        "commit": "a" * 40,
+        "dirty": False,
+        "submodules": [],
+    }
+    run = {
+        "id": 21,
+        "status": RUN_CANCELLED,
+        "target": str(target),
+        "output_dir": str(output),
+        "wiki_path": None,
+        "backend": "claude",
+        "model": "test-model",
+        "max_parallel": 2,
+        "target_au_count": -1,
+        "log_level": "DEBUG",
+        "dirty": 0,
+        "branch": "main",
+        "commit": "a" * 40,
+        "target_key": compute_target_key(identity),
+    }
+
+    class FakeStore:
+        def get_run(self, run_id):
+            return run if run_id == 21 else None
+
+        def disclosure_dedupe_index(self):
+            return []
+
+        def resume_cancelled_run(self, run_id):
+            run["status"] = "running"
+            return True
+
+        def seed_analysis_units(self, target_key, output_dir):
+            return 0
+
+        def finish_run(self, *args):
+            pass
+
+    state = {"dirty": True}
+    git_calls = []
+
+    async def fake_git(_target, *args, timeout_seconds=60.0):
+        git_calls.append(args)
+        if args[:2] == ("stash", "push"):
+            state["dirty"] = False
+        return ""
+
+    async def fake_checkout(*args):
+        pass
+
+    async def fake_run_audit(config, tui=None):
+        pass
+
+    monkeypatch.setattr(
+        job_module,
+        "capture_repo_identity",
+        lambda _path: dict(identity, dirty=state["dirty"]),
+    )
+    monkeypatch.setattr(job_module, "_run_resume_git_command", fake_git)
+    monkeypatch.setattr(job_module, "_checkout_recorded_revision", fake_checkout)
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    manager = AuditJobManager(store=FakeStore())
+
+    await manager.resume_cancelled(
+        21,
+        repos_dir=str(tmp_path / "repo"),
+        results_dir=str(tmp_path / "results"),
+        wikis_dir=str(tmp_path / "wiki"),
+    )
+    await manager._task
+
+    assert git_calls and git_calls[0][:2] == ("stash", "push")
+    assert manager.state == STATE_DONE
 
 
 async def test_checkout_recorded_revision_restores_commit_and_branch(tmp_path) -> None:
@@ -1326,6 +1412,96 @@ def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> No
 def test_api_resume_missing_history_run_returns_404(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
     assert client.post("/api/history/999/resume").status_code == 404
+
+
+def test_api_resumes_done_history_run_with_task_errors(tmp_path, monkeypatch) -> None:
+    app = _make_app(tmp_path)
+    target = _make_managed_repo(tmp_path)
+    output = _make_output_dir(tmp_path)
+    identity = {
+        "repo_name": "repo",
+        "repo_url": "https://github.com/user/repo.git",
+        "branch": "main",
+        "commit": "c" * 40,
+        "dirty": False,
+        "submodules": [],
+    }
+    run_id = app.state.store.create_run(
+        AuditConfig(target=target, output_dir=output),
+        started_at=100.0,
+    )
+    app.state.store.set_run_identity(run_id, identity)
+    app.state.store.finish_run(
+        run_id, RUN_DONE, "2 agent task(s) failed: stage5:H-03", ended_at=200.0
+    )
+    audited = []
+
+    async def fake_run_audit(config, tui=None):
+        audited.append(config)
+
+    monkeypatch.setattr(job_module, "capture_repo_identity", lambda _path: identity)
+
+    async def fake_checkout(_target, commit, branch):
+        assert commit == identity["commit"]
+
+    monkeypatch.setattr(job_module, "_checkout_recorded_revision", fake_checkout)
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/history/{run_id}/resume")
+        assert response.status_code == 202
+        _wait_for_state(app, STATE_DONE)
+
+        detail = client.get(f"/api/history/{run_id}").json()
+        assert detail["status"] == STATE_DONE
+
+    assert len(audited) == 1
+    assert audited[0].output_dir == output
+    assert audited[0].resume is True
+
+
+def test_api_rejects_resume_of_clean_done_history_run(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    target = _make_managed_repo(tmp_path)
+    output = _make_output_dir(tmp_path)
+    run_id = app.state.store.create_run(
+        AuditConfig(target=target, output_dir=output),
+        started_at=100.0,
+    )
+    app.state.store.finish_run(run_id, RUN_DONE, "", ended_at=200.0)
+
+    client = TestClient(app)
+    assert client.post(f"/api/history/{run_id}/resume").status_code == 400
+
+
+async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    params = AuditStartParams(target=str(target))
+    manager = AuditJobManager(store=None)
+    manager.reporter = WebProgressReporter(EventBus())
+    config = manager._build_config(params, str(target), None)
+    manager.config = config
+    manager.state = STATE_RUNNING
+    manager.kind = "audit"
+
+    async def fake_run_audit(cfg, tui=None):
+        cfg.models_used.append("model-x")
+        cfg.usage_stats.update({"agent_calls": 2, "input_tokens": 900, "cost_usd": 0.03})
+        cfg.task_errors.append("stage5:H-03: Agent ended with an error result: API Error: 400")
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+
+    await manager._run(config, params, None)
+
+    assert manager.state == STATE_FAILED
+    assert "stage5:H-03" in manager.error
+    assert manager.status()["models_used"] == ["model-x"]
+    assert manager.status()["usage_stats"] == {
+        "agent_calls": 2,
+        "input_tokens": 900,
+        "cost_usd": 0.03,
+    }
 
 
 def test_api_history_import_and_detail(tmp_path) -> None:

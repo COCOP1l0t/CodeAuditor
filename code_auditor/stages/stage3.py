@@ -10,7 +10,7 @@ from ..checkpoint import CheckpointManager
 from ..config import AnalysisUnit, AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
-from ..utils import format_validation_issues, list_matching_files, run_parallel_limited
+from ..utils import format_validation_issues, list_matching_files, record_task_error, run_parallel_limited
 from ..validation.stage3 import validate_stage3_file
 from ..wiki import build_wiki_context
 
@@ -137,6 +137,7 @@ async def run_stage3(
             continue
         if status == "rejected":
             logger.error("Stage 3: %s failed: %s", units[i].id, error)
+            record_task_error(config, "stage3", units[i].id, error)
             continue
         if value:
             all_finding_files.extend(value)

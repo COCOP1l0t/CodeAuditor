@@ -14,6 +14,7 @@ from ..utils import (
     natural_sort_key,
     format_validation_issues,
     list_json_files,
+    record_task_error,
     run_parallel_limited,
 )
 from ..validation.stage4 import validate_stage4_file
@@ -266,6 +267,9 @@ async def run_stage4(
             continue
         if status == "rejected":
             logger.error("Stage 4: %s failed: %s", os.path.basename(finding_files[i]), error)
+            record_task_error(
+                config, "stage4", os.path.basename(finding_files[i]), error
+            )
             continue
         if value:
             confirmed_pending.append(value)

@@ -1044,7 +1044,7 @@ def test_claude_backend_streams_bounded_tool_activity_to_logs(
         )
         log_file = tmp_path / "agent.log"
 
-        with caplog.at_level(logging.INFO, logger="code_auditor.agent"):
+        with caplog.at_level(logging.DEBUG, logger="code_auditor.agent"):
             result = await agent._run_claude_agent(
                 "prompt",
                 config,
@@ -1167,7 +1167,7 @@ def test_claude_backend_rate_limits_thinking_token_events(
         )
         log_file = tmp_path / "agent.log"
 
-        with caplog.at_level(logging.INFO, logger="code_auditor.agent"):
+        with caplog.at_level(logging.DEBUG, logger="code_auditor.agent"):
             result = await agent._run_claude_agent(
                 "prompt",
                 config,

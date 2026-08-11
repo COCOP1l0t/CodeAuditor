@@ -24,7 +24,7 @@ from ..config import (
     local_claude_model,
     resolve_wiki_arg,
 )
-from ..db import RUN_CANCELLED, AuditStore, compute_target_key
+from ..db import RUN_CANCELLED, RUN_DONE, RUN_FAILED, AuditStore, compute_target_key
 from ..logger import get_logger
 from ..orchestrator import run_audit
 from ..repos import (
@@ -33,8 +33,10 @@ from ..repos import (
     capture_repo_identity,
     default_audit_output_dir,
     ensure_repo,
+    repo_local_path,
 )
 from ..stages.stage5 import run_stage5
+from ..utils import summarize_task_errors
 from ..wikis import DEFAULT_WIKIS_DIR, list_local_wikis
 from .progress import EventBus, WebLogHandler, WebProgressReporter
 
@@ -264,6 +266,40 @@ async def _create_detached_worktree(repo: str, commit: str, destination: str) ->
         )
 
 
+async def _stash_resume_leftovers(target: str, run_id: int) -> None:
+    """Stash tracked leftover changes (e.g. from older PoC agents) before resume."""
+    output = await _run_resume_git_command(
+        target,
+        "stash",
+        "push",
+        "-m",
+        f"code-auditor auto-stash before resuming run #{run_id}",
+    )
+    logger.warning(
+        "Auto-stashed leftover changes in %s before resuming run #%d.%s",
+        target,
+        run_id,
+        f" git: {output}" if output else "",
+    )
+
+
+async def _stash_resume_leftovers(target: str, run_id: int) -> None:
+    """Stash tracked leftover changes (e.g. from older PoC agents) before resume."""
+    output = await _run_resume_git_command(
+        target,
+        "stash",
+        "push",
+        "-m",
+        f"code-auditor auto-stash before resuming run #{run_id}",
+    )
+    logger.warning(
+        "Auto-stashed leftover changes in %s before resuming run #%d.%s",
+        target,
+        run_id,
+        f" git: {output}" if output else "",
+    )
+
+
 class AuditJobManager:
     def __init__(self, store: AuditStore | None = None) -> None:
         self.bus = EventBus()
@@ -372,11 +408,21 @@ class AuditJobManager:
         except ValueError as e:
             raise JobValidationError(str(e)) from e
 
-        # With a git URL the target is only known after cloning, which happens
-        # inside the job task so clone logs stream to the browser.
         config: AuditConfig | None = None
-        if not params.git_url:
-            config = self._build_config(params, os.path.realpath(params.target or ""), wiki_path)
+        if params.git_url:
+            # Pre-compute the target path so the run appears in History
+            # immediately, before the clone finishes inside _run().
+            target = repo_local_path(params.git_url, params.repos_dir)
+            if os.path.isdir(target):
+                config = self._build_config(params, target, wiki_path)
+            else:
+                config = self._build_preliminary_config(
+                    params, target, wiki_path
+                )
+        else:
+            config = self._build_config(
+                params, os.path.realpath(params.target or ""), wiki_path
+            )
 
         self.bus.clear()
         self.reporter = WebProgressReporter(self.bus)
@@ -391,8 +437,7 @@ class AuditJobManager:
         self._run_id = None
         self.reproduction_candidate = None
         self.reproduction_reports = []
-        if config is not None:
-            self._create_run_row(config)
+        self._create_run_row(config)
         self.bus.publish(
             {
                 "type": "job",
@@ -422,8 +467,14 @@ class AuditJobManager:
         run = self.store.get_run(run_id)
         if run is None:
             raise JobValidationError(f"Run not found: {run_id}")
-        if run.get("status") != RUN_CANCELLED:
-            raise JobValidationError("Only cancelled audit runs can be continued.")
+        run_status = str(run.get("status") or "")
+        if run_status not in (RUN_CANCELLED, RUN_FAILED) and not (
+            run_status == RUN_DONE and run.get("error")
+        ):
+            raise JobValidationError(
+                "Only cancelled, failed, or partially failed (done with errors) "
+                "audit runs can be continued."
+            )
         if run.get("dirty"):
             raise JobValidationError(
                 "This run was recorded from a dirty checkout and cannot be safely continued."
@@ -456,9 +507,15 @@ class AuditJobManager:
             )
         current_identity = capture_repo_identity(target)
         if current_identity.get("dirty"):
-            raise JobValidationError(
-                "The source checkout has uncommitted changes; clean it before continuing."
-            )
+            # Older runs let PoC agents work inside the shared mirror, which
+            # could leave it dirty. Stash the leftovers instead of refusing.
+            await _stash_resume_leftovers(target, run_id)
+            current_identity = capture_repo_identity(target)
+            if current_identity.get("dirty"):
+                raise JobValidationError(
+                    "The source checkout still has uncommitted or untracked changes "
+                    "after an automatic `git stash`; clean it before continuing."
+                )
 
         backend = str(run.get("backend") or "")
         if backend not in {"claude", "codex"}:
@@ -575,7 +632,7 @@ class AuditJobManager:
         assert self.store is not None
         try:
             logger.info(
-                "Restoring cancelled Run #%d to commit %s.",
+                "Restoring Run #%d to commit %s.",
                 run_id,
                 recorded_commit,
             )
@@ -601,7 +658,7 @@ class AuditJobManager:
                 )
             if not self.store.resume_cancelled_run(run_id):
                 raise JobConflictError(
-                    "The run is no longer cancelled; refresh History and try again."
+                    "The run is no longer resumable; refresh History and try again."
                 )
         except asyncio.CancelledError:
             self.state = STATE_CANCELLED
@@ -744,6 +801,34 @@ class AuditJobManager:
             ),
         )
 
+    def _build_preliminary_config(
+        self, params: AuditStartParams, target: str, wiki_path: str | None
+    ) -> AuditConfig:
+        """Build a config for a repo that has not been cloned yet.
+
+        The output_dir uses a date-based stamp because the commit is unknown
+        until the clone completes. ``_run`` updates it afterwards.
+        """
+        output_dir = os.path.realpath(
+            params.output_dir
+            or default_audit_output_dir(target, results_dir=params.results_dir)
+        )
+        return AuditConfig(
+            target=target,
+            output_dir=output_dir,
+            wiki_path=wiki_path,
+            max_parallel=params.max_parallel,
+            resume=True,
+            log_level=params.log_level,
+            backend=params.backend,  # type: ignore[arg-type]
+            model=self._resolve_model(params),
+            target_au_count=params.target_au_count,
+            agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+            known_disclosures=tuple(
+                self.store.disclosure_dedupe_index() if self.store else ()
+            ),
+        )
+
     @staticmethod
     def _resolve_model(params: AuditStartParams) -> str | None:
         """Resolve the effective model for config creation.
@@ -788,14 +873,24 @@ class AuditJobManager:
         try:
             if params.git_url:
                 target = await ensure_repo(params.git_url, params.repos_dir)
+                prev_output_dir = config.output_dir if config else None
                 config = self._build_config(params, target, wiki_path)
                 self.config = config
-                self._create_run_row(config)
+                if (
+                    self.store is not None
+                    and self._run_id is not None
+                    and prev_output_dir
+                    and config.output_dir != prev_output_dir
+                ):
+                    self.store.update_run_output_dir(
+                        self._run_id, config.output_dir
+                    )
             assert config is not None
             self._seed_analysis_units(config)
             logger.info("Starting audit of %s (web UI)", config.target)
             await run_audit(config, tui=self.reporter)
-            self.state = STATE_DONE
+            self.error = summarize_task_errors(config.task_errors)
+            self.state = STATE_FAILED if self.error else STATE_DONE
         except asyncio.CancelledError:
             self.state = STATE_CANCELLED
             logger.info("Audit cancelled.")

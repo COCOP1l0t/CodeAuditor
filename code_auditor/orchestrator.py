@@ -104,4 +104,10 @@ async def run_audit(config: AuditConfig, tui: TUIManager | None = None) -> None:
     if tui:
         tui.end_stage(6)
 
+    if config.task_errors:
+        logger.error(
+            "Audit finished with %d failed agent task(s): %s",
+            len(config.task_errors),
+            "; ".join(config.task_errors),
+        )
     logger.info("Audit complete.")

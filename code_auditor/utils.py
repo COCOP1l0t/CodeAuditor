@@ -57,6 +57,32 @@ def list_matching_files(dir_path: str, pattern: re.Pattern[str]) -> list[str]:
     return sorted((str(f) for f in p.iterdir() if f.is_file() and pattern.search(f.name)), key=natural_sort_key)
 
 
+# Timestamped SDK/CLI log lines (e.g. "2026-08-08T13:48:08.035Z [DEBUG] ...")
+# that leak into exception messages via captured stderr.
+_SDK_LOG_LINE_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?\s+"
+    r"\[(?:TRACE|DEBUG|INFO|WARNING|ERROR)\]"
+)
+
+
+def sanitize_task_error_text(text: str, max_chars: int = 200) -> str:
+    """Strip SDK debug-log noise from an agent error and bound its length."""
+    lines = [line.strip() for line in text.splitlines()]
+    kept = [
+        line for line in lines if line and not _SDK_LOG_LINE_PATTERN.match(line)
+    ]
+    cleaned = " ".join(" ".join(kept).split()) or " ".join(text.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1] + "…"
+
+
+def record_task_error(config: Any, stage: str, task_id: str, error: BaseException | None) -> None:
+    """Record one failed parallel sub-task for end-of-run summarization."""
+    text = sanitize_task_error_text(str(error)) if error else "unknown error"
+    config.task_errors.append(f"{stage}:{task_id}: {text}")
+
+
 # Token-usage key variants emitted by the Claude SDK (snake_case) and the
 # Codex app-server protocol (camelCase).
 _USAGE_KEY_ALIASES = {
@@ -100,6 +126,18 @@ def record_agent_usage(
     number = _usage_number(cost_usd)
     if number is not None:
         stats["cost_usd"] = stats.get("cost_usd", 0.0) + number
+
+
+def summarize_task_errors(task_errors: list[str], max_chars: int = 1000) -> str:
+    """Build the run-record error summary from collected task failures."""
+    if not task_errors:
+        return ""
+    ids = [":".join(entry.split(":", 2)[:2]) for entry in task_errors]
+    summary = f"{len(task_errors)} agent task(s) failed: " + ", ".join(ids)
+    summary += f". First error: {task_errors[0]}"
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1] + "…"
+    return summary
 
 
 def format_validation_issues(issues: list[ValidationIssue]) -> str:

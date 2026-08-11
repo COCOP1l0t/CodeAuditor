@@ -454,10 +454,12 @@ def scan_output_dir(
 
     pocs_dir = base / "stage5-pocs"
     if pocs_dir.is_dir():
+        scanned_vuln_ids: set[str] = set()
         for report in sorted(pocs_dir.glob("*/report.md")):
             vuln_id = report.parent.name
             if vuln_id.endswith("_fp"):
                 vuln_id = vuln_id[: -len("_fp")]
+            scanned_vuln_ids.add(vuln_id)
             status = read_reproduction_status(str(report)) or "unknown"
             trigger_graph = report.parent / TRIGGER_GRAPH_FILENAME
             trigger_graph_path = ""
@@ -485,6 +487,29 @@ def scan_output_dir(
                         if asan_report.is_file()
                         else ""
                     ),
+                }
+            )
+        # PoC tasks whose agent died before writing a report (e.g. API quota
+        # exhaustion) leave a directory without report.md. Record them as
+        # errors so History shows the gap instead of hiding it.
+        for entry in sorted(pocs_dir.iterdir()):
+            if not entry.is_dir() or (entry / "report.md").is_file():
+                continue
+            vuln_id = entry.name
+            if vuln_id.endswith("_fp"):
+                vuln_id = vuln_id[: -len("_fp")]
+            if (
+                vuln_id in scanned_vuln_ids
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", vuln_id) is None
+            ):
+                continue
+            result["pocs"].append(
+                {
+                    "vuln_id": vuln_id,
+                    "status": "error",
+                    "report_path": "",
+                    "trigger_graph_path": "",
+                    "asan_report_path": "",
                 }
             )
 
@@ -1034,22 +1059,35 @@ class AuditStore:
         return run_ids
 
     def resume_cancelled_run(self, run_id: int) -> bool:
-        """Atomically move one cancelled run back to the running state.
+        """Atomically move one resumable run back to the running state.
 
-        The original row and ``started_at`` are preserved so History keeps one
-        lifecycle for a checkpoint-resumed audit instead of inventing a second
-        audit record for the same output tree.
+        Resumable means cancelled, failed, or done with recorded task errors
+        (partial failure). The original row and ``started_at`` are preserved
+        so History keeps one lifecycle for a checkpoint-resumed audit instead
+        of inventing a second audit record for the same output tree.
         """
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE runs
                 SET status = ?, error = '', ended_at = NULL
-                WHERE id = ? AND status = ?
+                WHERE id = ? AND (status IN (?, ?) OR (status = ? AND error != ''))
                 """,
-                (RUN_RUNNING, run_id, RUN_CANCELLED),
+                (RUN_RUNNING, run_id, RUN_CANCELLED, RUN_FAILED, RUN_DONE),
             )
             return cursor.rowcount == 1
+
+    def update_run_output_dir(self, run_id: int, output_dir: str) -> None:
+        """Update the output directory of an existing run.
+
+        Used when a git-clone audit's preliminary output_dir (date-based) is
+        replaced by the commit-stamped directory after cloning completes.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET output_dir = ? WHERE id = ?",
+                (output_dir, run_id),
+            )
 
     def record_run(
         self,
@@ -1240,7 +1278,11 @@ class AuditStore:
                     len(artifacts["findings"]),
                     len(artifacts["vulnerabilities"]),
                     reproduced,
-                    len(artifacts["disclosures"]),
+                    sum(
+                        1
+                        for d in artifacts["disclosures"]
+                        if d["report_path"]
+                    ),
                     run_id,
                 ),
             )
@@ -1461,6 +1503,22 @@ class AuditStore:
                 ).fetchall()
             ]
             run["reproduced_vulns_count"] = len(run["vulnerabilities"])
+            # Non-reproduced PoC outcomes (error/false-positive/not-reproduced)
+            # so the detail view can show which tasks did not produce a PoC.
+            run["poc_issues"] = [
+                dict(r)
+                for r in conn.execute(
+                    f"""
+                    SELECT v.vuln_id, v.severity, v.cvss_score, v.title,
+                           p.status AS poc_status
+                    FROM vulnerabilities v
+                    JOIN pocs p ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+                    WHERE v.run_id = ? AND p.status NOT IN ({status_placeholders})
+                    ORDER BY v.vuln_id
+                    """,
+                    (run_id, *statuses),
+                ).fetchall()
+            ]
             aus = [
                 dict(r)
                 for r in conn.execute(

@@ -11,7 +11,7 @@ from ..logger import get_logger
 from ..poc_artifacts import ASAN_REPORT_FILENAME, TRIGGER_GRAPH_FILENAME
 from ..prompts import load_prompt
 from ..reproduction_status import is_failed_status, read_reproduction_status
-from ..utils import format_validation_issues, run_parallel_limited
+from ..utils import format_validation_issues, record_task_error, run_parallel_limited
 from ..validation.stage5 import validate_stage5_trigger_graph
 from ..wiki import build_wiki_context
 
@@ -214,6 +214,12 @@ async def run_stage5(
             continue
         if status == "rejected":
             logger.error("Stage 5: %s failed: %s", os.path.basename(vuln_files[i]), error)
+            record_task_error(
+                config,
+                "stage5",
+                os.path.splitext(os.path.basename(vuln_files[i]))[0],
+                error,
+            )
             continue
         if value:
             reports.append(value)

@@ -15,7 +15,7 @@ from ..logger import get_logger
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
 from ..reproduction_status import is_failed_status, is_reproduced_status, read_reproduction_status
-from ..utils import run_parallel_limited
+from ..utils import record_task_error, run_parallel_limited
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage6")
@@ -490,6 +490,12 @@ async def run_stage6(
             continue
         if status == "rejected":
             logger.error("Stage 6: %s failed: %s", os.path.basename(candidates[i].report_path), error)
+            record_task_error(
+                config,
+                "stage6",
+                os.path.basename(os.path.dirname(candidates[i].report_path)),
+                error,
+            )
             continue
         if value:
             disclosure_reports.append(value)

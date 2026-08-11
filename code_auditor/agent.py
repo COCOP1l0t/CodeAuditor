@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import subprocess
 import time
 from contextvars import ContextVar
@@ -28,6 +29,20 @@ AGENT_NOISY_SYSTEM_EVENTS = {
 }
 
 logger = get_logger("agent")
+
+# Errors that retrying cannot fix (quota/credit exhaustion, auth failures).
+# Fail fast instead of burning AGENT_MAX_RETRIES attempts on each task.
+_NON_RETRYABLE_AGENT_ERROR_PATTERN = re.compile(
+    r"no left credit|insufficient\s*(credit|balance|quota)|quota exceeded"
+    r"|invalid\s*api[\s_-]*key|authentication failed|unauthorized"
+    r"|supported api model names|invalid[ _-]model|model not found|unknown model"
+    r"|\b401\b|\b403\b",
+    re.IGNORECASE,
+)
+
+
+def _is_non_retryable_agent_error(exc: BaseException) -> bool:
+    return bool(_NON_RETRYABLE_AGENT_ERROR_PATTERN.search(str(exc)))
 
 class _KillableProcess(Protocol):
     def kill(self) -> object:
@@ -410,14 +425,19 @@ def _tool_input_summary(tool_name: str, tool_input: object) -> str:
 
 
 def _record_agent_activity(log_fh: TextIO | None, activity: str) -> None:
-    """Persist one activity line and publish it through the normal Web log bridge."""
+    """Persist one activity line and mirror it to the DEBUG log channel.
+
+    Agent activity is per-tool-call noise: it always lands in the task's
+    agent.log, but only surfaces on the console/Web log when the log level
+    is DEBUG — INFO stays limited to stage-level milestones.
+    """
     line = _compact_agent_activity(activity)
     if not line:
         return
     if log_fh:
         log_fh.write(f"[activity] {line}\n")
         log_fh.flush()
-    logger.info("Agent: %s", line)
+    logger.debug("Agent: %s", line)
 
 
 def _codex_item_activity(method: str, payload: object) -> str | None:
@@ -599,6 +619,7 @@ async def _run_claude_agent(
                     token = _AGENT_PROCESS_REGISTRAR.set(run_control.register_process)
                     tool_names: dict[str, str] = {}
                     last_system_activity_at: dict[str, float] = {}
+                    result_error: list[bool] = []
                     try:
                         async for message in query(prompt=prompt, options=options):
                             if message is None:
@@ -692,13 +713,40 @@ async def _run_claude_agent(
                                 _record_agent_activity(
                                     log_fh, " ".join(result_parts)
                                 )
+                                if is_error:
+                                    result_error.append(True)
+                        if result_error:
+                            # An error ResultMessage (e.g. API 429 quota
+                            # exhaustion) must not be treated as success:
+                            # callers would mark the task complete and skip it
+                            # on resume with no usable output.
+                            tail = _compact_agent_activity(" ".join(parts), 500)
+                            raise RuntimeError(
+                                "Agent ended with an error result: "
+                                + (tail or "no error output")
+                            )
                         return "\n".join(parts)
+                    except Exception as exc:
+                        if result_error:
+                            # The SDK often raises a ProcessError carrying a
+                            # debug-level stderr dump right after an error
+                            # ResultMessage; the agent's own error text is far
+                            # more useful for diagnosing the failure.
+                            tail = _compact_agent_activity(" ".join(parts), 500)
+                            raise RuntimeError(
+                                "Agent ended with an error result: "
+                                + (tail or "no error output")
+                            ) from exc
+                        raise
                     finally:
                         _AGENT_PROCESS_REGISTRAR.reset(token)
 
                 return await collect_messages(text_parts)
             except Exception as exc:
                 last_exc = exc
+                if _is_non_retryable_agent_error(exc):
+                    logger.error("Agent call failed with a non-retryable error: %s", exc)
+                    raise
                 if attempt < AGENT_MAX_RETRIES - 1:
                     delay = AGENT_RETRY_BASE_DELAY * (2 ** attempt)
                     logger.warning(
@@ -893,6 +941,9 @@ async def _run_codex_agent(
                 return await run_codex_turn()
             except Exception as exc:
                 last_exc = exc
+                if _is_non_retryable_agent_error(exc):
+                    logger.error("Codex agent call failed with a non-retryable error: %s", exc)
+                    raise
                 if attempt < AGENT_MAX_RETRIES - 1:
                     delay = AGENT_RETRY_BASE_DELAY * (2 ** attempt)
                     logger.warning(
@@ -930,7 +981,7 @@ async def run_agent(
     status = "failed"
     run_control = _AgentRunControl()
 
-    logger.info(
+    logger.debug(
         "Creating %s subagent subagent_id=%s cwd=%s model=%s log_file=%s",
         config.backend,
         subagent_id,
@@ -978,7 +1029,7 @@ async def run_agent(
         status = "cancelled"
         raise
     finally:
-        logger.info(
+        logger.debug(
             "Destroyed %s subagent subagent_id=%s status=%s elapsed=%.2fs",
             config.backend,
             subagent_id,
@@ -1005,12 +1056,12 @@ async def run_with_validation(
 
     for attempt in range(max_retries + 1):
         if skip_if_missing and not os.path.exists(output_path):
-            logger.info("No output file at %s (filtered or no findings).", output_path)
+            logger.debug("No output file at %s (filtered or no findings).", output_path)
             return True, result
 
         issues = validator(output_path)
         if not issues:
-            logger.info("Validation passed for %s", output_path)
+            logger.debug("Validation passed for %s", output_path)
             return True, result
 
         if attempt == max_retries:

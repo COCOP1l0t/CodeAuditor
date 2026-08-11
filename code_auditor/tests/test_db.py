@@ -13,6 +13,7 @@ from code_auditor.db import (
     DISCLOSURE_TRASH_RETENTION_SECONDS,
     RUN_CANCELLED,
     RUN_DONE,
+    RUN_FAILED,
     RUN_IMPORTED,
     RUN_RUNNING,
     AuditStore,
@@ -195,6 +196,111 @@ def test_scan_output_dir_ignores_invalid_trigger_graph(tmp_path) -> None:
     poc = next(item for item in artifacts["pocs"] if item["vuln_id"] == "H-01")
 
     assert poc["trigger_graph_path"] == ""
+
+
+def test_scan_output_dir_records_poc_dirs_without_report_as_errors(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    dead = out / "stage5-pocs" / "H-03"
+    dead.mkdir()
+    (dead / "agent.log").write_text("API Error: 429\n", encoding="utf-8")
+
+    artifacts = scan_output_dir(str(out))
+
+    statuses = {p["vuln_id"]: p["status"] for p in artifacts["pocs"]}
+    assert statuses == {
+        "H-01": "reproduced",
+        "L-02": "false-positive",
+        "H-03": "error",
+    }
+    error_poc = next(p for p in artifacts["pocs"] if p["vuln_id"] == "H-03")
+    assert error_poc["report_path"] == ""
+    assert error_poc["trigger_graph_path"] == ""
+    assert error_poc["asan_report_path"] == ""
+
+
+def test_record_run_counts_only_completed_disclosures(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    # A disclosure whose agent died before producing any artifact.
+    (out / "stage6-disclosures" / "C-02" / "disclosure").mkdir(parents=True)
+
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(_make_config(tmp_path, out), status=RUN_DONE)
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["disclosures_count"] == 1  # only H-01 has a report
+
+
+def test_get_run_includes_non_reproduced_poc_issues(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    (out / "stage4-vulnerabilities" / "H-03.json").write_text(
+        json.dumps(
+            {
+                "id": "H-03",
+                "title": "Vuln whose PoC agent died",
+                "location": "src/net.c:f",
+                "trigger": "input",
+                "data_flow_trace": {},
+                "severity": "High",
+            }
+        ),
+        encoding="utf-8",
+    )
+    dead = out / "stage5-pocs" / "H-03"
+    dead.mkdir()
+    (dead / "agent.log").write_text("API Error: 429\n", encoding="utf-8")
+
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(_make_config(tmp_path, out), status=RUN_DONE)
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert [v["vuln_id"] for v in run["vulnerabilities"]] == ["H-01"]
+    assert run["reproduced_vulns_count"] == 1
+    issues = {p["vuln_id"]: p["poc_status"] for p in run["poc_issues"]}
+    assert issues == {"H-03": "error"}
+
+
+def test_resume_cancelled_run_accepts_done_with_errors(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        _make_config(tmp_path, out),
+        status=RUN_DONE,
+        error="3 agent task(s) failed: stage5:H-03",
+    )
+
+    assert store.resume_cancelled_run(run_id)
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["status"] == RUN_RUNNING
+    assert run["error"] == ""
+
+
+def test_resume_cancelled_run_rejects_clean_done_run(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(_make_config(tmp_path, out), status=RUN_DONE)
+
+    assert not store.resume_cancelled_run(run_id)
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["status"] == RUN_DONE
+
+
+def test_resume_cancelled_run_accepts_failed_run(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        _make_config(tmp_path, out),
+        status=RUN_FAILED,
+        error="18 agent task(s) failed: stage5:H-03",
+    )
+
+    assert store.resume_cancelled_run(run_id)
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["status"] == RUN_RUNNING
 
 
 def test_record_run_stores_models_used(tmp_path) -> None:

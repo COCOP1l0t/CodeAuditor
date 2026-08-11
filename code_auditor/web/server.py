@@ -1053,6 +1053,11 @@ def create_app(
             )
         return {"ok": True, **store.disclosed_summary()}
 
+    @app.post("/api/disclosures/trash/purge")
+    def purge_all_disclosure_trash() -> dict:
+        removed = store.purge_all_trashed_disclosures()
+        return {"ok": True, "removed": removed, **store.disclosed_summary()}
+
     @app.put("/api/disclosures")
     def update_disclosure(request: DisclosureUpdateRequest) -> dict:
         metadata = request.model_dump(exclude={"project", "dedupe_key", "cve_ids"})

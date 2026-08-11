@@ -1237,6 +1237,34 @@ def test_disclosure_trash_restore_and_expiry(tmp_path) -> None:
         ).fetchone()[0] == 0
 
 
+def test_purge_all_trashed_disclosures(tmp_path) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    db_path = tmp_path / "history.db"
+    store = AuditStore(str(db_path))
+    store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    disclosure = store.list_disclosed()[0]
+    key = disclosure["dedupe_key"]
+    disclosure_dir = out / "stage6-disclosures" / "H-01" / "disclosure"
+    stage5_report = out / "stage5-pocs" / "H-01" / "report.md"
+
+    assert store.purge_all_trashed_disclosures() == 0
+    assert store.list_disclosed()[0]["dedupe_key"] == key
+
+    assert store.trash_disclosure("qemu", key)
+    assert store.purge_all_trashed_disclosures() == 1
+    assert store.list_disclosure_trash() == []
+    assert store.list_disclosed() == []
+    assert not disclosure_dir.exists()
+    assert stage5_report.is_file()
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM disclosed_bugs WHERE dedupe_key = ?", (key,)
+        ).fetchone()[0] == 0
+
+
 def test_confirmed_disclosure_trash_preserves_cve_link_for_restore(tmp_path) -> None:
     out = _make_disclosure_output(tmp_path / "qemu")
     store = AuditStore(str(tmp_path / "history.db"))

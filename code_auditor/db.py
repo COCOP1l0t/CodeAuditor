@@ -2120,6 +2120,13 @@ class AuditStore:
                 conn, time.time() if now is None else now
             )
 
+    def purge_all_trashed_disclosures(self) -> int:
+        """Permanently remove every Disclosure record currently in the trash."""
+        with self._connect() as conn:
+            return self._purge_expired_disclosures(
+                conn, time.time() + DISCLOSURE_TRASH_RETENTION_SECONDS + 1
+            )
+
     def trash_disclosure(
         self,
         project: str,

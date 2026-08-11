@@ -2288,6 +2288,7 @@ async function loadTrash() {
     const entries = data.entries || [];
     updateTrashNavigation(data.total || 0);
     renderTrashProjectOptions(data.projects || []);
+    $("trash-purge-all").disabled = !(data.total || 0);
     $("trash-count").textContent = search || project
       ? `${data.matches || 0} of ${data.total || 0} records`
       : `${data.total || 0} record${data.total === 1 ? "" : "s"}`;
@@ -2350,6 +2351,30 @@ async function restoreDisclosure(entry, button) {
   }
 }
 
+async function purgeAllTrash() {
+  const button = $("trash-purge-all");
+  const total = Number($("trash-nav-count").textContent) || 0;
+  if (!total) return;
+  if (!window.confirm(
+    `Permanently delete all ${total} record${total === 1 ? "" : "s"} in the recycle bin? ` +
+    `Their linked Stage 6 disclosure artifacts will be deleted as well. Stage 5 PoC files are retained. This cannot be undone.`
+  )) return;
+  button.disabled = true;
+  try {
+    const res = await fetch("/api/disclosures/trash/purge", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    const removed = data.removed || 0;
+    $("trash-msg").textContent =
+      `Permanently deleted ${removed} record${removed === 1 ? "" : "s"}.`;
+    await Promise.all([loadTrash(), loadDisclosures()]);
+  } catch (error) {
+    $("trash-msg").textContent =
+      `Empty recycle bin failed: ${error.message || error}`;
+    button.disabled = false;
+  }
+}
+
 async function refreshTrashCount() {
   try {
     const res = await fetch("/api/disclosures/trash");
@@ -2362,6 +2387,7 @@ async function refreshTrashCount() {
 }
 
 $("trash-project").addEventListener("change", loadTrash);
+$("trash-purge-all").addEventListener("click", purgeAllTrash);
 $("trash-search").addEventListener("input", () => {
   clearTimeout(trashSearchTimer);
   trashSearchTimer = setTimeout(loadTrash, 220);

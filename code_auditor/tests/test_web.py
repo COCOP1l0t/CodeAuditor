@@ -2113,6 +2113,30 @@ def test_api_any_disclosure_moves_to_trash_and_restores(
     assert client.get("/api/disclosures/trash").json()["total"] == 0
 
 
+def test_api_purge_disclosure_trash(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    app.state.store.import_output_dir(_make_output_dir(tmp_path))
+    client = TestClient(app)
+    entry = client.get("/api/disclosures").json()["entries"][0]
+    identity = {
+        "project": entry["project"],
+        "dedupe_key": entry["dedupe_key"],
+    }
+
+    empty = client.post("/api/disclosures/trash/purge")
+    assert empty.status_code == 200
+    assert empty.json()["removed"] == 0
+
+    assert client.post("/api/disclosures/trash", json=identity).status_code == 200
+    assert client.get("/api/disclosures/trash").json()["total"] == 1
+
+    purged = client.post("/api/disclosures/trash/purge")
+    assert purged.status_code == 200
+    assert purged.json()["removed"] == 1
+    assert client.get("/api/disclosures/trash").json()["total"] == 0
+    assert client.get("/api/disclosures").json()["entries"] == []
+
+
 def test_api_disclosure_artifact_uses_database_registered_path(tmp_path) -> None:
     app = _make_app(tmp_path)
     app.state.store.import_output_dir(_make_output_dir(tmp_path))

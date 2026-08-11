@@ -949,7 +949,7 @@ tr.run-row:hover {
 
 .registry-toolbar-trash {
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) 180px auto;
+  grid-template-columns: minmax(280px, 1fr) 180px auto auto;
   align-items: end;
 }
 
@@ -1439,6 +1439,10 @@ th[aria-sort="descending"] .sort-button::after {
 .project-cell {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+#trash-table .date-cell {
+  white-space: normal;
 }
 
 .numeric-cell {

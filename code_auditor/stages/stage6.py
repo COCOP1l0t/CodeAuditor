@@ -413,11 +413,13 @@ async def _run_disclosure(
             "Use the vulnerability report for all details."
         )
 
+    poc_target = config.poc_worktree or config.target
+
     prompt = load_prompt("stage6.md", {
         "vuln_report_path": report_path,
         "poc_dir": poc_dir,
         "finding_reference": finding_reference,
-        "target_path": config.target,
+        "target_path": poc_target,
         "disclosure_dir": disclosure_dir,
         "vuln_id": vuln_id,
         "wiki_context": build_wiki_context(config, stage=6),
@@ -427,7 +429,7 @@ async def _run_disclosure(
     await run_agent(
         prompt,
         config,
-        cwd=config.target,
+        cwd=poc_target,
         max_turns=_MAX_TURNS,
         model=select_poc_model(config),
         effort=_DEFAULT_EFFORT,

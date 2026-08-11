@@ -5,6 +5,7 @@ import os
 from .checkpoint import CheckpointManager
 from .config import AnalysisUnit, AuditConfig
 from .logger import get_logger
+from .repos import ensure_poc_worktree
 from .stages.stage0 import run_setup
 from .stages.stage1 import Stage1Output, run_stage1
 from .stages.stage2 import run_stage2
@@ -91,6 +92,8 @@ async def run_audit(config: AuditConfig, tui: TUIManager | None = None) -> None:
     stage5_reports: list[str] = []
     if tui:
         tui.begin_stage(5, f"Reproducing {len(vuln_files)} vulnerabilities")
+    if vuln_files and config.poc_worktree is None:
+        config.poc_worktree = await ensure_poc_worktree(config.target, config.output_dir)
     stage5_reports = await run_stage5(vuln_files, config, checkpoint)
     if tui:
         tui.stage_progress(5, items_done=len(stage5_reports), items_total=len(vuln_files),

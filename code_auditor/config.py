@@ -47,6 +47,8 @@ class AuditConfig:
     # Runtime-only collector for per-task agent failures (stage3-6). Entries
     # are summarized into the run record's error field at the end of the audit.
     task_errors: list[str] = field(default_factory=list, repr=False)
+    # Isolated worktree for Stage 5/6 PoC agents; set up by the orchestrator.
+    poc_worktree: str | None = None
     # Model ids actually used by agent invocations, in first-use order.
     models_used: list[str] = field(default_factory=list, repr=False)
     # Runtime-only accumulator of token/cost usage across agent invocations.

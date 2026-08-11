@@ -310,3 +310,31 @@ def test_default_audit_output_dir_non_git_falls_back_to_date(tmp_path) -> None:
     out = default_audit_output_dir(str(tmp_path), str(tmp_path / "results"))
     stamp = datetime.now().strftime("%Y%m%d")
     assert out == str(tmp_path / "results" / tmp_path.name / f"audit-output-{stamp}")
+
+
+# ── PoC worktree isolation ────────────────────────────────────────────────
+
+
+async def test_ensure_poc_worktree_creates_and_reuses(tmp_path) -> None:
+    from code_auditor.repos import ensure_poc_worktree
+
+    src = _make_source_repo(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+
+    worktree = await ensure_poc_worktree(str(src), str(out))
+    assert worktree == str(out / ".poc-worktree")
+    assert (Path(worktree) / "README.md").is_file()
+    assert _head(Path(worktree)) == _head(src)
+    # The shared checkout is not modified, and resume reuses the worktree.
+    assert (src / ".git").is_dir()
+    assert await ensure_poc_worktree(str(src), str(out)) == worktree
+
+
+async def test_ensure_poc_worktree_non_git_target_returns_none(tmp_path) -> None:
+    from code_auditor.repos import ensure_poc_worktree
+
+    out = tmp_path / "out"
+    out.mkdir()
+    assert await ensure_poc_worktree(str(tmp_path), str(out)) is None
+    assert not (out / ".poc-worktree").exists()

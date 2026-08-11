@@ -282,3 +282,62 @@ def default_audit_output_dir(target: str, results_dir: str = DEFAULT_RESULTS_DIR
     return os.path.join(
         os.path.expanduser(results_dir), project, f"audit-output-{stamp}"
     )
+
+
+async def create_detached_worktree(repo: str, commit: str, destination: str) -> None:
+    """Create an isolated checkout without changing the shared repository."""
+    if not os.path.isdir(repo):
+        raise RuntimeError(f"Source repository not found: {repo}")
+    if os.path.exists(destination):
+        raise RuntimeError(f"Worktree already exists: {destination}")
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        repo,
+        "worktree",
+        "add",
+        "--detach",
+        destination,
+        commit,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        output, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+    if proc.returncode != 0:
+        tail = (output or b"").decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(
+            f"Cannot create a worktree for commit {commit[:12]}: {tail}"
+        )
+
+
+async def ensure_poc_worktree(target: str, output_dir: str) -> str | None:
+    """Create (or reuse) an isolated worktree for the Stage 5/6 PoC agents.
+
+    PoC agents build and patch the audited project; running them inside a
+    detached worktree keeps the shared repository mirror clean so later
+    resume checks do not fail on a dirty checkout. Returns the worktree
+    path, or None when the target is not a git repository (agents then work
+    in the source tree directly).
+    """
+    commit = capture_repo_identity(target).get("commit") or ""
+    if not commit:
+        return None
+    destination = os.path.join(output_dir, ".poc-worktree")
+    if os.path.isdir(destination):
+        return destination
+    try:
+        await create_detached_worktree(target, commit, destination)
+    except Exception as exc:
+        logger.warning(
+            "PoC worktree unavailable (%s); PoC agents will work in the source tree.",
+            exc,
+        )
+        return None
+    logger.info("PoC worktree created at %s (commit %s).", destination, commit[:12])
+    return destination

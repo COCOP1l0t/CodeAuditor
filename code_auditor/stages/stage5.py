@@ -101,9 +101,13 @@ async def _run_reproduce(
     logger.info("Stage 5: Starting PoC reproduction for %s.", vuln_id)
     os.makedirs(poc_dir, exist_ok=True)
 
+    # PoC agents build and patch the project; run them inside the isolated
+    # worktree when available so the shared source tree stays clean.
+    poc_target = config.poc_worktree or config.target
+
     prompt = load_prompt("stage5.md", {
         "finding_file_path": vuln_file_path,
-        "target_path": config.target,
+        "target_path": poc_target,
         "poc_dir": poc_dir,
         "finding_id": vuln_id,
         "wiki_context": build_wiki_context(config, stage=5),
@@ -113,7 +117,7 @@ async def _run_reproduce(
     await run_agent(
         prompt,
         config,
-        cwd=config.target,
+        cwd=poc_target,
         max_turns=_MAX_TURNS,
         model=select_poc_model(config),
         effort=_DEFAULT_EFFORT,
@@ -150,7 +154,7 @@ async def _run_reproduce(
             await run_agent(
                 repair_prompt,
                 config,
-                cwd=config.target,
+                cwd=poc_target,
                 max_turns=15,
                 model=select_poc_model(config),
                 effort=_DEFAULT_EFFORT,

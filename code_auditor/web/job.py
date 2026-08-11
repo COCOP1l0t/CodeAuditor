@@ -31,6 +31,7 @@ from ..repos import (
     DEFAULT_REPOS_DIR,
     DEFAULT_RESULTS_DIR,
     capture_repo_identity,
+    create_detached_worktree as repos_create_detached_worktree,
     default_audit_output_dir,
     ensure_repo,
     repo_local_path,
@@ -236,51 +237,10 @@ async def _checkout_recorded_revision(
 
 async def _create_detached_worktree(repo: str, commit: str, destination: str) -> None:
     """Create an isolated checkout without changing the shared repository."""
-    if not os.path.isdir(repo):
-        raise JobValidationError(f"Source repository not found: {repo}")
-    if os.path.exists(destination):
-        raise JobValidationError(f"Reproduction worktree already exists: {destination}")
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "-C",
-        repo,
-        "worktree",
-        "add",
-        "--detach",
-        destination,
-        commit,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
     try:
-        output, _ = await proc.communicate()
-    except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
-        raise
-    if proc.returncode != 0:
-        tail = (output or b"").decode("utf-8", errors="replace")[-1000:]
-        raise JobValidationError(
-            f"Cannot create a worktree for commit {commit[:12]}: {tail}"
-        )
-
-
-async def _stash_resume_leftovers(target: str, run_id: int) -> None:
-    """Stash tracked leftover changes (e.g. from older PoC agents) before resume."""
-    output = await _run_resume_git_command(
-        target,
-        "stash",
-        "push",
-        "-m",
-        f"code-auditor auto-stash before resuming run #{run_id}",
-    )
-    logger.warning(
-        "Auto-stashed leftover changes in %s before resuming run #%d.%s",
-        target,
-        run_id,
-        f" git: {output}" if output else "",
-    )
+        await repos_create_detached_worktree(repo, commit, destination)
+    except RuntimeError as exc:
+        raise JobValidationError(str(exc)) from exc
 
 
 async def _stash_resume_leftovers(target: str, run_id: int) -> None:

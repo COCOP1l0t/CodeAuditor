@@ -8,8 +8,10 @@ from contextlib import suppress
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig
+from ..disclosures import build_dedupe_key
 from ..logger import get_logger
 from ..prompts import load_prompt
+from ..repos import capture_repo_identity
 from ..utils import (
     natural_sort_key,
     format_validation_issues,
@@ -149,6 +151,55 @@ async def _run_finding(
     return pending_path if confirmed else None
 
 
+def _dedupe_findings(
+    findings: list[tuple[str, str, float]],
+    existing_final_files: list[str],
+    repo_url: str,
+) -> list[tuple[str, str, float]]:
+    """Remove duplicate findings that describe the same vulnerability.
+
+    ``findings`` must already be sorted by severity (Critical first) and
+    CVSS descending so that the first occurrence of each dedupe_key is kept.
+    """
+    seen_keys: set[str] = set()
+
+    for file_path in existing_final_files:
+        try:
+            with open(file_path) as f:
+                data = json.load(f)
+            seen_keys.add(build_dedupe_key(data, repo_url=repo_url))
+        except Exception:
+            pass
+
+    deduped: list[tuple[str, str, float]] = []
+    for pending_path, severity, cvss in findings:
+        try:
+            with open(pending_path) as f:
+                data = json.load(f)
+            key = build_dedupe_key(data, repo_url=repo_url)
+        except Exception as e:
+            logger.warning(
+                "Stage 4: Could not compute dedupe key for %s: %s; keeping.",
+                os.path.basename(pending_path), e,
+            )
+            deduped.append((pending_path, severity, cvss))
+            continue
+
+        if key in seen_keys:
+            logger.info(
+                "Stage 4: Skipping duplicate finding %s (dedupe_key=%s).",
+                os.path.basename(pending_path), key,
+            )
+            with suppress(OSError):
+                os.remove(pending_path)
+            continue
+
+        seen_keys.add(key)
+        deduped.append((pending_path, severity, cvss))
+
+    return deduped
+
+
 def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> list[str]:
     stage4_dir = os.path.join(config.output_dir, "stage4-vulnerabilities")
     existing_final_files = _list_existing_final_files(stage4_dir)
@@ -187,6 +238,9 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
 
     # Sort by severity order, then by cvss_score descending (higher score -> smaller ID)
     findings.sort(key=lambda x: (_SEVERITY_ORDER.index(x[1]), -x[2]))
+
+    repo_url = capture_repo_identity(config.target).get("repo_url", "")
+    findings = _dedupe_findings(findings, existing_final_files, repo_url)
 
     finalized: list[str] = list(existing_final_files)
     for pending_path, severity, _cvss in findings:

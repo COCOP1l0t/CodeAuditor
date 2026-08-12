@@ -17,6 +17,7 @@ _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 _CONFIG_KEYS = {
     "backend",
     "log_level",
+    "max_concurrent_jobs",
     "max_parallel",
     "repos_dir",
     "results_dir",
@@ -35,6 +36,7 @@ class WebSettings:
     backend: str
     log_level: str
     max_parallel: int
+    max_concurrent_jobs: int
     repos_dir: str
     results_dir: str
     reproductions_dir: str
@@ -47,6 +49,7 @@ class WebSettings:
         backend: str = DEFAULT_BACKEND,
         log_level: str = "DEBUG",
         max_parallel: int = 1,
+        max_concurrent_jobs: int = 4,
     ) -> "WebSettings":
         """Build validated settings for an isolated state directory."""
         root = os.path.realpath(os.path.expanduser(state_dir))
@@ -55,6 +58,7 @@ class WebSettings:
             {
                 "backend": backend,
                 "log_level": log_level,
+                "max_concurrent_jobs": max_concurrent_jobs,
                 "max_parallel": max_parallel,
                 "repos_dir": os.path.join(root, "repo"),
                 "results_dir": os.path.join(root, "results"),
@@ -66,6 +70,7 @@ class WebSettings:
         return {
             "backend": self.backend,
             "log_level": self.log_level,
+            "max_concurrent_jobs": self.max_concurrent_jobs,
             "max_parallel": self.max_parallel,
             "repos_dir": self.repos_dir,
             "results_dir": self.results_dir,
@@ -165,6 +170,13 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         raise WebSettingsError("max_parallel must be an integer.")
     if not 1 <= max_parallel <= 16:
         raise WebSettingsError("max_parallel must be between 1 and 16.")
+    max_concurrent_jobs = raw.get("max_concurrent_jobs")
+    if not isinstance(max_concurrent_jobs, int) or isinstance(
+        max_concurrent_jobs, bool
+    ):
+        raise WebSettingsError("max_concurrent_jobs must be an integer.")
+    if not 1 <= max_concurrent_jobs <= 16:
+        raise WebSettingsError("max_concurrent_jobs must be between 1 and 16.")
 
     managed_paths = {}
     for key in (
@@ -180,6 +192,7 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         backend=backend,
         log_level=log_level.upper(),
         max_parallel=max_parallel,
+        max_concurrent_jobs=max_concurrent_jobs,
         repos_dir=managed_paths["repos_dir"],
         results_dir=managed_paths["results_dir"],
         reproductions_dir=managed_paths["reproductions_dir"],

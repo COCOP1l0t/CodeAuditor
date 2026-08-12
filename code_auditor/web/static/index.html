@@ -44,8 +44,8 @@
       </a>
     </nav>
     <div id="job-status-panel" class="sidebar-footer" data-state="idle">
-      <span class="sidebar-footer-label">Audit status</span>
-      <span id="job-badge" class="badge badge-idle">idle</span>
+      <span class="sidebar-footer-label">Jobs</span>
+      <div id="job-list"><span class="badge badge-idle">idle</span></div>
     </div>
   </aside>
 
@@ -94,7 +94,6 @@
         </p>
         <div class="button-row">
           <button type="submit" id="btn-start" class="btn btn-start">Start Audit</button>
-          <button type="button" id="btn-stop" class="btn btn-stop" disabled>Stop</button>
           <button type="button" id="btn-new-audit-cancel" class="btn">Cancel</button>
           <span id="form-error" class="error"></span>
         </div>
@@ -136,7 +135,7 @@
           </div>
           <div class="log-actions">
             <button type="button" id="btn-full-agent-log" class="btn btn-compact">View full log</button>
-            <a class="btn btn-compact" id="btn-download-agent-log" href="/api/results/agent-log?download=true" download>Download</a>
+            <a class="btn btn-compact" id="btn-download-agent-log" href="#" download>Download</a>
           </div>
         </header>
         <pre id="log-pane"></pre>
@@ -258,7 +257,7 @@
           </div>
           <div class="log-actions">
             <button type="button" id="r-btn-full-agent-log" class="btn btn-compact">View full log</button>
-            <a class="btn btn-compact" href="/api/results/agent-log?download=true" download>Download</a>
+            <a class="btn btn-compact" id="r-btn-download-agent-log" href="#" download>Download</a>
           </div>
         </header>
         <pre id="reproduction-log-pane"></pre>

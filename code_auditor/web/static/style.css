@@ -528,6 +528,47 @@ button.tab {
   text-align: left;
 }
 
+#job-list {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.job-list-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--fg);
+  font-size: 0.82rem;
+  text-decoration: none;
+  min-width: 0;
+}
+
+.job-list-item:hover {
+  color: var(--accent, #6ea8fe);
+}
+
+.job-list-label {
+  font-weight: 620;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-list-elapsed {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.run-live .badge {
+  box-shadow: 0 0 0 1px var(--warn);
+}
+
+.run-live td:first-child::after {
+  content: " ●";
+  color: var(--warn);
+}
+
 /* ── Stage notifications ────────────────────────────────────────────────── */
 .notification-center {
   position: fixed;

@@ -29,13 +29,14 @@ from ..wikis import list_local_wikis
 from .job import (
     JOB_AUDIT,
     JOB_REPRODUCTION,
-    STATE_RUNNING,
+    AuditJob,
     AuditJobManager,
     AuditStartParams,
     JobConflictError,
     JobValidationError,
     ReproductionStartParams,
 )
+from .progress import install_web_log_handler
 from .settings import (
     DEFAULT_SETTINGS_PATH,
     WebSettings,
@@ -101,6 +102,29 @@ class ReproductionStartRequest(StrictRequest):
 
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _sse_stream(bus) -> StreamingResponse:
+    """Replay the bus backlog, then stream live events until disconnect."""
+    queue = bus.subscribe()
+
+    async def stream():
+        try:
+            for event in bus.backlog():
+                yield _sse(event)
+            while True:
+                event = await queue.get()
+                yield _sse(event)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            bus.unsubscribe(queue)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _scan_results(output_dir: str) -> dict:
@@ -174,6 +198,7 @@ def _run_stage_summary(run: dict) -> list[dict]:
         run.get("poc_issues") or []
     )
     reproduced_total = int(run.get("reproduced_vulns_count") or 0)
+    disclosures_total = int(run.get("disclosures_count") or 0)
     failed = run.get("status") == "failed"
 
     def entry(
@@ -210,7 +235,7 @@ def _run_stage_summary(run: dict) -> list[dict]:
     disclosures_exist = (base / "stage6-disclosures").is_dir() and any(
         (base / "stage6-disclosures").iterdir()
     )
-    s6_done, s6_count = marked("stage6-", reproduced_total, disclosures_exist)
+    s6_done, s6_count = marked("stage6-", disclosures_total, disclosures_exist)
 
     return [
         entry(0, base.is_dir()),
@@ -222,7 +247,7 @@ def _run_stage_summary(run: dict) -> list[dict]:
         entry(3, s3_done, min(s3_count, au_total), au_total),
         entry(4, s4_done, min(s4_count, findings_total), findings_total),
         entry(5, s5_done, min(s5_count, vuln_total), vuln_total),
-        entry(6, s6_done, min(s6_count, reproduced_total), reproduced_total),
+        entry(6, s6_done, min(s6_count, disclosures_total), disclosures_total),
     ]
 
 
@@ -490,10 +515,14 @@ def create_app(
     app = FastAPI(title="CodeAuditor", lifespan=lifespan)
     app.state.store = store
     app.state.web_settings = settings
-    manager = AuditJobManager(store=store)
+    manager = AuditJobManager(
+        store=store, max_concurrent_jobs=settings.max_concurrent_jobs
+    )
     app.state.manager = manager
     app.state.terminal_token = secrets.token_urlsafe(32)
     app.state.active_terminals = 0
+    # One process-wide log handler routes records to the owning job's bus.
+    install_web_log_handler(manager.bus_for_job)
 
     @app.middleware("http")
     async def require_web_asset_revalidation(request, call_next):
@@ -522,6 +551,7 @@ def create_app(
             "repos_dir": settings.repos_dir,
             "wikis_dir": settings.wikis_dir,
             "results_dir": settings.results_dir,
+            "max_concurrent_jobs": settings.max_concurrent_jobs,
             "terminal_enabled": True,
             "terminal_token": app.state.terminal_token,
         }
@@ -550,7 +580,7 @@ def create_app(
             except RepoError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            await manager.start(
+            job = await manager.start(
                 AuditStartParams(
                     target=target,
                     git_url=git_url,
@@ -567,81 +597,41 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e)) from e
         except JobConflictError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
-        return manager.status()
+        return job.status()
 
-    @app.post("/api/audit/stop")
-    async def stop_audit() -> dict:
-        if manager.kind != JOB_AUDIT or not manager.stop():
-            raise HTTPException(status_code=409, detail="No audit is running.")
-        return manager.status()
-
-    @app.get("/api/audit/status")
-    async def audit_status() -> dict:
-        return manager.status()
-
-    @app.get("/api/audit/events")
-    async def audit_events() -> StreamingResponse:
-        queue = manager.bus.subscribe()
-
-        async def stream():
-            try:
-                for event in manager.bus.backlog():
-                    yield _sse(event)
-                while True:
-                    event = await queue.get()
-                    yield _sse(event)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                manager.bus.unsubscribe(queue)
-
-        return StreamingResponse(
-            stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    @app.get("/api/results")
-    async def results() -> dict:
-        if manager.config is None:
-            raise HTTPException(status_code=404, detail="No audit has been started yet.")
-        return _scan_results(manager.config.output_dir)
-
-    @app.get("/api/results/file")
-    async def result_file(
-        path: str = Query(min_length=1, max_length=4096)
-    ) -> PlainTextResponse:
-        if manager.config is None:
-            raise HTTPException(status_code=404, detail="No audit has been started yet.")
-        full = _resolve_output_file(manager.config.output_dir, path)
-        try:
-            content = Path(full).read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return PlainTextResponse(content)
-
-    @app.get("/api/results/agent-log")
-    async def latest_agent_log(download: bool = Query(default=False)):
-        if manager.config is None:
-            raise HTTPException(status_code=404, detail="No audit has been started yet.")
-        latest = _latest_agent_log(manager.config.output_dir)
-        if latest is None:
-            raise HTTPException(status_code=404, detail="No Agent log is available yet.")
-        path, relative_path = latest
-        if download:
-            return FileResponse(
-                path,
-                media_type="text/plain; charset=utf-8",
-                filename=f"{path.parent.name}-{path.name}",
+    def _audit_job_or_404(run_id: int) -> AuditJob:
+        job = manager.get_job(str(run_id))
+        if job is None or job.kind != JOB_AUDIT:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No active or recent audit job for run {run_id}.",
             )
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return PlainTextResponse(
-            content,
-            headers={"X-CodeAuditor-Log-Path": relative_path},
-        )
+        return job
+
+    @app.post("/api/audit/{run_id}/stop")
+    async def stop_audit(run_id: int) -> dict:
+        job = _audit_job_or_404(run_id)
+        if not job.stop():
+            raise HTTPException(status_code=409, detail="That audit is not running.")
+        return job.status()
+
+    @app.get("/api/audit/{run_id}/status")
+    async def audit_status(run_id: int) -> dict:
+        return _audit_job_or_404(run_id).status()
+
+    @app.get("/api/audit/{run_id}/events")
+    async def audit_events(run_id: int) -> StreamingResponse:
+        return _sse_stream(_audit_job_or_404(run_id).bus)
+
+    @app.get("/api/jobs")
+    async def list_jobs() -> dict:
+        """Active and recently finished jobs (sidebar + History live badges)."""
+        return {"jobs": manager.list_jobs()}
+
+    @app.get("/api/jobs/events")
+    async def job_events() -> StreamingResponse:
+        """Run-tagged lifecycle events for every job."""
+        return _sse_stream(manager.bus)
 
     # ── Standalone reproduction ────────────────────────────────────────────
 
@@ -789,7 +779,7 @@ def create_app(
     @app.post("/api/reproduction", status_code=202)
     async def start_reproduction(request: ReproductionStartRequest) -> dict:
         try:
-            await manager.start_reproduction(
+            job = await manager.start_reproduction(
                 ReproductionStartParams(
                     run_id=request.run_id,
                     vuln_id=request.vuln_id,
@@ -803,35 +793,85 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e)) from e
         except JobConflictError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
-        return manager.status()
+        return job.status()
 
-    @app.post("/api/reproduction/stop")
-    async def stop_reproduction() -> dict:
-        if manager.kind != JOB_REPRODUCTION or not manager.stop():
-            raise HTTPException(status_code=409, detail="No reproduction is running.")
-        return manager.status()
-
-    @app.get("/api/reproduction/status")
-    async def reproduction_status() -> dict:
-        return manager.status()
-
-    @app.get("/api/reproduction/results")
-    async def reproduction_results() -> dict:
-        if manager.kind != JOB_REPRODUCTION or manager.config is None:
+    def _reproduction_job_or_404(job_key: str) -> AuditJob:
+        if re.fullmatch(r"repro-[0-9a-f]{12}", job_key) is None:
+            raise HTTPException(status_code=404, detail="Reproduction job not found.")
+        job = manager.get_job(job_key)
+        if job is None or job.kind != JOB_REPRODUCTION:
             raise HTTPException(
-                status_code=404, detail="No reproduction has been started yet."
+                status_code=404,
+                detail="No active or recent reproduction job with that id.",
             )
-        return _scan_results(manager.config.output_dir)
+        return job
 
-    @app.get("/api/reproduction/results/file")
+    @app.post("/api/reproduction/{job_key}/stop")
+    async def stop_reproduction(job_key: str) -> dict:
+        job = _reproduction_job_or_404(job_key)
+        if not job.stop():
+            raise HTTPException(
+                status_code=409, detail="That reproduction is not running."
+            )
+        return job.status()
+
+    @app.get("/api/reproduction/{job_key}/status")
+    async def reproduction_status(job_key: str) -> dict:
+        return _reproduction_job_or_404(job_key).status()
+
+    @app.get("/api/reproduction/{job_key}/events")
+    async def reproduction_events(job_key: str) -> StreamingResponse:
+        return _sse_stream(_reproduction_job_or_404(job_key).bus)
+
+    @app.get("/api/reproduction/{job_key}/results")
+    async def reproduction_results(job_key: str) -> dict:
+        job = _reproduction_job_or_404(job_key)
+        if job.config is None:
+            raise HTTPException(
+                status_code=404, detail="The reproduction has no output yet."
+            )
+        return _scan_results(job.config.output_dir)
+
+    @app.get("/api/reproduction/{job_key}/agent-log")
+    async def reproduction_agent_log(
+        job_key: str,
+        download: bool = Query(default=False),
+    ):
+        job = _reproduction_job_or_404(job_key)
+        if job.config is None:
+            raise HTTPException(
+                status_code=404, detail="The reproduction has no output yet."
+            )
+        latest = _latest_agent_log(job.config.output_dir)
+        if latest is None:
+            raise HTTPException(status_code=404, detail="No Agent log is available yet.")
+        path, relative_path = latest
+        if download:
+            return FileResponse(
+                path,
+                media_type="text/plain; charset=utf-8",
+                filename=f"{path.parent.name}-{path.name}",
+            )
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return PlainTextResponse(
+            content,
+            headers={"X-CodeAuditor-Log-Path": relative_path},
+        )
+
+    @app.get("/api/reproduction/{job_key}/results/file")
     async def reproduction_result_file(
+        job_key: str,
         path: str = Query(min_length=1, max_length=4096),
     ) -> PlainTextResponse:
-        if manager.kind != JOB_REPRODUCTION or manager.config is None:
+        job = _reproduction_job_or_404(job_key)
+        if job.config is None:
             raise HTTPException(
-                status_code=404, detail="No reproduction has been started yet."
+                status_code=404, detail="The reproduction has no output yet."
             )
-        full = _resolve_output_file(manager.config.output_dir, path)
+        full = _resolve_output_file(job.config.output_dir, path)
         try:
             content = Path(full).read_text(encoding="utf-8", errors="replace")
         except OSError as e:
@@ -901,7 +941,7 @@ def create_app(
     async def resume_history_run(run_id: int) -> dict:
         _get_history_run(run_id)
         try:
-            await manager.resume_cancelled(
+            job = await manager.resume_cancelled(
                 run_id,
                 repos_dir=settings.repos_dir,
                 results_dir=settings.results_dir,
@@ -911,7 +951,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e)) from e
         except JobConflictError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
-        return manager.status()
+        return job.status()
 
     @app.get("/api/target/{target_key:path}")
     def target_merged(target_key: str) -> dict:
@@ -927,6 +967,32 @@ def create_app(
         """Artifact file listing for a recorded run (History detail page)."""
         run = _get_history_run(run_id)
         return _scan_results(run["output_dir"])
+
+    @app.get("/api/history/{run_id}/agent-log")
+    def history_run_agent_log(
+        run_id: int,
+        download: bool = Query(default=False),
+    ):
+        """Latest agent log of a run; works for both live and finished runs."""
+        run = _get_history_run(run_id)
+        latest = _latest_agent_log(run["output_dir"])
+        if latest is None:
+            raise HTTPException(status_code=404, detail="No Agent log is available yet.")
+        path, relative_path = latest
+        if download:
+            return FileResponse(
+                path,
+                media_type="text/plain; charset=utf-8",
+                filename=f"{path.parent.name}-{path.name}",
+            )
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return PlainTextResponse(
+            content,
+            headers={"X-CodeAuditor-Log-Path": relative_path},
+        )
 
     @app.get("/api/history/{run_id}/file")
     def history_run_file(

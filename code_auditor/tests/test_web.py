@@ -21,13 +21,19 @@ from code_auditor.web.job import (
     STATE_FAILED,
     STATE_RESTORING,
     STATE_RUNNING,
+    AuditJob,
     AuditJobManager,
     AuditStartParams,
     JobConflictError,
     JobValidationError,
     ReproductionStartParams,
 )
-from code_auditor.web.progress import EventBus, WebLogHandler, WebProgressReporter
+from code_auditor.web.progress import (
+    CURRENT_JOB_KEY,
+    EventBus,
+    WebLogHandler,
+    WebProgressReporter,
+)
 from code_auditor.web.settings import WebSettings
 
 
@@ -55,19 +61,26 @@ def test_progress_reporter_publishes_stage_events() -> None:
     assert snapshot[0]["items_done"] == 3
 
 
-def test_web_log_handler_publishes_log_events() -> None:
-    bus = EventBus()
-    handler = WebLogHandler(bus)
-    record = logging.LogRecord(
+def _log_record(msg: str, args: tuple = (), level: int = logging.INFO):
+    return logging.LogRecord(
         name="code_auditor.test",
-        level=logging.INFO,
+        level=level,
         pathname=__file__,
         lineno=1,
-        msg="hello %s",
-        args=("world",),
+        msg=msg,
+        args=args,
         exc_info=None,
     )
-    handler.emit(record)
+
+
+def test_web_log_handler_publishes_log_events() -> None:
+    bus = EventBus()
+    handler = WebLogHandler(lambda key: bus if key == "job-1" else None)
+    token = CURRENT_JOB_KEY.set("job-1")
+    try:
+        handler.emit(_log_record("hello %s", ("world",)))
+    finally:
+        CURRENT_JOB_KEY.reset(token)
 
     events = bus.backlog()
     assert len(events) == 1
@@ -76,20 +89,39 @@ def test_web_log_handler_publishes_log_events() -> None:
     assert "hello world" in events[0]["message"]
 
 
+def test_web_log_handler_routes_records_to_the_owning_job() -> None:
+    bus_a = EventBus()
+    bus_b = EventBus()
+    buses = {"job-a": bus_a, "job-b": bus_b}
+    handler = WebLogHandler(buses.get)
+
+    token = CURRENT_JOB_KEY.set("job-b")
+    try:
+        handler.emit(_log_record("for job b"))
+    finally:
+        CURRENT_JOB_KEY.reset(token)
+    # Records logged outside any job task are dropped from the web stream.
+    handler.emit(_log_record("no job context"))
+    token = CURRENT_JOB_KEY.set("job-a")
+    try:
+        handler.emit(_log_record("for job a"))
+    finally:
+        CURRENT_JOB_KEY.reset(token)
+
+    assert len(bus_a.backlog()) == 1
+    assert "for job a" in bus_a.backlog()[0]["message"]
+    assert len(bus_b.backlog()) == 1
+    assert "for job b" in bus_b.backlog()[0]["message"]
+
+
 def test_web_log_handler_bounds_oversized_backend_output() -> None:
     bus = EventBus()
-    handler = WebLogHandler(bus)
-    record = logging.LogRecord(
-        name="code_auditor.test",
-        level=logging.ERROR,
-        pathname=__file__,
-        lineno=1,
-        msg="x" * 50_000,
-        args=(),
-        exc_info=None,
-    )
-
-    handler.emit(record)
+    handler = WebLogHandler(lambda key: bus)
+    token = CURRENT_JOB_KEY.set("job-1")
+    try:
+        handler.emit(_log_record("x" * 50_000, level=logging.ERROR))
+    finally:
+        CURRENT_JOB_KEY.reset(token)
 
     message = bus.backlog()[0]["message"]
     assert len(message) < 21_000
@@ -151,15 +183,91 @@ async def test_start_conflict_while_running(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
     manager = AuditJobManager()
-    await manager.start(AuditStartParams(target=str(tmp_path)))
+    job = await manager.start(AuditStartParams(target=str(tmp_path)))
     await asyncio.wait_for(started.wait(), timeout=1)
 
+    # A second job on the same repository is rejected…
     with pytest.raises(JobConflictError):
         await manager.start(AuditStartParams(target=str(tmp_path)))
 
     release.set()
-    await manager._task
-    assert manager.state == STATE_DONE
+    await job.task
+    assert job.state == STATE_DONE
+
+
+async def test_concurrent_jobs_on_different_targets(tmp_path, monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    running = 0
+
+    async def fake_run_audit(config, tui=None):
+        nonlocal running
+        running += 1
+        if running == 2:
+            started.set()
+        await release.wait()
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    target_a = tmp_path / "a"
+    target_b = tmp_path / "b"
+    target_a.mkdir()
+    target_b.mkdir()
+    manager = AuditJobManager()
+    job_a = await manager.start(AuditStartParams(target=str(target_a)))
+    job_b = await manager.start(AuditStartParams(target=str(target_b)))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    # Both jobs run concurrently, each with its own event bus.
+    assert job_a.job_key != job_b.job_key
+    assert job_a.bus is not job_b.bus
+    assert {j.job_key for j in manager._active_jobs()} == {
+        job_a.job_key,
+        job_b.job_key,
+    }
+    assert {j["job_key"] for j in manager.list_jobs()} == {
+        job_a.job_key,
+        job_b.job_key,
+    }
+
+    release.set()
+    await asyncio.gather(job_a.task, job_b.task)
+    assert job_a.state == STATE_DONE
+    assert job_b.state == STATE_DONE
+    # Each job bus carried its own lifecycle events, tagged with its run key.
+    for job in (job_a, job_b):
+        job_events = [e for e in job.bus.backlog() if e["type"] == "job"]
+        assert job_events
+        assert all(e["job_key"] == job.job_key for e in job_events)
+    # The manager-level bus saw both jobs' lifecycle events.
+    global_keys = {
+        e["job_key"] for e in manager.bus.backlog() if e["type"] == "job"
+    }
+    assert global_keys == {job_a.job_key, job_b.job_key}
+
+
+async def test_concurrent_job_limit_is_enforced(tmp_path, monkeypatch) -> None:
+    release = asyncio.Event()
+
+    async def fake_run_audit(config, tui=None):
+        await release.wait()
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    target_a = tmp_path / "a"
+    target_b = tmp_path / "b"
+    target_a.mkdir()
+    target_b.mkdir()
+    manager = AuditJobManager(max_concurrent_jobs=1)
+    first = await manager.start(AuditStartParams(target=str(target_a)))
+
+    with pytest.raises(JobConflictError, match="limit"):
+        await manager.start(AuditStartParams(target=str(target_b)))
+
+    release.set()
+    await first.task
+    # Once the first job finished, the slot is free again.
+    second = await manager.start(AuditStartParams(target=str(target_b)))
+    await second.task
+    assert second.state == STATE_DONE
 
 
 async def test_stop_cancels_running_job(tmp_path, monkeypatch) -> None:
@@ -171,13 +279,13 @@ async def test_stop_cancels_running_job(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
     manager = AuditJobManager()
-    await manager.start(AuditStartParams(target=str(tmp_path)))
+    job = await manager.start(AuditStartParams(target=str(tmp_path)))
     await asyncio.wait_for(started.wait(), timeout=1)
 
-    assert manager.stop() is True
-    await manager._task
-    assert manager.state == STATE_CANCELLED
-    assert manager.stop() is False
+    assert manager.stop(job.job_key) is job
+    await job.task
+    assert job.state == STATE_CANCELLED
+    assert manager.stop(job.job_key) is None
 
 
 async def test_shutdown_cancels_and_persists_running_audit(
@@ -192,13 +300,13 @@ async def test_shutdown_cancels_and_persists_running_audit(
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
     store = job_module.AuditStore(str(tmp_path / "history.db"))
     manager = AuditJobManager(store=store)
-    await manager.start(AuditStartParams(target=str(tmp_path)))
+    job = await manager.start(AuditStartParams(target=str(tmp_path)))
     await asyncio.wait_for(started.wait(), timeout=1)
-    run_id = manager.status()["run_id"]
+    run_id = job.status()["run_id"]
 
     await manager.shutdown()
 
-    assert manager.state == STATE_CANCELLED
+    assert job.state == STATE_CANCELLED
     run = store.get_run(run_id)
     assert run is not None
     assert run["status"] == RUN_CANCELLED
@@ -212,12 +320,13 @@ async def test_status_releases_busy_state_without_a_live_task(tmp_path) -> None:
         AuditConfig(target=str(tmp_path), output_dir=str(tmp_path / "output"))
     )
     manager = AuditJobManager(store=store)
-    manager.kind = "audit"
-    manager.state = STATE_RUNNING
-    manager._run_id = run_id
-    manager._task = None
+    job = AuditJob(manager, "audit")
+    job.state = STATE_RUNNING
+    job.run_id = run_id
+    job.job_key = str(run_id)
+    manager._jobs[job.job_key] = job
 
-    status = manager.status()
+    status = job.status()
 
     assert status["state"] == STATE_CANCELLED
     assert store.get_run(run_id)["status"] == RUN_CANCELLED
@@ -298,13 +407,13 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
     manager = AuditJobManager(store=store)
 
-    await manager.resume_cancelled(
+    job = await manager.resume_cancelled(
         17,
         repos_dir=str(tmp_path / "repo"),
         results_dir=str(tmp_path / "results"),
         wikis_dir=str(tmp_path / "wiki"),
     )
-    assert manager.state == STATE_RESTORING
+    assert job.state == STATE_RESTORING
     await asyncio.wait_for(checkout_started.wait(), timeout=1)
     with pytest.raises(JobConflictError):
         await manager.resume_cancelled(
@@ -314,12 +423,12 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
             wikis_dir=str(tmp_path / "wiki"),
         )
     checkout_release.set()
-    await manager._task
+    await job.task
 
     assert store.resumed == [17]
     assert checkouts == [(str(target), "a" * 40, "main")]
-    assert manager.state == STATE_DONE
-    assert manager.status()["run_id"] == 17
+    assert job.state == STATE_DONE
+    assert job.status()["run_id"] == 17
     assert len(audited) == 1
     assert audited[0].target == str(target)
     assert audited[0].output_dir == str(output)
@@ -392,17 +501,17 @@ async def test_resume_cancelled_job_keeps_run_cancelled_when_checkout_fails(
     store = FakeStore()
     manager = AuditJobManager(store=store)
 
-    await manager.resume_cancelled(
+    job = await manager.resume_cancelled(
         9,
         repos_dir=str(tmp_path / "repo"),
         results_dir=str(tmp_path / "results"),
         wikis_dir=str(tmp_path / "wiki"),
     )
-    assert manager.state == STATE_RESTORING
-    await manager._task
+    assert job.state == STATE_RESTORING
+    await job.task
 
-    assert manager.state == STATE_FAILED
-    assert manager.error == "Cannot restore recorded checkout"
+    assert job.state == STATE_FAILED
+    assert job.error == "Cannot restore recorded checkout"
     assert store.resumed == []
 
 
@@ -480,16 +589,16 @@ async def test_resume_cancelled_job_auto_stashes_dirty_checkout(
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
     manager = AuditJobManager(store=FakeStore())
 
-    await manager.resume_cancelled(
+    job = await manager.resume_cancelled(
         21,
         repos_dir=str(tmp_path / "repo"),
         results_dir=str(tmp_path / "results"),
         wikis_dir=str(tmp_path / "wiki"),
     )
-    await manager._task
+    await job.task
 
     assert git_calls and git_calls[0][:2] == ("stash", "push")
-    assert manager.state == STATE_DONE
+    assert job.state == STATE_DONE
 
 
 async def test_checkout_recorded_revision_restores_commit_and_branch(tmp_path) -> None:
@@ -621,12 +730,12 @@ async def test_failed_job_records_error(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
     manager = AuditJobManager()
-    await manager.start(AuditStartParams(target=str(tmp_path)))
-    await manager._task
+    job = await manager.start(AuditStartParams(target=str(tmp_path)))
+    await job.task
 
-    assert manager.state == STATE_FAILED
-    assert manager.error == "boom"
-    status = manager.status()
+    assert job.state == STATE_FAILED
+    assert job.error == "boom"
+    status = job.status()
     assert status["state"] == STATE_FAILED
     assert status["error"] == "boom"
 
@@ -683,7 +792,7 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
     manager = AuditJobManager(store=FakeStore())
     reproduction_root = tmp_path / "reproduction"
 
-    await manager.start_reproduction(
+    job = await manager.start_reproduction(
         ReproductionStartParams(
             run_id=7,
             vuln_id="H-03",
@@ -692,15 +801,16 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
             wikis_dir=str(tmp_path / "wikis"),
         )
     )
-    await manager._task
+    await job.task
 
-    assert manager.state == STATE_DONE
-    assert manager.kind == "reproduction"
-    assert manager.config is not None
-    assert manager.config.target == str(reproduction_root / "source")
-    assert manager.config.output_dir == str(reproduction_root / "output")
-    assert manager.reproduction_candidate["vuln_id"] == "H-03"
-    assert len(manager.reproduction_reports) == 1
+    assert job.state == STATE_DONE
+    assert job.kind == "reproduction"
+    assert job.job_key.startswith("repro-")
+    assert job.config is not None
+    assert job.config.target == str(reproduction_root / "source")
+    assert job.config.output_dir == str(reproduction_root / "output")
+    assert job.reproduction_candidate["vuln_id"] == "H-03"
+    assert len(job.reproduction_reports) == 1
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
@@ -823,12 +933,13 @@ def _write_web_stage5_evidence(output_dir: str) -> None:
 
 def _wait_for_state(app, state: str, timeout: float = 5.0) -> dict:
     deadline = time.time() + timeout
+    status: dict | None = None
     while time.time() < deadline:
-        status = app.state.manager.status()
-        if status["state"] == state:
-            return status
+        for status in app.state.manager.list_jobs():
+            if status["state"] == state:
+                return status
         time.sleep(0.05)
-    raise AssertionError(f"job did not reach state {state}: {status}")
+    raise AssertionError(f"no job reached state {state}: {status}")
 
 
 def test_api_config_returns_defaults(tmp_path) -> None:
@@ -926,17 +1037,21 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "appendEvidenceActionButtons" in script.text
     assert "renderTriggerGraph" in script.text
     assert "openAsanReport" in script.text
-    assert "pollAuditHeartbeat" in script.text
+    assert "pollDetailHeartbeat" in script.text
     assert "resumeCancelledAudit" in script.text
     assert "BUSY_JOB_STATES" in script.text
-    assert "isJobBusy" in script.text
+    assert "busyJobForRun" in script.text
+    assert "connectGlobalJobEvents" in script.text
+    assert "connectDetailEvents" in script.text
+    assert "/api/jobs/events" in script.text
     assert "/resume`" in script.text
     assert "notifyStageCompleted" in script.text
     assert "MAX_LOG_PANE_ENTRIES" in script.text
     assert "LOG_RENDER_INTERVAL_MS" in script.text
     assert "pane.textContent +=" not in script.text
     assert "pollActiveAgentLog" in script.text
-    assert 'fetch("/api/results/agent-log")' in script.text
+    assert "/agent-log" in script.text
+    assert "/api/results" not in script.text
     assert "is active — Stage" in script.text
     assert "older Web logs trimmed" in script.text
     assert '"fixed"' not in script.text
@@ -1208,9 +1323,9 @@ def test_poc_terminal_websocket_rejects_bad_token_and_origin(tmp_path) -> None:
 
 def test_api_status_idle_before_any_job(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
-    res = client.get("/api/audit/status")
+    res = client.get("/api/jobs")
     assert res.status_code == 200
-    assert res.json()["state"] == "idle"
+    assert res.json()["jobs"] == []
 
 
 def test_api_rejects_custom_target_and_unknown_repository(tmp_path) -> None:
@@ -1223,11 +1338,12 @@ def test_api_rejects_custom_target_and_unknown_repository(tmp_path) -> None:
     assert "managed repository" in res.json()["detail"].lower()
 
 
-def test_api_results_before_any_job_returns_404(tmp_path) -> None:
+def test_api_job_endpoints_404_for_unknown_run(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
-    assert client.get("/api/results").status_code == 404
-    assert client.get("/api/results/file", params={"path": "x.json"}).status_code == 404
-    assert client.get("/api/results/agent-log").status_code == 404
+    assert client.get("/api/audit/1/status").status_code == 404
+    assert client.post("/api/audit/1/stop").status_code == 404
+    assert client.get("/api/audit/1/events").status_code == 404
+    assert client.get("/api/history/1/agent-log").status_code == 404
 
 
 def test_api_serves_and_downloads_latest_agent_log(tmp_path) -> None:
@@ -1241,27 +1357,22 @@ def test_api_serves_and_downloads_latest_agent_log(tmp_path) -> None:
     latest.write_text("latest complete Agent log\n", encoding="utf-8")
     older.touch()
     latest.touch()
-    app.state.manager.config = AuditConfig(
-        target=str(tmp_path), output_dir=str(output)
-    )
+    run_id = app.state.store.import_output_dir(str(output))
     client = TestClient(app)
 
-    response = client.get("/api/results/agent-log")
+    response = client.get(f"/api/history/{run_id}/agent-log")
     assert response.status_code == 200
     assert response.text == "latest complete Agent log\n"
     assert response.headers["x-codeauditor-log-path"] == (
         "stage3-findings/logs/AU-9.log"
     )
 
-    download = client.get("/api/results/agent-log", params={"download": "true"})
+    download = client.get(
+        f"/api/history/{run_id}/agent-log", params={"download": "true"}
+    )
     assert download.status_code == 200
     assert "attachment" in download.headers["content-disposition"]
     assert download.content == latest.read_bytes()
-
-
-def test_api_stop_without_running_job_returns_409(tmp_path) -> None:
-    client = TestClient(_make_app(tmp_path))
-    assert client.post("/api/audit/stop").status_code == 409
 
 
 def test_api_full_job_lifecycle_and_results(tmp_path, monkeypatch) -> None:
@@ -1292,24 +1403,34 @@ def test_api_full_job_lifecycle_and_results(tmp_path, monkeypatch) -> None:
         json={"repository": "github.com/user/repo", "wiki": "qemu-security"},
     )
     assert res.status_code == 202
+    run_id = res.json()["run_id"]
 
     status = _wait_for_state(app, "done")
     assert status["stages"][0]["status"] == "done"
 
-    res = client.get("/api/results")
+    # Live job endpoints stay available for the finished job's retention
+    # window; results are served from the run-scoped history endpoints.
+    res = client.get(f"/api/audit/{run_id}/status")
+    assert res.status_code == 200
+    assert res.json()["state"] == "done"
+
+    res = client.get(f"/api/history/{run_id}/results")
     assert res.status_code == 200
     assert "findings" not in res.json()
 
     res = client.get(
-        "/api/results/file", params={"path": "stage3-findings/AU-1-F-1.json"}
+        f"/api/history/{run_id}/file",
+        params={"path": "stage3-findings/AU-1-F-1.json"},
     )
     assert res.status_code == 200
     assert res.text == "{}"
 
-    res = client.get("/api/results/file", params={"path": "../../etc/passwd"})
+    res = client.get(
+        f"/api/history/{run_id}/file", params={"path": "../../etc/passwd"}
+    )
     assert res.status_code == 400
 
-    res = client.get("/api/results/file", params={"path": "nope.json"})
+    res = client.get(f"/api/history/{run_id}/file", params={"path": "nope.json"})
     assert res.status_code == 404
 
     # The completed job was recorded in the history database.
@@ -1317,12 +1438,14 @@ def test_api_full_job_lifecycle_and_results(tmp_path, monkeypatch) -> None:
     assert total == 1
     assert runs[0]["status"] == "done"
     assert runs[0]["findings_count"] == 1
-    assert app.state.manager.config is not None
-    assert app.state.manager.config.backend == "claude"
-    assert app.state.manager.config.model is None
-    assert app.state.manager.config.log_level == "DEBUG"
-    assert app.state.manager.config.wiki_path == wiki
-    assert not hasattr(app.state.manager.config, "discovered_path")
+    job = app.state.manager.get_job(str(run_id))
+    assert job is not None
+    assert job.config is not None
+    assert job.config.backend == "claude"
+    assert job.config.model is None
+    assert job.config.log_level == "DEBUG"
+    assert job.config.wiki_path == wiki
+    assert not hasattr(job.config, "discovered_path")
 
 
 # ── History API ──────────────────────────────────────────────────────────────
@@ -1350,12 +1473,12 @@ def test_app_startup_recovers_interrupted_running_history(tmp_path) -> None:
 
     with TestClient(app) as client:
         detail = client.get(f"/api/history/{run_id}").json()
-        scheduler = client.get("/api/audit/status").json()
+        jobs = client.get("/api/jobs").json()
 
     assert detail["status"] == RUN_CANCELLED
     assert "Web worker exited" in detail["error"]
     assert detail["ended_at"] is not None
-    assert scheduler["state"] == "idle"
+    assert jobs["jobs"] == []
 
 
 def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> None:
@@ -1479,11 +1602,11 @@ async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch)
     target.mkdir()
     params = AuditStartParams(target=str(target))
     manager = AuditJobManager(store=None)
-    manager.reporter = WebProgressReporter(EventBus())
-    config = manager._build_config(params, str(target), None)
-    manager.config = config
-    manager.state = STATE_RUNNING
-    manager.kind = "audit"
+    job = AuditJob(manager, "audit")
+    config = job._build_config(params, str(target), None)
+    job.config = config
+    job.state = STATE_RUNNING
+    job.job_key = "audit-test"
 
     async def fake_run_audit(cfg, tui=None):
         cfg.models_used.append("model-x")
@@ -1492,12 +1615,12 @@ async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch)
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
 
-    await manager._run(config, params, None)
+    await job._run(config, params, None)
 
-    assert manager.state == STATE_FAILED
-    assert "stage5:H-03" in manager.error
-    assert manager.status()["models_used"] == ["model-x"]
-    assert manager.status()["usage_stats"] == {
+    assert job.state == STATE_FAILED
+    assert "stage5:H-03" in job.error
+    assert job.status()["models_used"] == ["model-x"]
+    assert job.status()["usage_stats"] == {
         "agent_calls": 2,
         "input_tokens": 900,
         "cost_usd": 0.03,
@@ -1711,18 +1834,18 @@ async def test_start_with_git_url_clones_then_audits(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
 
     manager = AuditJobManager()
-    await manager.start(
+    job = await manager.start(
         AuditStartParams(
             git_url="https://github.com/user/repo.git",
             repos_dir=str(tmp_path / "repos"),
         )
     )
-    await manager._task
+    await job.task
 
-    assert manager.state == STATE_DONE
+    assert job.state == STATE_DONE
     assert seen["target"] == str(cloned)
-    assert manager.config is not None
-    assert manager.config.target == str(cloned)
+    assert job.config is not None
+    assert job.config.target == str(cloned)
 
 
 async def test_start_with_git_url_clone_failure_marks_failed(
@@ -1736,11 +1859,13 @@ async def test_start_with_git_url_clone_failure_marks_failed(
     monkeypatch.setattr(job_module, "ensure_repo", fake_ensure_repo)
 
     manager = AuditJobManager()
-    await manager.start(AuditStartParams(git_url="https://example.com/x/y.git"))
-    await manager._task
+    job = await manager.start(
+        AuditStartParams(git_url="https://example.com/x/y.git")
+    )
+    await job.task
 
-    assert manager.state == STATE_FAILED
-    assert "clone failed" in manager.error
+    assert job.state == STATE_FAILED
+    assert "clone failed" in job.error
 
 
 def test_api_start_requires_target_or_git_url(tmp_path) -> None:
@@ -1849,9 +1974,12 @@ def test_api_start_with_git_url(tmp_path, monkeypatch) -> None:
         "/api/audit", json={"git_url": "https://github.com/user/repo.git"}
     )
     assert res.status_code == 202
+    run_id = res.json()["run_id"]
     _wait_for_state(app, "done")
-    assert app.state.manager.config is not None
-    assert app.state.manager.config.target == str(cloned)
+    job = app.state.manager.get_job(str(run_id))
+    assert job is not None
+    assert job.config is not None
+    assert job.config.target == str(cloned)
 
 
 # ── Repos & history target filter API ────────────────────────────────────────

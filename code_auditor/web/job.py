@@ -1,14 +1,17 @@
-"""Single-job lifecycle manager for the CodeAuditor web UI.
+"""Multi-job lifecycle manager for the CodeAuditor web UI.
 
-Only one audit may run at a time: logging is configured globally, the agent
-backends are monkey-patched at import time, and checkpoints are per output
-directory. ``AuditJobManager`` therefore models a single current/last job.
+Multiple audits may run concurrently: each job gets its own ``AuditJob``
+state holder and ``EventBus``, and the single process-wide ``WebLogHandler``
+routes log records to the owning job via the ``CURRENT_JOB_KEY`` context
+variable. Concurrency is bounded by ``max_concurrent_jobs`` and jobs that
+share a source checkout (the managed repo mirror) are mutually exclusive —
+stage 0 ``git pull`` / resume ``git checkout`` mutate the shared mirror and
+the commit-stamped output directory would collide.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import re
 import signal
@@ -16,6 +19,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from ..checkpoint import CheckpointManager
 from ..config import (
@@ -39,7 +43,7 @@ from ..repos import (
 from ..stages.stage5 import run_stage5
 from ..utils import summarize_task_errors
 from ..wikis import DEFAULT_WIKIS_DIR, list_local_wikis
-from .progress import EventBus, WebLogHandler, WebProgressReporter
+from .progress import CURRENT_JOB_KEY, EventBus, WebProgressReporter
 
 logger = get_logger("web.job")
 
@@ -54,6 +58,8 @@ JOB_AUDIT = "audit"
 JOB_REPRODUCTION = "reproduction"
 
 DEFAULT_REPRODUCTIONS_DIR = os.path.join("~", ".code_auditor", "reproductions")
+DEFAULT_MAX_CONCURRENT_JOBS = 4
+FINISHED_JOB_RETENTION_SECONDS = 300.0
 RESUME_GIT_TIMEOUT_SECONDS = 60.0
 SHUTDOWN_TASK_TIMEOUT_SECONDS = 15.0
 INTERRUPTED_AUDIT_ERROR = (
@@ -63,7 +69,7 @@ INTERRUPTED_AUDIT_ERROR = (
 
 
 class JobConflictError(Exception):
-    """Raised when starting a job while another one is running."""
+    """Raised when a job cannot start due to a conflicting or too many jobs."""
 
 
 class JobValidationError(Exception):
@@ -243,103 +249,82 @@ async def _create_detached_worktree(repo: str, commit: str, destination: str) ->
         raise JobValidationError(str(exc)) from exc
 
 
-async def _stash_resume_leftovers(target: str, run_id: int) -> None:
-    """Stash tracked leftover changes (e.g. from older PoC agents) before resume."""
-    output = await _run_resume_git_command(
-        target,
-        "stash",
-        "push",
-        "-m",
-        f"code-auditor auto-stash before resuming run #{run_id}",
-    )
-    logger.warning(
-        "Auto-stashed leftover changes in %s before resuming run #%d.%s",
-        target,
-        run_id,
-        f" git: {output}" if output else "",
-    )
+class AuditJob:
+    """State and lifecycle for one audit or reproduction job."""
 
-
-class AuditJobManager:
-    def __init__(self, store: AuditStore | None = None) -> None:
+    def __init__(self, manager: "AuditJobManager", kind: str) -> None:
+        self.manager = manager
+        self.store = manager.store
         self.bus = EventBus()
-        self.store = store
+        self.kind = kind
         self.state: str = STATE_IDLE
-        self.kind: str = ""
         self.error: str = ""
         self.config: AuditConfig | None = None
-        self.reporter: WebProgressReporter | None = None
-        self.started_at: float = 0.0
+        self.reporter: WebProgressReporter = WebProgressReporter(self.bus)
+        self.started_at: float = time.time()
         self.ended_at: float = 0.0
-        self._task: asyncio.Task | None = None
-        self._log_handler: WebLogHandler | None = None
-        self._run_id: int | None = None
+        self.task: asyncio.Task | None = None
+        self.job_key: str = ""
+        self.run_id: int | None = None
+        # Realpath of the shared source checkout; used for same-repo mutual
+        # exclusion across concurrent jobs.
+        self.target_path: str = ""
         self.reproduction_candidate: dict | None = None
         self.reproduction_reports: list[str] = []
 
-    def recover_interrupted_runs(self) -> list[int]:
-        """Recover database rows that no task in this Web worker can own."""
-        if self.store is None:
-            return []
-        if (
-            self.state in BUSY_STATES
-            and self._task is not None
-            and not self._task.done()
-        ):
-            return []
-        run_ids = self.store.cancel_running_runs(INTERRUPTED_AUDIT_ERROR)
-        if run_ids:
-            logger.warning(
-                "Recovered interrupted audit run(s) as cancelled: %s.",
-                ", ".join(f"#{run_id}" for run_id in run_ids),
-            )
-        return run_ids
+    # ── events ────────────────────────────────────────────────────────────
 
-    def _reconcile_task_state(self) -> bool:
-        """Release a busy scheduler state whose asyncio task has disappeared."""
+    def publish_job_event(self, **extra: object) -> None:
+        """Publish a lifecycle event to the job bus and the global job bus."""
+        event = {
+            "type": "job",
+            "job_key": self.job_key,
+            "kind": self.kind,
+            "status": self.state,
+            "error": self.error,
+            "run_id": self.run_id,
+            "started_at": self.started_at,
+            **extra,
+        }
+        self.bus.publish(event)
+        self.manager.bus.publish(event)
+
+    # ── state reconciliation ──────────────────────────────────────────────
+
+    def reconcile(self) -> bool:
+        """Release a busy state whose asyncio task has disappeared."""
         if self.state not in BUSY_STATES:
             return False
-        if self._task is not None and not self._task.done():
+        if self.task is not None and not self.task.done():
             return False
         self.state = STATE_CANCELLED
         self.error = self.error or INTERRUPTED_AUDIT_ERROR
         self.ended_at = time.time()
-        self._remove_log_handler()
-        if self.store is not None and self._run_id is not None:
+        if self.store is not None and self.run_id is not None:
             self.store.cancel_running_run(
-                self._run_id,
+                self.run_id,
                 self.error,
                 ended_at=self.ended_at,
             )
-        self.bus.publish(
-            {
-                "type": "job",
-                "kind": self.kind,
-                "status": self.state,
-                "error": self.error,
-            }
-        )
+        self.publish_job_event()
         logger.warning("Released an interrupted %s scheduler task.", self.kind or "job")
         return True
 
     async def shutdown(self) -> None:
         """Persist a resumable terminal state before the Web worker exits."""
-        self._reconcile_task_state()
-        if self.state not in BUSY_STATES or self._task is None:
+        self.reconcile()
+        if self.state not in BUSY_STATES or self.task is None:
             return
         self.error = INTERRUPTED_AUDIT_ERROR
-        task = self._task
+        task = self.task
         task.cancel()
-        done, _ = await asyncio.wait(
-            {task}, timeout=SHUTDOWN_TASK_TIMEOUT_SECONDS
-        )
+        done, _ = await asyncio.wait({task}, timeout=SHUTDOWN_TASK_TIMEOUT_SECONDS)
         if not done:
             self.state = STATE_CANCELLED
             self.ended_at = time.time()
-            self._remove_log_handler()
-            if self.store is not None and self._run_id is not None:
+            if self.store is not None and self.run_id is not None:
                 self.store.cancel_running_run(
-                    self._run_id,
+                    self.run_id,
                     self.error,
                     ended_at=self.ended_at,
                 )
@@ -355,386 +340,35 @@ class AuditJobManager:
         except Exception as exc:
             logger.warning("Audit task raised while shutting down: %s", exc)
 
-    async def start(self, params: AuditStartParams) -> None:
-        self._reconcile_task_state()
-        if self.state in BUSY_STATES:
-            raise JobConflictError("An audit is already running.")
-        if bool(params.git_url) == bool(params.target):
-            raise JobValidationError(
-                "Select exactly one existing repository or Git repository URL."
-            )
-        try:
-            wiki_path = resolve_wiki_arg(params.wiki)
-        except ValueError as e:
-            raise JobValidationError(str(e)) from e
-
-        config: AuditConfig | None = None
-        if params.git_url:
-            # Pre-compute the target path so the run appears in History
-            # immediately, before the clone finishes inside _run().
-            target = repo_local_path(params.git_url, params.repos_dir)
-            if os.path.isdir(target):
-                config = self._build_config(params, target, wiki_path)
-            else:
-                config = self._build_preliminary_config(
-                    params, target, wiki_path
-                )
-        else:
-            config = self._build_config(
-                params, os.path.realpath(params.target or ""), wiki_path
-            )
-
-        self.bus.clear()
-        self.reporter = WebProgressReporter(self.bus)
-        self._install_log_handler()
-
-        self.config = config
-        self.kind = JOB_AUDIT
-        self.state = STATE_RUNNING
+    def stop(self) -> bool:
+        """Cancel the running job. Returns False if it is not running."""
+        self.reconcile()
+        if self.state not in BUSY_STATES or self.task is None:
+            return False
         self.error = ""
-        self.started_at = time.time()
-        self.ended_at = 0.0
-        self._run_id = None
-        self.reproduction_candidate = None
-        self.reproduction_reports = []
-        self._create_run_row(config)
-        self.bus.publish(
-            {
-                "type": "job",
-                "kind": self.kind,
-                "status": STATE_RUNNING,
-                "target": params.target or params.git_url,
-            }
-        )
+        self.task.cancel()
+        return True
 
-        self._task = asyncio.create_task(self._run(config, params, wiki_path))
-
-    async def resume_cancelled(
-        self,
-        run_id: int,
-        *,
-        repos_dir: str = DEFAULT_REPOS_DIR,
-        results_dir: str = DEFAULT_RESULTS_DIR,
-        wikis_dir: str = DEFAULT_WIKIS_DIR,
-    ) -> None:
-        """Start restoring a cancelled audit in its original output directory."""
-        self._reconcile_task_state()
-        if self.state in BUSY_STATES:
-            raise JobConflictError("An audit or reproduction is already running.")
-        if self.store is None:
-            raise JobValidationError("The history database is unavailable.")
-
-        run = self.store.get_run(run_id)
-        if run is None:
-            raise JobValidationError(f"Run not found: {run_id}")
-        run_status = str(run.get("status") or "")
-        if run_status not in (RUN_CANCELLED, RUN_FAILED) and not (
-            run_status == RUN_DONE and run.get("error")
-        ):
-            raise JobValidationError(
-                "Only cancelled, failed, or partially failed (done with errors) "
-                "audit runs can be continued."
-            )
-        if run.get("dirty"):
-            raise JobValidationError(
-                "This run was recorded from a dirty checkout and cannot be safely continued."
-            )
-
-        target = os.path.realpath(run.get("target") or "")
-        output_dir = os.path.realpath(run.get("output_dir") or "")
-        if not _path_is_within(target, repos_dir):
-            raise JobValidationError(
-                "The recorded source is outside the managed repository directory."
-            )
-        if not _path_is_within(output_dir, results_dir):
-            raise JobValidationError(
-                "The recorded output is outside the managed results directory."
-            )
-        if not os.path.isdir(target):
-            raise JobValidationError(f"Source repository not found: {target}")
-        if not os.path.isdir(output_dir):
-            raise JobValidationError(f"Audit output directory not found: {output_dir}")
-
-        recorded_commit = str(run.get("commit") or "")
-        recorded_target_key = str(run.get("target_key") or "")
-        if (
-            re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", recorded_commit)
-            is None
-            or not recorded_target_key
-        ):
-            raise JobValidationError(
-                "The cancelled run has no pinned source identity and cannot be safely continued."
-            )
-        current_identity = capture_repo_identity(target)
-        if current_identity.get("dirty"):
-            # Older runs let PoC agents work inside the shared mirror, which
-            # could leave it dirty. Stash the leftovers instead of refusing.
-            await _stash_resume_leftovers(target, run_id)
-            current_identity = capture_repo_identity(target)
-            if current_identity.get("dirty"):
-                raise JobValidationError(
-                    "The source checkout still has uncommitted or untracked changes "
-                    "after an automatic `git stash`; clean it before continuing."
-                )
-
-        backend = str(run.get("backend") or "")
-        if backend not in {"claude", "codex"}:
-            raise JobValidationError(f"Unsupported recorded backend: {backend or 'empty'}")
-        max_parallel = run.get("max_parallel")
-        target_au_count = run.get("target_au_count")
-        if not isinstance(max_parallel, int) or not 1 <= max_parallel <= 16:
-            raise JobValidationError("The recorded max_parallel value is invalid.")
-        if not isinstance(target_au_count, int) or (
-            target_au_count != -1 and target_au_count < 1
-        ):
-            raise JobValidationError("The recorded target analysis-unit count is invalid.")
-
-        wiki_path = _recorded_local_wiki(run.get("wiki_path"), wikis_dir)
-        if run.get("wiki_path") and wiki_path is None:
-            raise JobValidationError(
-                "The recorded Wiki is no longer available under the managed Wiki directory."
-            )
-        config = AuditConfig(
-            target=target,
-            output_dir=output_dir,
-            wiki_path=wiki_path,
-            max_parallel=max_parallel,
-            resume=True,
-            update_repo=False,
-            log_level=str(run.get("log_level") or "INFO"),
-            backend=backend,  # type: ignore[arg-type]
-            # Do not pin the recorded model id: providers rename models, so
-            # resolve it fresh from the local Claude config at agent time.
-            model=None,
-            target_au_count=target_au_count,
-            agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
-            known_disclosures=tuple(self.store.disclosure_dedupe_index()),
-        )
-        # Carry forward the original session's accounting: finish_run writes
-        # config.models_used / config.usage_stats wholesale, so seed them from
-        # the run row or the earlier session's models/costs would be lost.
-        try:
-            prior_models = json.loads(str(run.get("models_used") or "[]"))
-        except ValueError:
-            prior_models = []
-        if isinstance(prior_models, list):
-            config.models_used.extend(str(m) for m in prior_models)
-        try:
-            prior_usage = json.loads(str(run.get("usage_stats") or "{}"))
-        except ValueError:
-            prior_usage = {}
-        if isinstance(prior_usage, dict):
-            for key, value in prior_usage.items():
-                try:
-                    config.usage_stats[str(key)] = float(value)
-                except (TypeError, ValueError):
-                    continue
-        params = AuditStartParams(
-            target=target,
-            output_dir=output_dir,
-            wiki=wiki_path,
-            max_parallel=max_parallel,
-            backend=backend,
-            model=config.model,
-            target_au_count=target_au_count,
-            log_level=config.log_level,
-            repos_dir=repos_dir,
-            results_dir=results_dir,
-        )
-        self.bus.clear()
-        self.reporter = WebProgressReporter(self.bus)
-        self._install_log_handler()
-        self.config = config
-        self.kind = JOB_AUDIT
-        self.state = STATE_RESTORING
-        self.error = ""
-        self.started_at = time.time()
-        self.ended_at = 0.0
-        self._run_id = run_id
-        self.reproduction_candidate = None
-        self.reproduction_reports = []
-        self.bus.publish(
-            {
-                "type": "job",
-                "kind": self.kind,
-                "status": STATE_RESTORING,
-                "target": target,
-                "run_id": run_id,
-                "resumed": True,
-            }
-        )
-        self._task = asyncio.create_task(
-            self._restore_and_run_cancelled(
-                run_id=run_id,
-                target=target,
-                recorded_commit=recorded_commit,
-                recorded_target_key=recorded_target_key,
-                branch=str(run.get("branch") or ""),
-                config=config,
-                params=params,
-                wiki_path=wiki_path,
-            )
-        )
-
-    async def _restore_and_run_cancelled(
-        self,
-        *,
-        run_id: int,
-        target: str,
-        recorded_commit: str,
-        recorded_target_key: str,
-        branch: str,
-        config: AuditConfig,
-        params: AuditStartParams,
-        wiki_path: str | None,
-    ) -> None:
-        """Restore a pinned checkout, then continue the existing audit."""
-        assert self.store is not None
-        try:
-            logger.info(
-                "Restoring Run #%d to commit %s.",
-                run_id,
-                recorded_commit,
-            )
-            identity = capture_repo_identity(target)
-            if identity.get("dirty"):
-                raise JobValidationError(
-                    "The source checkout changed and is now dirty; clean it before continuing."
-                )
-            await _checkout_recorded_revision(target, recorded_commit, branch)
-            identity = capture_repo_identity(target)
-            if identity.get("dirty"):
-                raise JobValidationError(
-                    "The restored source checkout is dirty after checkout/submodule update."
-                )
-            if identity.get("commit") != recorded_commit:
-                raise JobValidationError(
-                    "The restored source checkout does not match the cancelled run commit "
-                    f"({recorded_commit[:12]})."
-                )
-            if compute_target_key(identity) != recorded_target_key:
-                raise JobValidationError(
-                    "The source or submodule identity no longer matches the cancelled run."
-                )
-            if not self.store.resume_cancelled_run(run_id):
-                raise JobConflictError(
-                    "The run is no longer resumable; refresh History and try again."
-                )
-        except asyncio.CancelledError:
-            self.state = STATE_CANCELLED
-            logger.info("Cancelled audit restoration stopped.")
-            self._finish_restore_attempt()
-            return
-        except Exception as exc:
-            self.state = STATE_FAILED
-            self.error = str(exc)
-            logger.exception("Cancelled audit restoration failed: %s", exc)
-            self._finish_restore_attempt()
-            return
-
-        self.state = STATE_RUNNING
-        self.bus.publish(
-            {
-                "type": "job",
-                "kind": self.kind,
-                "status": STATE_RUNNING,
-                "target": target,
-                "run_id": run_id,
-                "resumed": True,
-            }
-        )
-        await self._run(config, params, wiki_path)
-
-    def _finish_restore_attempt(self) -> None:
-        self.ended_at = time.time()
-        self._remove_log_handler()
-        self.bus.publish(
-            {
-                "type": "job",
-                "kind": self.kind,
-                "status": self.state,
-                "error": self.error,
-            }
-        )
-
-    async def start_reproduction(self, params: ReproductionStartParams) -> None:
-        """Retest one exactly reproduced History vulnerability in isolation."""
-        self._reconcile_task_state()
-        if self.state in BUSY_STATES:
-            raise JobConflictError("An audit or reproduction is already running.")
-        if self.store is None:
-            raise JobValidationError("The history database is unavailable.")
-        candidate = self.store.get_reproduction_candidate(
-            params.run_id, params.vuln_id
-        )
-        if candidate is None:
-            raise JobValidationError(
-                "The selected vulnerability is missing or is not exactly reproduced."
-            )
-        if not candidate.get("commit"):
-            raise JobValidationError("The selected History run has no source commit.")
-        if not os.path.isdir(candidate["target"]):
-            raise JobValidationError(
-                f"Source repository not found: {candidate['target']}"
-            )
-
-        repo_name = _safe_path_segment(candidate.get("repo_name") or "repo")
-        vuln_segment = _safe_path_segment(candidate["vuln_id"])
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        unique_suffix = str(time.time_ns())[-6:]
-        reproduction_root = os.path.realpath(
-            os.path.expanduser(
-                params.output_dir
-                or os.path.join(
-                    params.reproductions_dir,
-                    repo_name,
-                    candidate["commit"][:12],
-                    vuln_segment,
-                    f"{stamp}-{unique_suffix}",
-                )
-            )
-        )
-        if os.path.exists(reproduction_root):
-            raise JobValidationError(
-                f"Reproduction output already exists: {reproduction_root}"
-            )
-
-        self.bus.clear()
-        self.reporter = WebProgressReporter(self.bus)
-        self._install_log_handler()
-        self.kind = JOB_REPRODUCTION
-        self.config = None
-        self.state = STATE_RUNNING
-        self.error = ""
-        self.started_at = time.time()
-        self.ended_at = 0.0
-        self._run_id = None
-        self.reproduction_candidate = {
-            key: candidate.get(key)
-            for key in (
-                "run_id",
-                "vuln_id",
-                "title",
-                "repo_name",
-                "commit",
-                "severity",
-                "cvss_score",
-            )
+    def status(self) -> dict:
+        self.reconcile()
+        return {
+            "job_key": self.job_key,
+            "kind": self.kind,
+            "state": self.state,
+            "error": self.error,
+            "target": self.config.target if self.config else "",
+            "output_dir": self.config.output_dir if self.config else "",
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "run_id": self.run_id,
+            "models_used": list(self.config.models_used) if self.config else [],
+            "usage_stats": dict(self.config.usage_stats) if self.config else {},
+            "stages": self.reporter.snapshot(),
+            "reproduction_candidate": self.reproduction_candidate,
+            "reproduction_reports": self.reproduction_reports,
         }
-        self.reproduction_reports = []
-        self.bus.publish(
-            {
-                "type": "job",
-                "kind": self.kind,
-                "status": STATE_RUNNING,
-                "target": candidate["target"],
-                "run_id": candidate["run_id"],
-                "vuln_id": candidate["vuln_id"],
-            }
-        )
-        self._task = asyncio.create_task(
-            self._run_reproduction(params, candidate, reproduction_root)
-        )
+
+    # ── config / run-row helpers ────────────────────────────────────────────
 
     def _build_config(
         self, params: AuditStartParams, target: str, wiki_path: str | None
@@ -805,7 +439,7 @@ class AuditJobManager:
         if self.store is None:
             return
         try:
-            self._run_id = self.store.create_run(config, started_at=self.started_at)
+            self.run_id = self.store.create_run(config, started_at=self.started_at)
         except Exception as e:
             logger.warning("Failed to create history database run row: %s", e)
 
@@ -824,6 +458,8 @@ class AuditJobManager:
         except Exception as e:
             logger.warning("Failed to seed analysis units: %s", e)
 
+    # ── audit pipeline ──────────────────────────────────────────────────────
+
     async def _run(
         self,
         config: AuditConfig | None,
@@ -838,12 +474,12 @@ class AuditJobManager:
                 self.config = config
                 if (
                     self.store is not None
-                    and self._run_id is not None
+                    and self.run_id is not None
                     and prev_output_dir
                     and config.output_dir != prev_output_dir
                 ):
                     self.store.update_run_output_dir(
-                        self._run_id, config.output_dir
+                        self.run_id, config.output_dir
                     )
             assert config is not None
             self._seed_analysis_units(config)
@@ -863,11 +499,10 @@ class AuditJobManager:
                 self.state = STATE_CANCELLED
                 self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
-            self._remove_log_handler()
-            if self.store is not None and self._run_id is not None:
+            if self.store is not None and self.run_id is not None:
                 try:
                     self.store.finish_run(
-                        self._run_id,
+                        self.run_id,
                         self.state,
                         self.error,
                         self.ended_at,
@@ -876,14 +511,81 @@ class AuditJobManager:
                     )
                 except Exception as e:
                     logger.warning("Failed to update history database run row: %s", e)
-            self.bus.publish(
-                {
-                    "type": "job",
-                    "kind": self.kind,
-                    "status": self.state,
-                    "error": self.error,
-                }
+            self.publish_job_event()
+
+    async def _restore_and_run_cancelled(
+        self,
+        *,
+        run_id: int,
+        target: str,
+        recorded_commit: str,
+        recorded_target_key: str,
+        branch: str,
+        config: AuditConfig,
+        params: AuditStartParams,
+        wiki_path: str | None,
+    ) -> None:
+        """Restore a pinned checkout, then continue the existing audit."""
+        assert self.store is not None
+        try:
+            logger.info(
+                "Restoring Run #%d to commit %s.",
+                run_id,
+                recorded_commit,
             )
+            identity = capture_repo_identity(target)
+            if identity.get("dirty"):
+                # Older runs let PoC agents work inside the shared mirror,
+                # which could leave it dirty. Stash the leftovers instead of
+                # refusing.
+                await _stash_resume_leftovers(target, run_id)
+                identity = capture_repo_identity(target)
+                if identity.get("dirty"):
+                    raise JobValidationError(
+                        "The source checkout still has uncommitted or untracked "
+                        "changes after an automatic `git stash`; clean it before "
+                        "continuing."
+                    )
+            await _checkout_recorded_revision(target, recorded_commit, branch)
+            identity = capture_repo_identity(target)
+            if identity.get("dirty"):
+                raise JobValidationError(
+                    "The restored source checkout is dirty after checkout/submodule update."
+                )
+            if identity.get("commit") != recorded_commit:
+                raise JobValidationError(
+                    "The restored source checkout does not match the cancelled run commit "
+                    f"({recorded_commit[:12]})."
+                )
+            if compute_target_key(identity) != recorded_target_key:
+                raise JobValidationError(
+                    "The source or submodule identity no longer matches the cancelled run."
+                )
+            if not self.store.resume_cancelled_run(run_id):
+                raise JobConflictError(
+                    "The run is no longer resumable; refresh History and try again."
+                )
+        except asyncio.CancelledError:
+            self.state = STATE_CANCELLED
+            logger.info("Cancelled audit restoration stopped.")
+            self._finish_restore_attempt()
+            return
+        except Exception as exc:
+            self.state = STATE_FAILED
+            self.error = str(exc)
+            logger.exception("Cancelled audit restoration failed: %s", exc)
+            self._finish_restore_attempt()
+            return
+
+        self.state = STATE_RUNNING
+        self.publish_job_event(target=target, resumed=True)
+        await self._run(config, params, wiki_path)
+
+    def _finish_restore_attempt(self) -> None:
+        self.ended_at = time.time()
+        self.publish_job_event()
+
+    # ── reproduction pipeline ───────────────────────────────────────────────
 
     async def _run_reproduction(
         self,
@@ -924,7 +626,6 @@ class AuditJobManager:
                 model=params.model,
                 agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             )
-            assert self.reporter is not None
             self.reporter.begin_stage(
                 5, f"Retesting Run #{candidate['run_id']} {candidate['vuln_id']}"
             )
@@ -956,51 +657,440 @@ class AuditJobManager:
                 self.state = STATE_CANCELLED
                 self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
-            self._remove_log_handler()
-            self.bus.publish(
-                {
-                    "type": "job",
-                    "kind": self.kind,
-                    "status": self.state,
-                    "error": self.error,
-                }
+            self.publish_job_event()
+
+
+async def _stash_resume_leftovers(target: str, run_id: int) -> None:
+    """Stash tracked leftover changes (e.g. from older PoC agents) before resume."""
+    output = await _run_resume_git_command(
+        target,
+        "stash",
+        "push",
+        "-m",
+        f"code-auditor auto-stash before resuming run #{run_id}",
+    )
+    logger.warning(
+        "Auto-stashed leftover changes in %s before resuming run #%d.%s",
+        target,
+        run_id,
+        f" git: {output}" if output else "",
+    )
+
+
+class AuditJobManager:
+    """Registry of concurrently running web jobs.
+
+    Jobs are keyed by ``job_key`` (the run id for audits, a generated id for
+    reproductions). Starting a job is atomic with respect to other starts:
+    validation and registration happen synchronously before the job's
+    asyncio task is created, so the conflict checks below cannot interleave
+    on the single event loop.
+    """
+
+    def __init__(
+        self,
+        store: AuditStore | None = None,
+        *,
+        max_concurrent_jobs: int = DEFAULT_MAX_CONCURRENT_JOBS,
+    ) -> None:
+        self.store = store
+        self.max_concurrent_jobs = max(1, max_concurrent_jobs)
+        # Global lifecycle bus: every job's "job" events, run-tagged, for the
+        # sidebar / History live badges.
+        self.bus = EventBus()
+        self._jobs: dict[str, AuditJob] = {}
+
+    # ── registry ────────────────────────────────────────────────────────────
+
+    def get_job(self, job_key: str) -> AuditJob | None:
+        job = self._jobs.get(job_key)
+        if job is not None:
+            job.reconcile()
+        return job
+
+    def bus_for_job(self, job_key: str) -> EventBus | None:
+        """EventBus lookup used by the process-wide web log handler."""
+        job = self._jobs.get(job_key)
+        return job.bus if job is not None else None
+
+    def list_jobs(self) -> list[dict]:
+        self._prune_finished_jobs()
+        return [job.status() for job in self._jobs.values()]
+
+    def _active_jobs(self) -> list[AuditJob]:
+        active = []
+        for job in self._jobs.values():
+            job.reconcile()
+            if job.state in BUSY_STATES:
+                active.append(job)
+        return active
+
+    def _prune_finished_jobs(self) -> None:
+        now = time.time()
+        for key, job in list(self._jobs.items()):
+            job.reconcile()
+            if (
+                job.state not in BUSY_STATES
+                and job.ended_at
+                and now - job.ended_at > FINISHED_JOB_RETENTION_SECONDS
+            ):
+                del self._jobs[key]
+
+    def _check_start_allowed(
+        self, target_path: str | None, run_id: int | None = None
+    ) -> None:
+        active = self._active_jobs()
+        if len(active) >= self.max_concurrent_jobs:
+            raise JobConflictError(
+                f"Concurrent job limit reached ({self.max_concurrent_jobs}); "
+                "wait for a running job to finish or stop one."
+            )
+        for job in active:
+            if run_id is not None and job.run_id == run_id:
+                raise JobConflictError(f"Run #{run_id} already has a running job.")
+            if target_path and job.target_path == target_path:
+                raise JobConflictError(
+                    "A job is already running for this repository; concurrent "
+                    "jobs must target different repositories."
+                )
+
+    def _register(self, job: AuditJob) -> AuditJob:
+        self._jobs[job.job_key] = job
+        return job
+
+    @staticmethod
+    def _launch(job: AuditJob, coroutine) -> None:
+        """Start the job task with the log-routing context variable set."""
+        token = CURRENT_JOB_KEY.set(job.job_key)
+        try:
+            job.task = asyncio.create_task(coroutine)
+        finally:
+            CURRENT_JOB_KEY.reset(token)
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+
+    def recover_interrupted_runs(self) -> list[int]:
+        """Recover database rows that no task in this Web worker can own."""
+        if self.store is None:
+            return []
+        if self._active_jobs():
+            return []
+        run_ids = self.store.cancel_running_runs(INTERRUPTED_AUDIT_ERROR)
+        if run_ids:
+            logger.warning(
+                "Recovered interrupted audit run(s) as cancelled: %s.",
+                ", ".join(f"#{run_id}" for run_id in run_ids),
+            )
+        return run_ids
+
+    async def shutdown(self) -> None:
+        """Persist resumable terminal states before the Web worker exits."""
+        await asyncio.gather(
+            *(job.shutdown() for job in list(self._jobs.values())),
+            return_exceptions=True,
+        )
+
+    def stop(self, job_key: str) -> AuditJob | None:
+        """Cancel one job. Returns the job, or None if it was not running."""
+        job = self.get_job(job_key)
+        if job is None or not job.stop():
+            return None
+        return job
+
+    async def start(self, params: AuditStartParams) -> AuditJob:
+        self._prune_finished_jobs()
+        if bool(params.git_url) == bool(params.target):
+            raise JobValidationError(
+                "Select exactly one existing repository or Git repository URL."
+            )
+        try:
+            wiki_path = resolve_wiki_arg(params.wiki)
+        except ValueError as e:
+            raise JobValidationError(str(e)) from e
+
+        config: AuditConfig | None = None
+        if params.git_url:
+            # Pre-compute the target path so the run appears in History
+            # immediately, before the clone finishes inside _run().
+            target = repo_local_path(params.git_url, params.repos_dir)
+            target_path = os.path.realpath(target)
+            job = AuditJob(self, JOB_AUDIT)
+            if os.path.isdir(target):
+                config = job._build_config(params, target_path, wiki_path)
+            else:
+                config = job._build_preliminary_config(params, target_path, wiki_path)
+        else:
+            target_path = os.path.realpath(params.target or "")
+            job = AuditJob(self, JOB_AUDIT)
+            config = job._build_config(params, target_path, wiki_path)
+
+        self._check_start_allowed(target_path)
+        job.target_path = target_path
+        job.config = config
+        job.state = STATE_RUNNING
+        job._create_run_row(config)
+        job.job_key = (
+            str(job.run_id)
+            if job.run_id is not None
+            else f"audit-{uuid4().hex[:12]}"
+        )
+        self._register(job)
+        job.publish_job_event(target=params.target or params.git_url)
+        self._launch(job, job._run(config, params, wiki_path))
+        return job
+
+    async def resume_cancelled(
+        self,
+        run_id: int,
+        *,
+        repos_dir: str = DEFAULT_REPOS_DIR,
+        results_dir: str = DEFAULT_RESULTS_DIR,
+        wikis_dir: str = DEFAULT_WIKIS_DIR,
+    ) -> AuditJob:
+        """Start restoring a cancelled audit in its original output directory."""
+        self._prune_finished_jobs()
+        if self.store is None:
+            raise JobValidationError("The history database is unavailable.")
+
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise JobValidationError(f"Run not found: {run_id}")
+        run_status = str(run.get("status") or "")
+        if run_status not in (RUN_CANCELLED, RUN_FAILED) and not (
+            run_status == RUN_DONE and run.get("error")
+        ):
+            raise JobValidationError(
+                "Only cancelled, failed, or partially failed (done with errors) "
+                "audit runs can be continued."
+            )
+        if run.get("dirty"):
+            raise JobValidationError(
+                "This run was recorded from a dirty checkout and cannot be safely continued."
             )
 
-    def stop(self) -> bool:
-        """Cancel the running audit. Returns False if nothing is running."""
-        self._reconcile_task_state()
-        if self.state not in BUSY_STATES or self._task is None:
-            return False
-        self.error = ""
-        self._task.cancel()
-        return True
+        target = os.path.realpath(run.get("target") or "")
+        output_dir = os.path.realpath(run.get("output_dir") or "")
+        if not _path_is_within(target, repos_dir):
+            raise JobValidationError(
+                "The recorded source is outside the managed repository directory."
+            )
+        if not _path_is_within(output_dir, results_dir):
+            raise JobValidationError(
+                "The recorded output is outside the managed results directory."
+            )
+        # Clone never completed: target dir absent and no identity was ever recorded.
+        # Re-dispatch as a fresh clone reusing the existing run row.
+        if not os.path.isdir(target) and not run.get("commit") and not run.get("target_key"):
+            repos_root = os.path.realpath(os.path.expanduser(repos_dir))
+            rel = os.path.relpath(target, repos_root)
+            git_url = "https://" + rel.replace(os.sep, "/")
+            backend = str(run.get("backend") or "")
+            if backend not in {"claude", "codex"}:
+                raise JobValidationError(f"Unsupported recorded backend: {backend or 'empty'}")
+            max_parallel = run.get("max_parallel")
+            target_au_count = run.get("target_au_count")
+            if not isinstance(max_parallel, int) or not 1 <= max_parallel <= 16:
+                raise JobValidationError("The recorded max_parallel value is invalid.")
+            if not isinstance(target_au_count, int) or (
+                target_au_count != -1 and target_au_count < 1
+            ):
+                raise JobValidationError("The recorded target analysis-unit count is invalid.")
+            wiki_path = _recorded_local_wiki(run.get("wiki_path"), wikis_dir)
+            clone_params = AuditStartParams(
+                git_url=git_url,
+                repos_dir=repos_dir,
+                results_dir=results_dir,
+                max_parallel=max_parallel,
+                backend=backend,
+                model=None,
+                target_au_count=target_au_count,
+                log_level=str(run.get("log_level") or "INFO"),
+                wiki=wiki_path,
+            )
+            self._check_start_allowed(target, run_id=run_id)
+            job = AuditJob(self, JOB_AUDIT)
+            config = job._build_preliminary_config(clone_params, target, wiki_path)
+            if not self.store.resume_cancelled_run(run_id):
+                raise JobConflictError(
+                    "The run is no longer resumable; refresh History and try again."
+                )
+            job.target_path = target
+            job.config = config
+            job.state = STATE_RUNNING
+            job.run_id = run_id
+            job.job_key = str(run_id)
+            self._register(job)
+            job.publish_job_event(target=git_url, resumed=True)
+            self._launch(job, job._run(config, clone_params, wiki_path))
+            return job
 
-    def status(self) -> dict:
-        self._reconcile_task_state()
-        return {
-            "kind": self.kind,
-            "state": self.state,
-            "error": self.error,
-            "target": self.config.target if self.config else "",
-            "output_dir": self.config.output_dir if self.config else "",
-            "started_at": self.started_at,
-            "ended_at": self.ended_at,
-            "run_id": self._run_id,
-            "models_used": list(self.config.models_used) if self.config else [],
-            "usage_stats": dict(self.config.usage_stats) if self.config else {},
-            "stages": self.reporter.snapshot() if self.reporter else [],
-            "reproduction_candidate": self.reproduction_candidate,
-            "reproduction_reports": self.reproduction_reports,
+        if not os.path.isdir(target):
+            raise JobValidationError(f"Source repository not found: {target}")
+        if not os.path.isdir(output_dir):
+            raise JobValidationError(f"Audit output directory not found: {output_dir}")
+
+        recorded_commit = str(run.get("commit") or "")
+        recorded_target_key = str(run.get("target_key") or "")
+        if (
+            re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", recorded_commit)
+            is None
+            or not recorded_target_key
+        ):
+            raise JobValidationError(
+                "The cancelled run has no pinned source identity and cannot be safely continued."
+            )
+
+        backend = str(run.get("backend") or "")
+        if backend not in {"claude", "codex"}:
+            raise JobValidationError(f"Unsupported recorded backend: {backend or 'empty'}")
+        max_parallel = run.get("max_parallel")
+        target_au_count = run.get("target_au_count")
+        if not isinstance(max_parallel, int) or not 1 <= max_parallel <= 16:
+            raise JobValidationError("The recorded max_parallel value is invalid.")
+        if not isinstance(target_au_count, int) or (
+            target_au_count != -1 and target_au_count < 1
+        ):
+            raise JobValidationError("The recorded target analysis-unit count is invalid.")
+
+        wiki_path = _recorded_local_wiki(run.get("wiki_path"), wikis_dir)
+        if run.get("wiki_path") and wiki_path is None:
+            raise JobValidationError(
+                "The recorded Wiki is no longer available under the managed Wiki directory."
+            )
+        config = AuditConfig(
+            target=target,
+            output_dir=output_dir,
+            wiki_path=wiki_path,
+            max_parallel=max_parallel,
+            resume=True,
+            update_repo=False,
+            log_level=str(run.get("log_level") or "INFO"),
+            backend=backend,  # type: ignore[arg-type]
+            # Do not pin the recorded model id: providers rename models, so
+            # resolve it fresh from the local Claude config at agent time.
+            model=None,
+            target_au_count=target_au_count,
+            agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+            known_disclosures=tuple(self.store.disclosure_dedupe_index()),
+        )
+        # Carry forward the original session's accounting: finish_run writes
+        # config.models_used / config.usage_stats wholesale, so seed them from
+        # the run row or the earlier session's models/costs would be lost.
+        try:
+            prior_models = json.loads(str(run.get("models_used") or "[]"))
+        except ValueError:
+            prior_models = []
+        if isinstance(prior_models, list):
+            config.models_used.extend(str(m) for m in prior_models)
+        try:
+            prior_usage = json.loads(str(run.get("usage_stats") or "{}"))
+        except ValueError:
+            prior_usage = {}
+        if isinstance(prior_usage, dict):
+            for key, value in prior_usage.items():
+                try:
+                    config.usage_stats[str(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        params = AuditStartParams(
+            target=target,
+            output_dir=output_dir,
+            wiki=wiki_path,
+            max_parallel=max_parallel,
+            backend=backend,
+            model=config.model,
+            target_au_count=target_au_count,
+            log_level=config.log_level,
+            repos_dir=repos_dir,
+            results_dir=results_dir,
+        )
+        self._check_start_allowed(target, run_id=run_id)
+        job = AuditJob(self, JOB_AUDIT)
+        job.target_path = target
+        job.config = config
+        job.state = STATE_RESTORING
+        job.run_id = run_id
+        job.job_key = str(run_id)
+        self._register(job)
+        job.publish_job_event(target=target, resumed=True)
+        self._launch(
+            job,
+            job._restore_and_run_cancelled(
+                run_id=run_id,
+                target=target,
+                recorded_commit=recorded_commit,
+                recorded_target_key=recorded_target_key,
+                branch=str(run.get("branch") or ""),
+                config=config,
+                params=params,
+                wiki_path=wiki_path,
+            ),
+        )
+        return job
+
+    async def start_reproduction(self, params: ReproductionStartParams) -> AuditJob:
+        """Retest one exactly reproduced History vulnerability in isolation."""
+        self._prune_finished_jobs()
+        if self.store is None:
+            raise JobValidationError("The history database is unavailable.")
+        candidate = self.store.get_reproduction_candidate(
+            params.run_id, params.vuln_id
+        )
+        if candidate is None:
+            raise JobValidationError(
+                "The selected vulnerability is missing or is not exactly reproduced."
+            )
+        if not candidate.get("commit"):
+            raise JobValidationError("The selected History run has no source commit.")
+        if not os.path.isdir(candidate["target"]):
+            raise JobValidationError(
+                f"Source repository not found: {candidate['target']}"
+            )
+
+        repo_name = _safe_path_segment(candidate.get("repo_name") or "repo")
+        vuln_segment = _safe_path_segment(candidate["vuln_id"])
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        unique_suffix = str(time.time_ns())[-6:]
+        reproduction_root = os.path.realpath(
+            os.path.expanduser(
+                params.output_dir
+                or os.path.join(
+                    params.reproductions_dir,
+                    repo_name,
+                    candidate["commit"][:12],
+                    vuln_segment,
+                    f"{stamp}-{unique_suffix}",
+                )
+            )
+        )
+        if os.path.exists(reproduction_root):
+            raise JobValidationError(
+                f"Reproduction output already exists: {reproduction_root}"
+            )
+
+        self._check_start_allowed(os.path.realpath(candidate["target"]))
+        job = AuditJob(self, JOB_REPRODUCTION)
+        job.target_path = os.path.realpath(candidate["target"])
+        job.state = STATE_RUNNING
+        job.run_id = None
+        job.job_key = f"repro-{uuid4().hex[:12]}"
+        job.reproduction_candidate = {
+            key: candidate.get(key)
+            for key in (
+                "run_id",
+                "vuln_id",
+                "title",
+                "repo_name",
+                "commit",
+                "severity",
+                "cvss_score",
+            )
         }
-
-    def _install_log_handler(self) -> None:
-        self._remove_log_handler()
-        handler = WebLogHandler(self.bus)
-        handler.setLevel(logging.DEBUG)
-        logging.getLogger("code_auditor").addHandler(handler)
-        self._log_handler = handler
-
-    def _remove_log_handler(self) -> None:
-        if self._log_handler is not None:
-            logging.getLogger("code_auditor").removeHandler(self._log_handler)
-            self._log_handler = None
+        self._register(job)
+        job.publish_job_event(
+            target=candidate["target"],
+            source_run_id=candidate["run_id"],
+            vuln_id=candidate["vuln_id"],
+        )
+        self._launch(job, job._run_reproduction(params, candidate, reproduction_root))
+        return job

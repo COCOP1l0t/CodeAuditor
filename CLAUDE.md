@@ -69,9 +69,10 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 - **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
 - **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
-- **Web settings boundary**: backend/model/log level and managed paths come only from `~/.code_auditor/settings.json`; browser requests cannot override them
+- **Web settings boundary**: backend/model/log level, managed paths, and `max_concurrent_jobs` come only from `~/.code_auditor/settings.json`; browser requests cannot override them
 - **Logging tiers**: INFO is reserved for stage-level milestones (`Stage N: ...`); per-tool-call agent activity, subagent lifecycle, and per-file validation results log at DEBUG and always persist to the task's `agent.log` regardless of level
-- **Web layout**: audits are created from the "New Audit" sidebar dialog; `#/` lands on History and every run row opens a detail page (`#/run/{id}`) with Stages, Logs, and Results — live via SSE when the run is the active job, otherwise reconstructed from checkpoint markers (`server._run_stage_summary`) and `/api/history/{id}/results`
+- **Web multi-job model**: multiple audits run concurrently (capped by `max_concurrent_jobs`, default 4); jobs sharing a source repo mirror are mutually exclusive (409). Each job has its own `EventBus` and per-run SSE endpoints (`/api/audit/{run_id}/events`); one process-wide `WebLogHandler` routes log records to the owning job via `progress.CURRENT_JOB_KEY`. `GET /api/jobs` + `/api/jobs/events` drive the sidebar job list and History live badges
+- **Web layout**: audits are created from the "New Audit" sidebar dialog; `#/` lands on History and every run row opens a detail page (`#/run/{id}`) with Stages, Logs, and Results — live via the run's own SSE stream when it has a running job, otherwise reconstructed from checkpoint markers (`server._run_stage_summary`) and `/api/history/{id}/results`
 - **Web Wiki discovery**: optional Wikis are discovered from `~/.code_auditor/wiki/` and selected by opaque local name; `wiki_path` is not a Web config field
 - **Disclosure storage boundary**: SQLite owns Disclosure metadata, review status, dedupe identity, and artifact indexes; Stage 5/6 reports remain filesystem artifacts and there is no registry-path setting
 
@@ -94,9 +95,10 @@ code_auditor/
 ├── stages/              # stage0–stage6 (one file per stage)
 ├── parsing/             # stage2.py — extract structured data from agent output
 ├── validation/          # common.py + stage1–stage6 — validate agent output format
-├── web/                 # FastAPI web UI (--web): server.py endpoints, job.py single-job
-│                        #   manager, progress.py EventBus/SSE + duck-typed tui reporter,
-│                        #   static/ vanilla-JS page
+├── web/                 # FastAPI web UI (--web): server.py endpoints, job.py multi-job
+│                        #   registry (per-job EventBus, same-repo mutex, concurrency cap),
+│                        #   progress.py EventBus/SSE + ContextVar log routing + duck-typed
+│                        #   tui reporter, static/ vanilla-JS page
 └── tests/
 prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
 ```

@@ -2,9 +2,12 @@
 
 The web mode reuses the duck-typed ``tui`` parameter of ``run_audit``:
 ``WebProgressReporter`` implements ``begin_stage`` / ``stage_progress`` /
-``end_stage`` and publishes events to an ``EventBus``, which streams them to
-browsers over SSE. Log records from the ``code_auditor`` logger are captured
-via ``WebLogHandler`` (mirroring the TUI's ``_TUILogHandler``).
+``end_stage`` and publishes events to a per-job ``EventBus``, which streams
+them to browsers over per-job SSE endpoints. Log records from the
+``code_auditor`` logger are captured by a single process-wide
+``WebLogHandler`` and routed to the owning job's bus via the
+``CURRENT_JOB_KEY`` context variable (set by the job manager before spawning
+each job task and inherited by its child tasks).
 """
 from __future__ import annotations
 
@@ -12,10 +15,20 @@ import asyncio
 import logging
 import time
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Callable
 
 MAX_WEB_LOG_MESSAGE_CHARS = 20_000
 MAX_SSE_SUBSCRIBER_EVENTS = 500
+
+#: Key of the web job the current asyncio task belongs to. The job manager
+#: sets this before spawning a job task; ``asyncio.create_task`` copies the
+#: context, so every agent sub-task inherits it and its log records route to
+#: the correct per-job event bus.
+CURRENT_JOB_KEY: ContextVar[str | None] = ContextVar(
+    "code_auditor_web_job_key", default=None
+)
 
 
 def _priority_event(event: dict) -> bool:
@@ -135,15 +148,27 @@ class EventBus:
 
 
 class WebLogHandler(logging.Handler):
-    """Captures ``code_auditor`` log records and publishes them as log events."""
+    """Routes ``code_auditor`` log records to the owning job's event bus.
+
+    One instance is installed process-wide at server startup. ``emit`` reads
+    ``CURRENT_JOB_KEY`` to find the job that produced the record and looks up
+    that job's bus; records logged outside any job task (startup, request
+    handlers) are dropped from the web stream.
+    """
 
     _FORMATTER = logging.Formatter()
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(self, bus_for_job: Callable[[str], "EventBus | None"]) -> None:
         super().__init__()
-        self._bus = bus
+        self.bus_for_job = bus_for_job
 
     def emit(self, record: logging.LogRecord) -> None:
+        job_key = CURRENT_JOB_KEY.get()
+        if job_key is None:
+            return
+        bus = self.bus_for_job(job_key)
+        if bus is None:
+            return
         try:
             ts = self._FORMATTER.formatTime(record, datefmt="[%x %X]")
             message = record.getMessage()
@@ -156,7 +181,7 @@ class WebLogHandler(logging.Handler):
                     message[:MAX_WEB_LOG_MESSAGE_CHARS]
                     + "\n… Web log event truncated; see agent.log for full output."
                 )
-            self._bus.publish(
+            bus.publish(
                 {
                     "type": "log",
                     "level": record.levelname,
@@ -165,6 +190,21 @@ class WebLogHandler(logging.Handler):
             )
         except Exception:
             self.handleError(record)
+
+
+def install_web_log_handler(
+    bus_for_job: Callable[[str], "EventBus | None"],
+) -> WebLogHandler:
+    """Attach the routing handler to the ``code_auditor`` logger once."""
+    root = logging.getLogger("code_auditor")
+    for handler in root.handlers:
+        if isinstance(handler, WebLogHandler):
+            handler.bus_for_job = bus_for_job
+            return handler
+    handler = WebLogHandler(bus_for_job)
+    handler.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+    return handler
 
 
 @dataclass

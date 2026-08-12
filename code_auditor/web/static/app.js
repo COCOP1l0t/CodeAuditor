@@ -22,10 +22,9 @@ const STATUS_LABEL = {
 const $ = (id) => document.getElementById(id);
 const form = $("audit-form");
 const logPane = $("log-pane");
-const jobBadge = $("job-badge");
+const jobList = $("job-list");
 const jobStatusPanel = $("job-status-panel");
 const btnStart = $("btn-start");
-const btnStop = $("btn-stop");
 const formError = $("form-error");
 const stagesTbody = document.querySelector("#stages-table tbody");
 const resultsPanel = $("results-panel");
@@ -38,13 +37,19 @@ const reproductionFormError = $("r-form-error");
 const reproductionResultsPanel = $("reproduction-results-panel");
 const reproductionViewerPanel = $("reproduction-viewer-panel");
 
-let jobState = "idle";
-let jobKind = "audit";
-// Run detail page live/static tracking: when the displayed run is not the
-// active job, the Results panel shows that run's recorded artifacts and live
-// job updates must not clobber them.
-let activeAuditRunId = null;
-let runDetailStatic = false;
+// Active and recently finished jobs, keyed by job_key ("<run_id>" for audits,
+// "repro-…" for reproductions). Populated from /api/jobs at boot and kept
+// current by the /api/jobs/events lifecycle stream; busy entries only are
+// meaningful for liveness checks.
+const activeJobs = new Map();
+// Run id currently streamed into the run detail page's Stages/Logs panels.
+let liveDetailRunId = null;
+// Run id currently displayed on the run detail page (live or static).
+let detailRunId = null;
+let detailEventSource = null;
+// Reproduction job currently attached to the Reproduction view.
+let activeReproKey = null;
+let reproEventSource = null;
 let reproductionCandidates = [];
 let configuredGitUrl = "";
 let managedResultsDir = "";
@@ -92,8 +97,17 @@ const tableCollator = new Intl.Collator(undefined, {
   sensitivity: "base",
 });
 
-function isJobBusy(state = jobState) {
-  return BUSY_JOB_STATES.has(state);
+function busyJobs() {
+  return [...activeJobs.values()].filter((j) => BUSY_JOB_STATES.has(j.state));
+}
+
+function busyJobForRun(runId) {
+  const job = activeJobs.get(String(runId));
+  return job && BUSY_JOB_STATES.has(job.state) ? job : null;
+}
+
+function busyReproductionJob() {
+  return busyJobs().find((j) => j.kind === "reproduction") || null;
 }
 
 // ── Config form ─────────────────────────────────────────────────────────────
@@ -259,22 +273,13 @@ form.addEventListener("submit", async (e) => {
       return;
     }
     const data = await res.json();
-    setJobState(data.state || "running", data.error, data.kind || "audit");
-    activeAuditRunId = data.run_id || null;
+    applyJobStatus(data);
     newAuditDialog.close();
     // The new run is tracked in History; open its detail page (which shows
     // Stages, Logs, and Results live) when the row already exists.
     location.hash = data.run_id ? `#/run/${data.run_id}` : "#/history";
   } catch (err) {
     formError.textContent = `Start failed: ${err}`;
-  }
-});
-
-btnStop.addEventListener("click", async () => {
-  try {
-    await fetch("/api/audit/stop", { method: "POST" });
-  } catch (e) {
-    // status stream will reconcile state
   }
 });
 
@@ -454,8 +459,9 @@ $("r-commit-select").addEventListener("change", () => {
 $("r-bug-select").addEventListener("change", renderReproductionCandidate);
 
 function updateReproductionStartAvailability() {
+  // The Reproduction view can follow one reproduction job at a time.
   reproductionBtnStart.disabled =
-    isJobBusy() || selectedReproductionCandidate() === null;
+    busyReproductionJob() !== null || selectedReproductionCandidate() === null;
 }
 
 reproductionForm.addEventListener("submit", async (e) => {
@@ -483,61 +489,191 @@ reproductionForm.addEventListener("submit", async (e) => {
       return;
     }
     const data = await res.json();
-    setJobState(
-      data.state || "running",
-      data.error,
-      data.kind || "reproduction"
-    );
+    applyJobStatus(data);
+    attachReproductionJob(data);
   } catch (err) {
     reproductionFormError.textContent = `Start failed: ${err}`;
   }
 });
 
 reproductionBtnStop.addEventListener("click", async () => {
+  if (!activeReproKey) return;
   try {
-    await fetch("/api/reproduction/stop", { method: "POST" });
+    await fetch(`/api/reproduction/${activeReproKey}/stop`, { method: "POST" });
   } catch {
-    // status stream will reconcile state
+    // the job's event stream will reconcile state
   }
 });
 
-// ── Job state / stages table ────────────────────────────────────────────────
-function setJobState(state, error, kind) {
-  const enteringActive = isJobBusy(state) && !isJobBusy(jobState);
-  if (kind) jobKind = kind;
-  jobState = state;
-  jobStatusPanel.dataset.state = state;
-  jobBadge.textContent = (jobKind ? `${jobKind}: ` : "") + state;
-  jobBadge.title = error || "";
-  jobBadge.className = `badge badge-${state}`;
-  btnStart.disabled = isJobBusy(state);
-  reproductionBtnStart.disabled = isJobBusy(state);
-  btnStop.disabled = !isJobBusy(state) || jobKind !== "audit";
-  reproductionBtnStop.disabled =
-    !isJobBusy(state) || jobKind !== "reproduction";
-  if (enteringActive) {
-    completedStageNotifications.clear();
-    lastAgentEventAt = 0;
-    activeAgentLogOffsets.clear();
-    if (jobKind === "reproduction") {
-      resetReproductionStage();
-      clearLogBuffer(reproductionLogPane);
-      reproductionResultsPanel.hidden = true;
-      reproductionViewerPanel.hidden = true;
-    } else if (!runDetailStatic) {
-      // A static run detail page keeps its own recorded stages/logs.
-      resetStages();
-      clearLogBuffer(logPane);
-      resultsPanel.hidden = true;
-      viewerPanel.hidden = true;
-    }
-  }
-  if (state === "done" || state === "failed" || state === "cancelled") {
-    if (jobKind === "reproduction") loadReproductionResults();
-    else loadResults();
-  }
-  updateReproductionStartAvailability();
+// ── Job registry / sidebar job list ─────────────────────────────────────────
+function applyJobStatus(status) {
+  if (!status || !status.job_key) return;
+  activeJobs.set(String(status.job_key), status);
+  renderJobList();
   updateResumeButtons();
+}
+
+function jobDisplayLabel(job) {
+  if (job.kind === "reproduction") {
+    const candidate = job.reproduction_candidate || {};
+    return candidate.vuln_id
+      ? `repro ${candidate.vuln_id}`
+      : `repro ${String(job.job_key).slice(0, 12)}`;
+  }
+  return `Run #${job.run_id ?? "?"}`;
+}
+
+function renderJobList() {
+  const busy = busyJobs();
+  jobStatusPanel.dataset.state = busy.length ? "running" : "idle";
+  jobList.innerHTML = "";
+  if (!busy.length) {
+    const idle = document.createElement("span");
+    idle.className = "badge badge-idle";
+    idle.textContent = "idle";
+    jobList.appendChild(idle);
+    return;
+  }
+  for (const job of busy) {
+    const item = document.createElement(
+      job.kind === "audit" && job.run_id ? "a" : "span"
+    );
+    item.className = "job-list-item";
+    if (item.tagName === "A") item.href = `#/run/${job.run_id}`;
+    const badge = document.createElement("span");
+    badge.className = `badge badge-${job.state}`;
+    badge.textContent = job.state;
+    badge.title = job.error || "";
+    const label = document.createElement("span");
+    label.className = "job-list-label";
+    label.textContent = jobDisplayLabel(job);
+    const elapsed = document.createElement("span");
+    elapsed.className = "job-list-elapsed dim";
+    elapsed.textContent = fmtDuration(job.started_at, 0);
+    item.append(badge, label, elapsed);
+    jobList.appendChild(item);
+  }
+}
+
+async function stopRunAudit(runId) {
+  try {
+    await fetch(`/api/audit/${runId}/stop`, { method: "POST" });
+  } catch {
+    // the job's event stream will reconcile state
+  }
+}
+
+// Central handler for run-tagged lifecycle events (from /api/jobs/events and
+// from each per-job event stream). Idempotent: both streams deliver the same
+// events when a run detail page is open.
+function handleJobLifecycleEvent(ev) {
+  const key = String(ev.job_key || (ev.run_id != null ? ev.run_id : ""));
+  if (!key) return;
+  const prev = activeJobs.get(key) || {};
+  const terminal = !BUSY_JOB_STATES.has(ev.status);
+  if (terminal) {
+    activeJobs.delete(key);
+  } else {
+    activeJobs.set(key, {
+      ...prev,
+      job_key: key,
+      kind: ev.kind || prev.kind || "audit",
+      state: ev.status,
+      error: ev.error || "",
+      run_id: ev.run_id ?? prev.run_id ?? null,
+      started_at: ev.started_at || prev.started_at || 0,
+    });
+  }
+  renderJobList();
+  updateResumeButtons();
+  updateReproductionStartAvailability();
+  if (!$("view-history").hidden) loadHistory();
+  if (ev.kind === "reproduction") {
+    if (terminal && key === activeReproKey) finishReproductionJob(ev);
+    return;
+  }
+  const runId = ev.run_id != null ? Number(ev.run_id) : null;
+  if (terminal && runId !== null && liveDetailRunId === runId) {
+    // The run page we are watching just ended: switch it to the static view.
+    disconnectDetailEvents();
+    liveDetailRunId = null;
+    loadRunDetail(runId);
+  }
+}
+
+// ── Reproduction live wiring ────────────────────────────────────────────────
+function attachReproductionJob(status) {
+  if (!status || !status.job_key) return;
+  disconnectReproEvents();
+  activeReproKey = String(status.job_key);
+  completedStageNotifications.clear();
+  resetReproductionStage();
+  clearLogBuffer(reproductionLogPane);
+  reproductionResultsPanel.hidden = true;
+  reproductionViewerPanel.hidden = true;
+  for (const s of status.stages || []) {
+    updateReproductionStage(s.status, s.detail);
+    updateReproductionProgress(s.items_done, s.items_total);
+  }
+  reproductionBtnStop.disabled = !BUSY_JOB_STATES.has(status.state);
+  updateReproductionStartAvailability();
+  $("r-btn-download-agent-log").href =
+    `/api/reproduction/${activeReproKey}/agent-log?download=true`;
+  connectReproEvents(activeReproKey);
+}
+
+function finishReproductionJob(ev) {
+  reproductionBtnStop.disabled = true;
+  if (ev.status && ev.status !== "running") {
+    updateReproductionStage(
+      ev.status === "done" ? "done" : ev.status,
+      ev.error || undefined
+    );
+  }
+  loadReproductionResults();
+  updateReproductionStartAvailability();
+}
+
+function disconnectReproEvents() {
+  if (reproEventSource) {
+    reproEventSource.close();
+    reproEventSource = null;
+  }
+}
+
+function connectReproEvents(jobKey) {
+  disconnectReproEvents();
+  const source = new EventSource(`/api/reproduction/${jobKey}/events`);
+  reproEventSource = source;
+  source.onmessage = (msg) => {
+    let ev;
+    try {
+      ev = JSON.parse(msg.data);
+    } catch {
+      return;
+    }
+    if (source !== reproEventSource) return;
+    if (ev.type === "log") {
+      if (String(ev.message || "").includes(" Agent: ")) {
+        lastAgentEventAt = Date.now();
+      }
+      appendLogToPane(reproductionLogPane, ev.message);
+    } else if (ev.type === "stage") {
+      if (ev.stage === 5) updateReproductionStage(ev.status, ev.detail);
+      if (ev.status === "done") {
+        notifyStageCompleted("reproduction", ev.stage, ev.detail, jobKey);
+      }
+    } else if (ev.type === "progress") {
+      if (ev.stage === 5) {
+        updateReproductionProgress(ev.items_done, ev.items_total, ev.detail);
+      }
+    } else if (ev.type === "job") {
+      handleJobLifecycleEvent(ev);
+    }
+  };
+  source.onerror = () => {
+    // EventSource auto-reconnects; nothing to do.
+  };
 }
 
 function resetStages() {
@@ -593,12 +729,12 @@ function updateReproductionProgress(done, total, detail) {
   if (detail) row.querySelector(".stage-desc").textContent = detail;
 }
 
-function stageNotificationKey(kind, stage) {
-  return `${kind || "audit"}:${stage}`;
+function stageNotificationKey(kind, stage, scope) {
+  return `${kind || "audit"}:${scope || ""}:${stage}`;
 }
 
-function rememberCompletedStage(kind, stage) {
-  completedStageNotifications.add(stageNotificationKey(kind, stage));
+function rememberCompletedStage(kind, stage, scope) {
+  completedStageNotifications.add(stageNotificationKey(kind, stage, scope));
 }
 
 function dismissNotification(item) {
@@ -608,8 +744,8 @@ function dismissNotification(item) {
   }
 }
 
-function notifyStageCompleted(kind, stage, detail) {
-  const key = stageNotificationKey(kind, stage);
+function notifyStageCompleted(kind, stage, detail, scope) {
+  const key = stageNotificationKey(kind, stage, scope);
   if (completedStageNotifications.has(key)) return;
   completedStageNotifications.add(key);
 
@@ -714,15 +850,10 @@ function appendLogToPane(pane, message) {
   return state;
 }
 
-function appendLog(message) {
-  const pane = jobKind === "reproduction" ? reproductionLogPane : logPane;
-  appendLogToPane(pane, message);
-  lastAuditLogAt = Date.now();
-}
-
 async function pollActiveAgentLog() {
+  if (liveDetailRunId === null) return false;
   if (Date.now() - lastAgentEventAt < 15000) return false;
-  const res = await fetch("/api/results/agent-log");
+  const res = await fetch(`/api/history/${liveDetailRunId}/agent-log`);
   if (!res.ok) return false;
   const text = await res.text();
   const path = res.headers.get("X-CodeAuditor-Log-Path") || "agent.log";
@@ -737,23 +868,36 @@ async function pollActiveAgentLog() {
     .slice(-AGENT_LOG_FALLBACK_CHARS)
     .trimEnd();
   if (!addition) return false;
-  appendLog(`[${path}] ${addition}`);
+  appendLogToPane(logPane, `[${path}] ${addition}`);
+  lastAuditLogAt = Date.now();
   return true;
 }
 
-async function pollAuditHeartbeat() {
-  if (!isJobBusy() || auditHeartbeatPending) return;
+async function pollDetailHeartbeat() {
+  if (liveDetailRunId === null || auditHeartbeatPending) return;
   auditHeartbeatPending = true;
   try {
-    const res = await fetch("/api/audit/status");
-    if (!res.ok) return;
-    const status = await res.json();
-    if (!isJobBusy(status.state)) {
-      setJobState(status.state, status.error, status.kind || jobKind);
+    const res = await fetch(`/api/audit/${liveDetailRunId}/status`);
+    if (!res.ok) {
+      // The job is gone (finished and pruned): reload the page as static.
+      const runId = liveDetailRunId;
+      liveDetailRunId = null;
+      disconnectDetailEvents();
+      loadRunDetail(runId);
       return;
     }
-    if (status.state !== jobState) {
-      setJobState(status.state, status.error, status.kind || jobKind);
+    const status = await res.json();
+    applyJobStatus(status);
+    if (!BUSY_JOB_STATES.has(status.state)) {
+      handleJobLifecycleEvent({
+        type: "job",
+        job_key: status.job_key,
+        kind: status.kind,
+        status: status.state,
+        error: status.error,
+        run_id: status.run_id,
+      });
+      return;
     }
     const runningStage = (status.stages || []).find(
       (stage) => stage.status === "running"
@@ -769,9 +913,10 @@ async function pollAuditHeartbeat() {
       now - lastAuditHeartbeatAt >= 15000
     ) {
       const elapsed = Math.max(0, Math.round(runningStage.elapsed || 0));
-      appendLog(
-        `[live] ${jobKind} is active — Stage ${runningStage.stage}: ` +
-        `${runningStage.detail || "running"} (${elapsed}s elapsed)`
+      appendLogToPane(
+        logPane,
+        `[live] Run #${liveDetailRunId} is active — Stage ${runningStage.stage}: ` +
+          `${runningStage.detail || "running"} (${elapsed}s elapsed)`
       );
       lastAuditHeartbeatAt = now;
     }
@@ -782,8 +927,18 @@ async function pollAuditHeartbeat() {
   }
 }
 
-function connectEvents() {
-  const source = new EventSource("/api/audit/events");
+// ── Run detail live stream (one per open live run page) ─────────────────────
+function disconnectDetailEvents() {
+  if (detailEventSource) {
+    detailEventSource.close();
+    detailEventSource = null;
+  }
+}
+
+function connectDetailEvents(runId) {
+  disconnectDetailEvents();
+  const source = new EventSource(`/api/audit/${runId}/events`);
+  detailEventSource = source;
   source.onmessage = (msg) => {
     let ev;
     try {
@@ -791,33 +946,40 @@ function connectEvents() {
     } catch {
       return;
     }
+    if (source !== detailEventSource) return;
     if (ev.type === "log") {
       if (String(ev.message || "").includes(" Agent: ")) {
         lastAgentEventAt = Date.now();
       }
-      appendLog(ev.message);
+      appendLogToPane(logPane, ev.message);
+      lastAuditLogAt = Date.now();
     } else if (ev.type === "stage") {
-      if (jobKind === "reproduction" && ev.stage === 5) {
-        updateReproductionStage(ev.status, ev.detail);
-      } else {
-        updateStage(ev.stage, ev.status, ev.detail);
-      }
+      updateStage(ev.stage, ev.status, ev.detail);
       if (ev.status === "done") {
-        notifyStageCompleted(jobKind, ev.stage, ev.detail);
+        notifyStageCompleted("audit", ev.stage, ev.detail, runId);
       }
     } else if (ev.type === "progress") {
-      if (jobKind === "reproduction" && ev.stage === 5) {
-        updateReproductionProgress(
-          ev.items_done,
-          ev.items_total,
-          ev.detail
-        );
-      } else {
-        updateProgress(ev.stage, ev.items_done, ev.items_total, ev.detail);
-      }
+      updateProgress(ev.stage, ev.items_done, ev.items_total, ev.detail);
     } else if (ev.type === "job") {
-      setJobState(ev.status, ev.error, ev.kind);
+      handleJobLifecycleEvent(ev);
     }
+  };
+  source.onerror = () => {
+    // EventSource auto-reconnects; nothing to do.
+  };
+}
+
+// ── Global job lifecycle stream (sidebar + History badges) ──────────────────
+function connectGlobalJobEvents() {
+  const source = new EventSource("/api/jobs/events");
+  source.onmessage = (msg) => {
+    let ev;
+    try {
+      ev = JSON.parse(msg.data);
+    } catch {
+      return;
+    }
+    if (ev.type === "job") handleJobLifecycleEvent(ev);
   };
   source.onerror = () => {
     // EventSource auto-reconnects; nothing to do.
@@ -826,16 +988,29 @@ function connectEvents() {
 
 // ── Results ─────────────────────────────────────────────────────────────────
 async function viewLatestAgentLog(preferReproduction = false) {
-  const useReproduction = preferReproduction || jobKind === "reproduction";
-  const panel = useReproduction ? reproductionViewerPanel : viewerPanel;
-  const title = useReproduction
+  const panel = preferReproduction ? reproductionViewerPanel : viewerPanel;
+  const title = preferReproduction
     ? $("reproduction-viewer-title")
     : $("viewer-title");
-  const content = useReproduction
+  const content = preferReproduction
     ? $("reproduction-viewer-content")
     : $("viewer-content");
+  let url = null;
+  if (preferReproduction) {
+    if (activeReproKey) {
+      url = `/api/reproduction/${activeReproKey}/agent-log`;
+    }
+  } else if (detailRunId !== null) {
+    url = `/api/history/${detailRunId}/agent-log`;
+  }
+  if (!url) {
+    title.textContent = "Latest Agent log";
+    content.textContent = "No job is selected.";
+    panel.hidden = false;
+    return;
+  }
   try {
-    const res = await fetch("/api/results/agent-log");
+    const res = await fetch(url);
     const text = await res.text();
     const path = res.headers.get("X-CodeAuditor-Log-Path") || "Latest Agent log";
     title.textContent = path;
@@ -851,24 +1026,7 @@ async function viewLatestAgentLog(preferReproduction = false) {
 $("btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(false));
 $("r-btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(true));
 
-async function loadResults() {
-  if (runDetailStatic) return; // static run detail loads its own artifacts
-  try {
-    const res = await fetch("/api/results");
-    if (!res.ok) return;
-    const data = await res.json();
-    $("results-output-dir").textContent = `Output: ${baseName(data.output_dir)}`;
-    fillFileList("results-vulnerabilities", data.vulnerabilities);
-    fillFileList("results-pocs", data.poc_reports);
-    fillFileList("results-disclosures", data.disclosures);
-    fillFileList("results-agent-logs", data.agent_logs);
-    resultsPanel.hidden = false;
-  } catch {
-    // no results available
-  }
-}
-
-async function loadStaticRunResults(run) {
+async function loadRunResults(run) {
   const viewer = (path) => viewHistoryFile(run.id, path);
   try {
     const res = await fetch(`/api/history/${run.id}/results`);
@@ -885,7 +1043,7 @@ async function loadStaticRunResults(run) {
   }
 }
 
-function fillFileList(id, files, viewer = viewFile) {
+function fillFileList(id, files, viewer) {
   const ul = $(id);
   ul.innerHTML = "";
   const count = $(`${id}-count`);
@@ -910,24 +1068,10 @@ function fillFileList(id, files, viewer = viewFile) {
   }
 }
 
-async function viewFile(path) {
-  try {
-    const res = await fetch(`/api/results/file?path=${encodeURIComponent(path)}`);
-    const text = await res.text();
-    $("viewer-title").textContent = path;
-    $("viewer-content").textContent = res.ok ? text : `Error: ${text}`;
-    viewerPanel.hidden = false;
-    viewerPanel.scrollIntoView({ behavior: "smooth" });
-  } catch (e) {
-    $("viewer-title").textContent = path;
-    $("viewer-content").textContent = `Error: ${e}`;
-    viewerPanel.hidden = false;
-  }
-}
-
 async function loadReproductionResults() {
+  if (!activeReproKey) return;
   try {
-    const res = await fetch("/api/reproduction/results");
+    const res = await fetch(`/api/reproduction/${activeReproKey}/results`);
     if (!res.ok) return;
     const data = await res.json();
     $("reproduction-results-output-dir").textContent =
@@ -950,9 +1094,10 @@ async function loadReproductionResults() {
 }
 
 async function viewReproductionFile(path) {
+  if (!activeReproKey) return;
   try {
     const res = await fetch(
-      `/api/reproduction/results/file?path=${encodeURIComponent(path)}`
+      `/api/reproduction/${activeReproKey}/results/file?path=${encodeURIComponent(path)}`
     );
     const text = await res.text();
     $("reproduction-viewer-title").textContent = path;
@@ -1067,13 +1212,15 @@ function setResumeMessage(message, isError = false) {
 
 function updateResumeButtons() {
   document.querySelectorAll("[data-resume-run]").forEach((button) => {
-    button.disabled = isJobBusy();
+    // Only the run's own active job blocks resuming it; other jobs running
+    // concurrently are fine (the server rejects same-repository conflicts).
+    button.disabled = busyJobForRun(button.dataset.resumeRun) !== null;
   });
 }
 
 async function resumeCancelledAudit(runId, button) {
-  if (isJobBusy()) {
-    setResumeMessage("Another audit or reproduction is already running.", true);
+  if (busyJobForRun(runId)) {
+    setResumeMessage(`Run #${runId} already has a running job.`, true);
     return;
   }
   if (!window.confirm(
@@ -1090,8 +1237,7 @@ async function resumeCancelledAudit(runId, button) {
       if (button) button.disabled = false;
       return;
     }
-    setJobState(data.state || "running", data.error, data.kind || "audit");
-    activeAuditRunId = data.run_id || Number(runId) || null;
+    applyJobStatus(data);
     // Stay on the run detail page: it now shows the live Stages/Logs.
     if (location.hash === `#/run/${runId}`) {
       loadRunDetail(runId);
@@ -1114,6 +1260,8 @@ async function loadHistory() {
     for (const run of data.runs || []) {
       const tr = document.createElement("tr");
       tr.className = "run-row";
+      const liveJob = busyJobForRun(run.id);
+      if (liveJob) tr.classList.add("run-live");
       const cells = [
         run.id,
         repoDisplay(run),
@@ -1157,7 +1305,18 @@ async function loadHistory() {
       }
       const actionCell = document.createElement("td");
       actionCell.className = "history-action";
-      if (
+      if (liveJob) {
+        const stopButton = document.createElement("button");
+        stopButton.type = "button";
+        stopButton.className = "btn btn-stop";
+        stopButton.textContent = "Stop";
+        stopButton.title = "Cancel this running audit";
+        stopButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          stopRunAudit(run.id);
+        });
+        actionCell.appendChild(stopButton);
+      } else if (
         run.status === "cancelled" ||
         run.status === "failed" ||
         (run.status === "done" && run.error)
@@ -1168,7 +1327,6 @@ async function loadHistory() {
         resumeButton.dataset.resumeRun = String(run.id);
         resumeButton.textContent = "Resume";
         resumeButton.title = "Continue from the existing audit checkpoints";
-        resumeButton.disabled = isJobBusy();
         resumeButton.addEventListener("click", (event) => {
           event.stopPropagation();
           resumeCancelledAudit(run.id, resumeButton);
@@ -1259,59 +1417,62 @@ async function loadRunDetail(runId) {
     return;
   }
 
-  // Decide whether this run is the live job: then the shared Stages/Logs/
-  // Results panels follow the SSE stream; otherwise they show the run's own
-  // recorded artifacts.
+  // Decide whether this run has a live job: then the Stages/Logs panels
+  // follow its per-run SSE stream; otherwise they show recorded artifacts.
+  detailRunId = run.id;
   let status = null;
   try {
-    const res = await fetch("/api/audit/status");
+    const res = await fetch(`/api/audit/${run.id}/status`);
     if (res.ok) status = await res.json();
   } catch {
     status = null;
   }
-  activeAuditRunId = status?.run_id || null;
+  if (status) applyJobStatus(status);
   const isLive =
     !!status &&
-    isJobBusy(status.state) &&
-    (status.kind || "audit") === "audit" &&
-    status.run_id === run.id;
-  runDetailStatic = !isLive;
+    BUSY_JOB_STATES.has(status.state) &&
+    (status.kind || "audit") === "audit";
 
   // Stages and Logs only make sense while the audit is actually running;
   // finished runs show their recorded Results instead.
   $("stages-panel").hidden = !isLive;
   $("logs-panel").hidden = !isLive;
+  disconnectDetailEvents();
+  liveDetailRunId = null;
   if (isLive) {
+    liveDetailRunId = run.id;
     stopButton.hidden = false;
-    stopButton.onclick = async () => {
-      try {
-        await fetch("/api/audit/stop", { method: "POST" });
-      } catch {
-        // status stream reconciles the state
-      }
-    };
+    stopButton.onclick = () => stopRunAudit(run.id);
+    completedStageNotifications.clear();
+    lastAgentEventAt = 0;
+    activeAgentLogOffsets.clear();
     resetStages();
     for (const s of status.stages || []) {
+      if (s.status === "done") rememberCompletedStage("audit", s.stage, run.id);
       updateStage(s.stage, s.status, s.detail);
       updateProgress(s.stage, s.items_done, s.items_total);
     }
-    renderLogBuffer(logPane, logBufferFor(logPane));
-    $("btn-download-agent-log").href = "/api/results/agent-log?download=true";
+    // The per-run SSE backlog replays this run's recent log entries.
+    clearLogBuffer(logPane);
+    $("btn-download-agent-log").href =
+      `/api/history/${run.id}/agent-log?download=true`;
     resultsPanel.hidden = true;
     viewerPanel.hidden = true;
+    connectDetailEvents(run.id);
   } else {
-    await loadStaticRunResults(run);
+    await loadRunResults(run);
   }
 
   $("run-detail-title").textContent = `Run #${run.id} — ${repoDisplay(run)}`;
   if (
-    run.status === "cancelled" ||
-    run.status === "failed" ||
-    (run.status === "done" && run.error)
+    !isLive &&
+    (run.status === "cancelled" ||
+      run.status === "failed" ||
+      (run.status === "done" && run.error))
   ) {
     resumeButton.hidden = false;
     resumeButton.dataset.resumeRun = String(run.id);
-    resumeButton.disabled = isJobBusy();
+    resumeButton.disabled = busyJobForRun(run.id) !== null;
     resumeButton.onclick = () => resumeCancelledAudit(run.id, resumeButton);
   }
   let submodules = [];
@@ -3107,6 +3268,13 @@ function route() {
   for (const v of Object.values(views)) v.hidden = true;
   tabs.forEach((t) => t.classList.remove("tab-active"));
 
+  if (!runMatch) {
+    // Leaving the run detail page: stop streaming its events.
+    disconnectDetailEvents();
+    liveDetailRunId = null;
+    detailRunId = null;
+  }
+
   if (runMatch) {
     views.detail.hidden = false;
     tabs.forEach((t) => {
@@ -3128,6 +3296,13 @@ function route() {
       if (t.dataset.route === "reproduction") t.classList.add("tab-active");
     });
     loadReproductionCandidates();
+    // Reattach to a reproduction job that is still running.
+    const repro = busyReproductionJob();
+    if (repro && repro.job_key !== activeReproKey) {
+      attachReproductionJob(repro);
+    } else if (!repro) {
+      updateReproductionStartAvailability();
+    }
   } else if (hash.startsWith("#/disclosures")) {
     views.disclosures.hidden = false;
     tabs.forEach((t) => {
@@ -3163,33 +3338,24 @@ window.addEventListener("hashchange", route);
 async function boot() {
   resetStages();
   resetReproductionStage();
-  route();
   await loadConfig();
-  await Promise.all([loadRepos(), loadWikis(), refreshTrashCount()]);
   try {
-    const res = await fetch("/api/audit/status");
-    const status = await res.json();
-    activeAuditRunId = status.run_id || null;
-    if (status.state && status.state !== "idle") {
-      setJobState(status.state, status.error, status.kind || "audit");
-      for (const s of status.stages || []) {
-        if (s.status === "done") {
-          rememberCompletedStage(status.kind || "audit", s.stage);
-        }
-        if (status.kind === "reproduction" && s.stage === 5) {
-          updateReproductionStage(s.status, s.detail);
-          updateReproductionProgress(s.items_done, s.items_total);
-        } else {
-          updateStage(s.stage, s.status, s.detail);
-          updateProgress(s.stage, s.items_done, s.items_total);
-        }
+    const res = await fetch("/api/jobs");
+    if (res.ok) {
+      const data = await res.json();
+      for (const job of data.jobs || []) {
+        if (BUSY_JOB_STATES.has(job.state)) applyJobStatus(job);
       }
     }
   } catch {
-    // server not reachable yet; SSE connect will retry
+    // server not reachable yet; the lifecycle stream will retry
   }
-  connectEvents();
-  window.setInterval(pollAuditHeartbeat, 10000);
+  route();
+  await Promise.all([loadRepos(), loadWikis(), refreshTrashCount()]);
+  connectGlobalJobEvents();
+  window.setInterval(pollDetailHeartbeat, 10000);
+  // The sidebar elapsed times tick once a minute.
+  window.setInterval(renderJobList, 30000);
 }
 
 boot();

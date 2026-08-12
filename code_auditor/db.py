@@ -1312,6 +1312,7 @@ class AuditStore:
                    d.report_path, d.email_path, d.zip_path,
                    p.report_path AS poc_report_path,
                    p.trigger_graph_path, p.asan_report_path,
+                   p.status AS p_status,
                    r.repo_name, r.repo_url, r.target, r."commit",
                    r.backend, r.ended_at, r.started_at, r.created_at
             FROM disclosures d
@@ -1324,8 +1325,24 @@ class AuditStore:
             """,
             (run_id,),
         ).fetchall()
+        reproduced = REPRODUCED_STATUSES
+        # Remove any previously-synced entries for this run whose PoC is no
+        # longer reproduced (e.g. re-runs that flipped to false-positive).
+        non_reproduced_keys = [
+            row["dedupe_key"]
+            for row in rows
+            if row["dedupe_key"] and (row["p_status"] not in reproduced)
+        ]
+        if non_reproduced_keys:
+            placeholders = ",".join("?" * len(non_reproduced_keys))
+            conn.execute(
+                f"DELETE FROM disclosed_bugs WHERE dedupe_key IN ({placeholders})",
+                non_reproduced_keys,
+            )
         now = time.time()
         for row in rows:
+            if row["p_status"] not in reproduced:
+                continue
             report_path = resolved_file(row["report_path"])
             if report_path is None or not row["dedupe_key"]:
                 continue
@@ -2043,21 +2060,19 @@ class AuditStore:
                 if row.get("review_status") == "confirmed"
                 else []
             )
-            row["poc"] = None
-            if row.get("review_status") == "confirmed":
-                row["poc"] = poc_by_key.get(row.get("dedupe_key") or "")
-                if row["poc"] is None:
-                    for cve in row["cves"]:
-                        row["poc"] = next(
-                            (
-                                poc_by_key[key]
-                                for key in keys_by_cve.get(cve["cve_id"], [])
-                                if key in poc_by_key
-                            ),
-                            None,
-                        )
-                        if row["poc"] is not None:
-                            break
+            row["poc"] = poc_by_key.get(row.get("dedupe_key") or "")
+            if row["poc"] is None:
+                for cve in row["cves"]:
+                    row["poc"] = next(
+                        (
+                            poc_by_key[key]
+                            for key in keys_by_cve.get(cve["cve_id"], [])
+                            if key in poc_by_key
+                        ),
+                        None,
+                    )
+                    if row["poc"] is not None:
+                        break
         if status:
             entries = [row for row in entries if row["review_status"] == status]
         if project:

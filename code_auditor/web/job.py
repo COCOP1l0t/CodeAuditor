@@ -262,6 +262,9 @@ class AuditJob:
         self.config: AuditConfig | None = None
         self.reporter: WebProgressReporter = WebProgressReporter(self.bus)
         self.started_at: float = time.time()
+        self.active_started_at: float = self.started_at
+        self.duration_seconds: float = 0.0
+        self.duration_known: bool = True
         self.ended_at: float = 0.0
         self.task: asyncio.Task | None = None
         self.job_key: str = ""
@@ -284,10 +287,20 @@ class AuditJob:
             "error": self.error,
             "run_id": self.run_id,
             "started_at": self.started_at,
+            "duration_seconds": self.duration_seconds,
+            "active_started_at": self.active_started_at,
+            "duration_known": self.duration_known,
             **extra,
         }
         self.bus.publish(event)
         self.manager.bus.publish(event)
+
+    def _stop_duration_clock(self, ended_at: float) -> None:
+        """Fold this active session into the job's accumulated duration once."""
+        if not self.active_started_at:
+            return
+        self.duration_seconds += max(0.0, ended_at - self.active_started_at)
+        self.active_started_at = 0.0
 
     # ── state reconciliation ──────────────────────────────────────────────
 
@@ -300,6 +313,7 @@ class AuditJob:
         self.state = STATE_CANCELLED
         self.error = self.error or INTERRUPTED_AUDIT_ERROR
         self.ended_at = time.time()
+        self._stop_duration_clock(self.ended_at)
         if self.store is not None and self.run_id is not None:
             self.store.cancel_running_run(
                 self.run_id,
@@ -322,6 +336,7 @@ class AuditJob:
         if not done:
             self.state = STATE_CANCELLED
             self.ended_at = time.time()
+            self._stop_duration_clock(self.ended_at)
             if self.store is not None and self.run_id is not None:
                 self.store.cancel_running_run(
                     self.run_id,
@@ -360,6 +375,9 @@ class AuditJob:
             "output_dir": self.config.output_dir if self.config else "",
             "started_at": self.started_at,
             "ended_at": self.ended_at,
+            "duration_seconds": self.duration_seconds,
+            "active_started_at": self.active_started_at,
+            "duration_known": self.duration_known,
             "run_id": self.run_id,
             "models_used": list(self.config.models_used) if self.config else [],
             "usage_stats": dict(self.config.usage_stats) if self.config else {},
@@ -499,6 +517,7 @@ class AuditJob:
                 self.state = STATE_CANCELLED
                 self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
+            self._stop_duration_clock(self.ended_at)
             if self.store is not None and self.run_id is not None:
                 try:
                     self.store.finish_run(
@@ -561,7 +580,9 @@ class AuditJob:
                 raise JobValidationError(
                     "The source or submodule identity no longer matches the cancelled run."
                 )
-            if not self.store.resume_cancelled_run(run_id):
+            if not self.store.resume_cancelled_run(
+                run_id, resumed_at=self.active_started_at
+            ):
                 raise JobConflictError(
                     "The run is no longer resumable; refresh History and try again."
                 )
@@ -583,6 +604,7 @@ class AuditJob:
 
     def _finish_restore_attempt(self) -> None:
         self.ended_at = time.time()
+        self._stop_duration_clock(self.ended_at)
         self.publish_job_event()
 
     # ── reproduction pipeline ───────────────────────────────────────────────
@@ -657,6 +679,7 @@ class AuditJob:
                 self.state = STATE_CANCELLED
                 self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
+            self._stop_duration_clock(self.ended_at)
             self.publish_job_event()
 
 
@@ -910,7 +933,11 @@ class AuditJobManager:
             self._check_start_allowed(target, run_id=run_id)
             job = AuditJob(self, JOB_AUDIT)
             config = job._build_preliminary_config(clone_params, target, wiki_path)
-            if not self.store.resume_cancelled_run(run_id):
+            job.duration_seconds = max(float(run.get("duration_seconds") or 0), 0.0)
+            job.duration_known = bool(run.get("duration_known", True))
+            if not self.store.resume_cancelled_run(
+                run_id, resumed_at=job.active_started_at
+            ):
                 raise JobConflictError(
                     "The run is no longer resumable; refresh History and try again."
                 )
@@ -1006,6 +1033,8 @@ class AuditJobManager:
         )
         self._check_start_allowed(target, run_id=run_id)
         job = AuditJob(self, JOB_AUDIT)
+        job.duration_seconds = max(float(run.get("duration_seconds") or 0), 0.0)
+        job.duration_known = bool(run.get("duration_known", True))
         job.target_path = target
         job.config = config
         job.state = STATE_RESTORING

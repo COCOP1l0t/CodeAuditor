@@ -42,6 +42,7 @@ const reproductionViewerPanel = $("reproduction-viewer-panel");
 // current by the /api/jobs/events lifecycle stream; busy entries only are
 // meaningful for liveness checks.
 const activeJobs = new Map();
+const durationKnownByRun = new Map();
 // Run id currently streamed into the run detail page's Stages/Logs panels.
 let liveDetailRunId = null;
 // Run id currently displayed on the run detail page (live or static).
@@ -549,7 +550,7 @@ function renderJobList() {
     label.textContent = jobDisplayLabel(job);
     const elapsed = document.createElement("span");
     elapsed.className = "job-list-elapsed dim";
-    elapsed.textContent = fmtDuration(job.started_at, 0);
+    elapsed.textContent = fmtRunDuration(job);
     item.append(badge, label, elapsed);
     jobList.appendChild(item);
   }
@@ -582,6 +583,9 @@ function handleJobLifecycleEvent(ev) {
       error: ev.error || "",
       run_id: ev.run_id ?? prev.run_id ?? null,
       started_at: ev.started_at || prev.started_at || 0,
+      duration_seconds: ev.duration_seconds ?? prev.duration_seconds ?? 0,
+      active_started_at: ev.active_started_at ?? prev.active_started_at ?? 0,
+      duration_known: ev.duration_known ?? prev.duration_known ?? true,
     });
   }
   renderJobList();
@@ -1130,15 +1134,35 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleString();
 }
 
-function fmtDuration(start, end) {
-  if (!start) return "—";
-  const secs = Math.max(0, Math.round((end || Date.now() / 1000) - start));
+function fmtDurationSeconds(seconds) {
+  const secs = Math.max(0, Math.round(Number(seconds) || 0));
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   const s = secs % 60;
   if (h) return `${h}h ${m}m ${s}s`;
   if (m) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+function fmtRunDuration(run) {
+  let durationKnown = run?.duration_known;
+  if (
+    durationKnown == null &&
+    (run?.kind || "audit") === "audit" &&
+    run?.run_id != null
+  ) {
+    durationKnown = durationKnownByRun.get(String(run.run_id));
+  }
+  if (durationKnown === false || Number(durationKnown) === 0) {
+    return "N/A";
+  }
+  let seconds = Math.max(0, Number(run?.duration_seconds) || 0);
+  const activeStartedAt = Number(run?.active_started_at) || 0;
+  if (!run?.started_at && !activeStartedAt && seconds === 0) return "—";
+  if (activeStartedAt) {
+    seconds += Math.max(0, Date.now() / 1000 - activeStartedAt);
+  }
+  return fmtDurationSeconds(seconds);
 }
 
 function severityBadge(sev) {
@@ -1250,7 +1274,16 @@ async function resumeCancelledAudit(runId, button) {
   }
 }
 
+let _loadingHistory = false;
+let _pendingHistoryLoad = false;
+
 async function loadHistory() {
+  if (_loadingHistory) {
+    _pendingHistoryLoad = true;
+    return;
+  }
+  _loadingHistory = true;
+  _pendingHistoryLoad = false;
   const tbody = document.querySelector("#history-table tbody");
   tbody.innerHTML = "";
   setResumeMessage("");
@@ -1258,6 +1291,7 @@ async function loadHistory() {
     const res = await fetch("/api/history");
     const data = await res.json();
     for (const run of data.runs || []) {
+      durationKnownByRun.set(String(run.id), run.duration_known);
       const tr = document.createElement("tr");
       tr.className = "run-row";
       const liveJob = busyJobForRun(run.id);
@@ -1267,11 +1301,7 @@ async function loadHistory() {
         repoDisplay(run),
         { kind: "commit" },
         fmtTime(run.started_at || run.created_at),
-        run.status === "running"
-          ? "running…"
-          : run.status === "imported"
-            ? "—"
-            : fmtDuration(run.started_at, run.ended_at),
+        run.status === "imported" ? "—" : fmtRunDuration(liveJob || run),
         { kind: "status" },
         run.backend || "—",
         usageStatsDisplay(run) || "—",
@@ -1341,6 +1371,7 @@ async function loadHistory() {
       });
       tbody.appendChild(tr);
     }
+    renderJobList();
     if (!data.runs || data.runs.length === 0) {
       const tr = document.createElement("tr");
       tr.innerHTML = `<td colspan="10" class="dim">No audit runs recorded yet.</td>`;
@@ -1350,6 +1381,11 @@ async function loadHistory() {
     tbody.innerHTML =
       `<tr><td colspan="10" class="error">Failed to load history: ` +
       `${escapeHtml(String(e))}</td></tr>`;
+  } finally {
+    _loadingHistory = false;
+    if (_pendingHistoryLoad) {
+      loadHistory();
+    }
   }
 }
 
@@ -1411,6 +1447,7 @@ async function loadRunDetail(runId) {
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
     run = await res.json();
+    durationKnownByRun.set(String(run.id), run.duration_known);
   } catch (e) {
     $("run-detail-title").textContent = `Run #${runId}`;
     $("run-meta").innerHTML = `<span class="error">Failed to load: ${escapeHtml(String(e))}</span>`;
@@ -1427,7 +1464,10 @@ async function loadRunDetail(runId) {
   } catch {
     status = null;
   }
-  if (status) applyJobStatus(status);
+  if (status) {
+    status.duration_known ??= run.duration_known;
+    applyJobStatus(status);
+  }
   const isLive =
     !!status &&
     BUSY_JOB_STATES.has(status.state) &&
@@ -1505,7 +1545,10 @@ async function loadRunDetail(runId) {
     ["Tokens / Cost", usageStatsDisplay(run) || "—"],
     ["Started", fmtTime(run.started_at)],
     ["Ended", fmtTime(run.ended_at)],
-    ["Duration", run.status === "imported" ? "—" : fmtDuration(run.started_at, run.ended_at)],
+    [
+      "Duration",
+      run.status === "imported" ? "—" : fmtRunDuration(isLive ? status : run),
+    ],
     ["Reproduced vulnerabilities", String(run.reproduced_vulns_count ?? (run.vulnerabilities || []).length)],
   ];
   $("run-meta").innerHTML = meta

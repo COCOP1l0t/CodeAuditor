@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS runs (
     error TEXT DEFAULT '',
     started_at REAL,
     ended_at REAL,
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    active_started_at REAL,
+    duration_known INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
     findings_count INTEGER DEFAULT 0,
     vulns_count INTEGER DEFAULT 0,
@@ -227,7 +230,7 @@ def _parse_output_dir_date(name: str) -> float | None:
         return None
 
 
-# Extra run-identity columns added after the initial schema; migrated via
+# Extra run columns added after the initial schema; migrated via
 # ALTER TABLE in AuditStore._init_schema for existing databases.
 _RUN_EXTRA_COLUMNS = {
     "repo_name": '"repo_name" TEXT DEFAULT \'\'',
@@ -239,6 +242,9 @@ _RUN_EXTRA_COLUMNS = {
     "target_key": '"target_key" TEXT DEFAULT \'\'',
     "models_used": '"models_used" TEXT DEFAULT \'[]\'',
     "usage_stats": '"usage_stats" TEXT DEFAULT \'{}\'',
+    "duration_seconds": '"duration_seconds" REAL NOT NULL DEFAULT 0',
+    "active_started_at": '"active_started_at" REAL',
+    "duration_known": '"duration_known" INTEGER NOT NULL DEFAULT 1',
 }
 
 _DISCLOSED_BUGS_V2_SCHEMA = """
@@ -573,9 +579,34 @@ class AuditStore:
             existing = {
                 row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()
             }
+            duration_missing = "duration_seconds" not in existing
+            active_started_missing = "active_started_at" not in existing
+            duration_known_missing = "duration_known" not in existing
             for column, ddl in _RUN_EXTRA_COLUMNS.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
+            # Existing terminal runs only have wall-clock timestamps. Retain
+            # that raw migration baseline for diagnostics, but mark every
+            # pre-accounting row unknown so the API/UI never presents it as an
+            # accurate active duration. A legacy running row likewise has no
+            # recoverable session start because started_at may predate pauses.
+            if duration_missing and {"started_at", "ended_at"} <= existing:
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET duration_seconds = CASE
+                        WHEN status = ? THEN 0
+                        WHEN started_at IS NOT NULL AND ended_at IS NOT NULL
+                        THEN MAX(0, ended_at - started_at)
+                        ELSE 0
+                    END
+                    """,
+                    (RUN_IMPORTED,),
+                )
+            if active_started_missing:
+                conn.execute("UPDATE runs SET active_started_at = NULL")
+            if duration_known_missing:
+                conn.execute("UPDATE runs SET duration_known = 0")
             poc_existing = {
                 row[1] for row in conn.execute("PRAGMA table_info(pocs)").fetchall()
             }
@@ -951,14 +982,16 @@ class AuditStore:
         status: str = RUN_RUNNING,
         started_at: float | None = None,
     ) -> int:
+        active_started_at = started_at if status == RUN_RUNNING else None
+        duration_known = 0 if status == RUN_IMPORTED else 1
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO runs (
                     target, output_dir, wiki_path,
                     backend, model, max_parallel, target_au_count, log_level,
-                    status, started_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, started_at, active_started_at, duration_known, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     config.target,
@@ -971,6 +1004,8 @@ class AuditStore:
                     config.log_level,
                     status,
                     started_at,
+                    active_started_at,
+                    duration_known,
                     time.time(),
                 ),
             )
@@ -985,7 +1020,7 @@ class AuditStore:
         models_used: list[str] | None = None,
         usage_stats: dict[str, float] | None = None,
     ) -> None:
-        finished_at = ended_at or time.time()
+        finished_at = time.time() if ended_at is None else ended_at
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT target, output_dir, target_key FROM runs WHERE id = ?",
@@ -999,8 +1034,17 @@ class AuditStore:
                 self.set_run_identity(run_id, identity)
         with self._connect() as conn:
             conn.execute(
-                "UPDATE runs SET status = ?, error = ?, ended_at = ? WHERE id = ?",
-                (status, error, finished_at, run_id),
+                """
+                UPDATE runs
+                SET status = ?, error = ?, ended_at = ?,
+                    duration_seconds = MAX(0, COALESCE(duration_seconds, 0)) +
+                        CASE WHEN active_started_at IS NOT NULL
+                             THEN MAX(0, ? - active_started_at)
+                             ELSE 0 END,
+                    active_started_at = NULL
+                WHERE id = ?
+                """,
+                (status, error, finished_at, finished_at, run_id),
             )
             if models_used is not None:
                 conn.execute(
@@ -1028,10 +1072,22 @@ class AuditStore:
             cursor = conn.execute(
                 """
                 UPDATE runs
-                SET status = ?, error = ?, ended_at = ?
+                SET status = ?, error = ?, ended_at = ?,
+                    duration_seconds = MAX(0, COALESCE(duration_seconds, 0)) +
+                        CASE WHEN active_started_at IS NOT NULL
+                             THEN MAX(0, ? - active_started_at)
+                             ELSE 0 END,
+                    active_started_at = NULL
                 WHERE id = ? AND status = ?
                 """,
-                (RUN_CANCELLED, error, finished_at, run_id, RUN_RUNNING),
+                (
+                    RUN_CANCELLED,
+                    error,
+                    finished_at,
+                    finished_at,
+                    run_id,
+                    RUN_RUNNING,
+                ),
             )
             return cursor.rowcount == 1
 
@@ -1056,29 +1112,52 @@ class AuditStore:
                 conn.execute(
                     """
                     UPDATE runs
-                    SET status = ?, error = ?, ended_at = ?
+                    SET status = ?, error = ?, ended_at = ?,
+                        duration_seconds = MAX(0, COALESCE(duration_seconds, 0)) +
+                            CASE WHEN active_started_at IS NOT NULL
+                                 THEN MAX(0, ? - active_started_at)
+                                 ELSE 0 END,
+                        active_started_at = NULL
                     WHERE status = ?
                     """,
-                    (RUN_CANCELLED, error, finished_at, RUN_RUNNING),
+                    (
+                        RUN_CANCELLED,
+                        error,
+                        finished_at,
+                        finished_at,
+                        RUN_RUNNING,
+                    ),
                 )
         return run_ids
 
-    def resume_cancelled_run(self, run_id: int) -> bool:
+    def resume_cancelled_run(
+        self, run_id: int, *, resumed_at: float | None = None
+    ) -> bool:
         """Atomically move one resumable run back to the running state.
 
         Resumable means cancelled, failed, or done with recorded task errors
         (partial failure). The original row and ``started_at`` are preserved
         so History keeps one lifecycle for a checkpoint-resumed audit instead
-        of inventing a second audit record for the same output tree.
+        of inventing a second audit record for the same output tree. Duration
+        is accumulated separately from each active session, excluding gaps.
         """
+        active_started_at = time.time() if resumed_at is None else resumed_at
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE runs
-                SET status = ?, error = '', ended_at = NULL
+                SET status = ?, error = '', ended_at = NULL,
+                    active_started_at = ?
                 WHERE id = ? AND (status IN (?, ?) OR (status = ? AND error != ''))
                 """,
-                (RUN_RUNNING, run_id, RUN_CANCELLED, RUN_FAILED, RUN_DONE),
+                (
+                    RUN_RUNNING,
+                    active_started_at,
+                    run_id,
+                    RUN_CANCELLED,
+                    RUN_FAILED,
+                    RUN_DONE,
+                ),
             )
             return cursor.rowcount == 1
 
@@ -1107,12 +1186,22 @@ class AuditStore:
         identity = capture_repo_identity(config.target)
         if identity["commit"]:
             self.set_run_identity(run_id, identity)
+        finished_at = time.time() if ended_at is None else ended_at
+        duration_seconds = (
+            max(0.0, finished_at - started_at) if started_at is not None else 0.0
+        )
         with self._connect() as conn:
             conn.execute(
-                "UPDATE runs SET error = ?, ended_at = ?, models_used = ?, usage_stats = ? WHERE id = ?",
+                """
+                UPDATE runs
+                SET error = ?, ended_at = ?, duration_seconds = ?,
+                    active_started_at = NULL, models_used = ?, usage_stats = ?
+                WHERE id = ?
+                """,
                 (
                     error,
-                    ended_at or time.time(),
+                    finished_at,
+                    duration_seconds,
                     json.dumps(config.models_used, ensure_ascii=False),
                     json.dumps(config.usage_stats, ensure_ascii=False),
                     run_id,
@@ -1140,10 +1229,19 @@ class AuditStore:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO runs (target, output_dir, status, started_at, ended_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO runs (
+                    target, output_dir, status, started_at, ended_at,
+                    duration_known, created_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
                 """,
-                (target, output_dir, RUN_IMPORTED, started_at, latest_mtime, time.time()),
+                (
+                    target,
+                    output_dir,
+                    RUN_IMPORTED,
+                    started_at,
+                    latest_mtime,
+                    time.time(),
+                ),
             )
             run_id = int(cursor.lastrowid)
         identity = capture_repo_identity(target)

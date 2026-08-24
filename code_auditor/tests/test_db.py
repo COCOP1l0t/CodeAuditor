@@ -397,7 +397,9 @@ def test_schema_init_is_idempotent(tmp_path) -> None:
     AuditStore(db)  # second init must not raise
     with store._connect() as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(pocs)")}
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
     assert {"trigger_graph_path", "asan_report_path"} <= columns
+    assert {"duration_seconds", "active_started_at", "duration_known"} <= run_columns
 
 
 def test_record_run_persists_run_and_artifacts(tmp_path) -> None:
@@ -419,6 +421,9 @@ def test_record_run_persists_run_and_artifacts(tmp_path) -> None:
     assert run["reproduced_vulns_count"] == 1
     assert run["disclosures_count"] == 1
     assert run["ended_at"] >= started
+    assert run["duration_seconds"] >= 60
+    assert run["active_started_at"] is None
+    assert run["duration_known"] == 1
 
     assert "findings" not in run
     assert len(run["vulnerabilities"]) == 1
@@ -521,19 +526,38 @@ def test_resume_cancelled_run_reuses_same_history_row(tmp_path) -> None:
     )
     store.finish_run(run_id, RUN_CANCELLED, "cancelled", ended_at=456.0)
 
-    assert store.resume_cancelled_run(run_id) is True
+    assert store.resume_cancelled_run(run_id, resumed_at=1000.0) is True
     run = store.get_run(run_id)
     assert run is not None
     assert run["id"] == run_id
     assert run["status"] == RUN_RUNNING
     assert run["started_at"] == 123.0
     assert run["ended_at"] is None
+    assert run["duration_seconds"] == 333.0
+    assert run["active_started_at"] == 1000.0
     assert run["error"] == ""
     assert store.resume_cancelled_run(run_id) is False
 
     runs, total = store.list_runs()
     assert total == 1
     assert runs[0]["id"] == run_id
+
+
+def test_resumed_run_duration_excludes_inactive_gap(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(_make_config(tmp_path, out), started_at=100.0)
+
+    store.finish_run(run_id, RUN_CANCELLED, ended_at=150.0)
+    assert store.resume_cancelled_run(run_id, resumed_at=1000.0)
+    store.finish_run(run_id, RUN_DONE, ended_at=1030.0)
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["started_at"] == 100.0
+    assert run["ended_at"] == 1030.0
+    assert run["duration_seconds"] == 80.0
+    assert run["active_started_at"] is None
 
 
 def test_cancel_running_runs_only_recovers_active_rows(tmp_path) -> None:
@@ -553,6 +577,8 @@ def test_cancel_running_runs_only_recovers_active_rows(tmp_path) -> None:
     assert interrupted["status"] == RUN_CANCELLED
     assert interrupted["error"] == "worker exited"
     assert interrupted["ended_at"] == 300.0
+    assert interrupted["duration_seconds"] == 200.0
+    assert interrupted["active_started_at"] is None
     assert store.get_run(done_id)["status"] == RUN_DONE
     assert store.cancel_running_runs("again") == []
     assert store.resume_cancelled_run(interrupted_id)
@@ -563,9 +589,9 @@ def test_import_output_dir(tmp_path) -> None:
     store = AuditStore(str(tmp_path / "history.db"))
 
     run_id = store.import_output_dir(str(out))
-
     run = store.get_run(run_id)
     assert run is not None
+    assert run["duration_known"] == 0
     assert run["status"] == RUN_IMPORTED
     assert run["target"] == str(tmp_path)  # defaults to dirname(output_dir)
     assert run["vulns_count"] == 1
@@ -731,6 +757,92 @@ def test_schema_migration_adds_identity_columns(tmp_path) -> None:
         assert col in columns
     runs, total = store.list_runs()
     assert total == 1  # existing row preserved
+
+
+def test_schema_migration_marks_legacy_run_durations_unknown(tmp_path) -> None:
+    db = str(tmp_path / "legacy-duration.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                target TEXT NOT NULL,
+                output_dir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at REAL,
+                ended_at REAL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO runs (
+                id, target, output_dir, status, started_at, ended_at, created_at
+            ) VALUES (?, '/missing', '/missing/out', ?, ?, ?, 1.0)
+            """,
+            [
+                (1, RUN_DONE, 100.0, 160.0),
+                (2, RUN_RUNNING, 200.0, None),
+                (3, RUN_IMPORTED, 300.0, 390.0),
+            ],
+        )
+
+    store = AuditStore(db)
+    done = store.get_run(1)
+    running = store.get_run(2)
+    imported = store.get_run(3)
+
+    assert done is not None and done["duration_seconds"] == 60.0
+    assert done["active_started_at"] is None
+    assert done["duration_known"] == 0
+    assert running is not None and running["duration_seconds"] == 0.0
+    assert running["active_started_at"] is None
+    assert running["duration_known"] == 0
+    assert imported is not None and imported["duration_seconds"] == 0.0
+    assert imported["active_started_at"] is None
+    assert imported["duration_known"] == 0
+
+
+def test_schema_migration_marks_existing_duration_values_unknown(tmp_path) -> None:
+    db = str(tmp_path / "legacy-duration-columns.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                target TEXT NOT NULL,
+                output_dir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at REAL,
+                ended_at REAL,
+                duration_seconds REAL NOT NULL DEFAULT 0,
+                active_started_at REAL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO runs (
+                id, target, output_dir, status, started_at, ended_at,
+                duration_seconds, active_started_at, created_at
+            ) VALUES (?, '/missing', '/missing/out', ?, 100, ?, ?, NULL, 1)
+            """,
+            [
+                (1, RUN_DONE, 160.0, 60.0),
+                (2, RUN_CANCELLED, 200.0, 0.0),
+            ],
+        )
+
+    store = AuditStore(db)
+    done = store.get_run(1)
+    cancelled = store.get_run(2)
+
+    assert done is not None and done["duration_seconds"] == 60.0
+    assert done["duration_known"] == 0
+    assert cancelled is not None and cancelled["duration_seconds"] == 0.0
+    assert cancelled["duration_known"] == 0
 
 
 def test_record_run_captures_repo_identity(tmp_path) -> None:

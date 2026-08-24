@@ -364,6 +364,8 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         "target_key": compute_target_key(identity),
         "models_used": '["old-model"]',
         "usage_stats": '{"agent_calls": 5, "input_tokens": 900, "cost_usd": 0.5}',
+        "duration_seconds": 75.0,
+        "duration_known": 0,
     }
 
     class FakeStore:
@@ -377,8 +379,8 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         def disclosure_dedupe_index(self):
             return []
 
-        def resume_cancelled_run(self, run_id):
-            self.resumed.append(run_id)
+        def resume_cancelled_run(self, run_id, *, resumed_at=None):
+            self.resumed.append((run_id, resumed_at))
             run["status"] = "running"
             return True
 
@@ -414,6 +416,10 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         wikis_dir=str(tmp_path / "wiki"),
     )
     assert job.state == STATE_RESTORING
+    restoring_status = job.status()
+    assert restoring_status["duration_seconds"] == 75.0
+    assert restoring_status["active_started_at"] == job.started_at
+    assert restoring_status["duration_known"] is False
     await asyncio.wait_for(checkout_started.wait(), timeout=1)
     with pytest.raises(JobConflictError):
         await manager.resume_cancelled(
@@ -425,10 +431,15 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     checkout_release.set()
     await job.task
 
-    assert store.resumed == [17]
+    assert len(store.resumed) == 1
+    assert store.resumed[0][0] == 17
+    assert store.resumed[0][1] == job.started_at
     assert checkouts == [(str(target), "a" * 40, "main")]
     assert job.state == STATE_DONE
     assert job.status()["run_id"] == 17
+    assert job.status()["duration_seconds"] >= 75.0
+    assert job.status()["active_started_at"] == 0.0
+    assert job.status()["duration_known"] is False
     assert len(audited) == 1
     assert audited[0].target == str(target)
     assert audited[0].output_dir == str(output)
@@ -480,7 +491,7 @@ async def test_resume_cancelled_job_keeps_run_cancelled_when_checkout_fails(
         def disclosure_dedupe_index(self):
             return []
 
-        def resume_cancelled_run(self, run_id):
+        def resume_cancelled_run(self, run_id, *, resumed_at=None):
             self.resumed.append(run_id)
             return True
 
@@ -554,7 +565,7 @@ async def test_resume_cancelled_job_auto_stashes_dirty_checkout(
         def disclosure_dedupe_index(self):
             return []
 
-        def resume_cancelled_run(self, run_id):
+        def resume_cancelled_run(self, run_id, *, resumed_at=None):
             run["status"] = "running"
             return True
 
@@ -1033,6 +1044,9 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'if (e.review_status === "slop")' not in script.text
     assert "restoreDisclosure" in script.text
     assert "refreshTrashCount" in script.text
+    assert "duration_known" in script.text
+    assert "durationKnownByRun" in script.text
+    assert 'return "N/A"' in script.text
     assert "openCveDialog" in script.text
     assert "appendEvidenceActionButtons" in script.text
     assert "renderTriggerGraph" in script.text
@@ -1523,6 +1537,8 @@ def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> No
         detail = client.get(f"/api/history/{run_id}").json()
         assert detail["status"] == STATE_DONE
         assert detail["started_at"] == 100.0
+        assert 0 <= detail["duration_seconds"] < 60
+        assert detail["active_started_at"] is None
         assert client.get("/api/history").json()["total"] == 1
         assert client.post(f"/api/history/{run_id}/resume").status_code == 400
 

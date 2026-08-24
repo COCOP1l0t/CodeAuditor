@@ -44,7 +44,7 @@
       </a>
     </nav>
     <div id="job-status-panel" class="sidebar-footer" data-state="idle">
-      <span class="sidebar-footer-label">Jobs</span>
+      <span class="sidebar-footer-label"><span class="status-dot" aria-hidden="true"></span>Status</span>
       <div id="job-list"><span class="badge badge-idle">idle</span></div>
     </div>
   </aside>
@@ -642,6 +642,10 @@
         </table>
       </section>
     </div><!-- /view-target -->
+
+    <button type="button" id="btn-scroll-top" class="scroll-top" aria-label="Back to top" title="Back to top" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>
+    </button>
   </main>
 
   <div id="terminal-splitter" role="separator" aria-orientation="horizontal"

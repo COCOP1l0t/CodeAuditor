@@ -3377,6 +3377,28 @@ function route() {
 
 window.addEventListener("hashchange", route);
 
+// ── Scroll-to-top button ────────────────────────────────────────────────────
+function initScrollTopButton() {
+  const contentPane = $("content-pane");
+  const btn = $("btn-scroll-top");
+  if (!contentPane || !btn) return;
+
+  const threshold = 200;
+  const update = () => {
+    if (contentPane.scrollTop > threshold) {
+      btn.hidden = false;
+    } else {
+      btn.hidden = true;
+    }
+  };
+
+  contentPane.addEventListener("scroll", update, { passive: true });
+  btn.addEventListener("click", () => {
+    contentPane.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  update();
+}
+
 // ── Boot ────────────────────────────────────────────────────────────────────
 async function boot() {
   resetStages();
@@ -3396,6 +3418,7 @@ async function boot() {
   route();
   await Promise.all([loadRepos(), loadWikis(), refreshTrashCount()]);
   connectGlobalJobEvents();
+  initScrollTopButton();
   window.setInterval(pollDetailHeartbeat, 10000);
   // The sidebar elapsed times tick once a minute.
   window.setInterval(renderJobList, 30000);

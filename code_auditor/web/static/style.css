@@ -181,6 +181,58 @@ textarea:focus {
   cursor: not-allowed;
 }
 
+.scroll-top[hidden] {
+  display: none;
+}
+
+.scroll-top {
+  position: fixed;
+  right: 1.5rem;
+  bottom: 1.5rem;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--panel-raised);
+  color: var(--accent);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 180ms ease, transform 180ms ease, background 120ms ease, border-color 120ms ease;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+.scroll-top:not([hidden]) {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.scroll-top:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #04202a;
+}
+
+.scroll-top:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.scroll-top svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .btn-start:not(:disabled) {
   background: var(--accent);
   border-color: var(--accent);
@@ -637,10 +689,41 @@ button.tab {
 }
 
 .sidebar-footer-label {
-  font-size: 0.68rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.18rem;
+  font-size: 0.66rem;
+  font-weight: 600;
   color: var(--dim);
-  letter-spacing: 0.06em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--border-strong);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.sidebar-footer[data-state="running"] .status-dot {
+  background: var(--warn);
+  box-shadow: 0 0 6px var(--warn);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+.sidebar-footer[data-state="done"] .status-dot {
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok);
+}
+
+.sidebar-footer[data-state="failed"] .status-dot,
+.sidebar-footer[data-state="cancelled"] .status-dot {
+  background: var(--err);
+  box-shadow: 0 0 6px var(--err);
 }
 
 #job-badge {

@@ -4,7 +4,7 @@
 
 # CodeAuditor
 
-A multi-stage, agentic code auditing pipeline that can run on the [Claude Code SDK](https://github.com/anthropics/claude-code-sdk-python) or the [Codex App Server Python SDK](https://github.com/openai/codex/blob/main/sdk/python/README.md). Given a target source tree, CodeAuditor researches project context, decomposes the codebase into analysis units, hunts for bugs, evaluates them as security vulnerabilities, reproduces them with a working PoC, and finally prepares a disclosure-ready report package.
+A multi-stage, agentic code auditing pipeline that can run on the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) or the [Codex App Server Python SDK](https://github.com/openai/codex/blob/main/sdk/python/README.md). Given a target source tree, CodeAuditor researches project context, decomposes the codebase into analysis units, hunts for bugs, evaluates them as security vulnerabilities, reproduces them with a working PoC, and finally prepares a disclosure-ready report package.
 
 CodeAuditor has discovered several CVEs in widely used open-source projects — see [Vulnerabilities found](#vulnerabilities-found) below.
 
@@ -63,7 +63,7 @@ Stage 1 produces two directives — an *auditing focus* and *vulnerability crite
 - Python **3.12+**
 - A working [Claude Code](https://docs.claude.com/en/docs/claude-code) install for `--backend claude` (the SDK reuses its authentication)
 - A working Codex CLI at `/usr/local/bin/codex` with `codex app-server` support and local Codex auth/session for `--backend codex`
-- Git, plus whatever build tools the target project needs for Stage 5 reproduction
+- Git and a working Docker Engine. Stage 5/6 build tools live in the sandbox image.
 
 ## Installation
 
@@ -99,8 +99,92 @@ code-auditor --target /path/to/project [options]
 | `--host` | Web UI bind host (default: `127.0.0.1`; use `0.0.0.0` to expose on the network). |
 | `--port` | Web UI bind port (default: `8000`). |
 | `--db` | Audit history SQLite database path (default: `~/.code_auditor/audits.db`). |
+| `--sandbox-image` | Docker image for Stage 5/6 builds (default: `code-auditor-sandbox:latest`). |
+| `--sandbox-root` | Dedicated disposable root below `/tmp` (default: `/tmp/code-auditor`). |
+| `--no-docker-sandbox` | Disable Docker isolation for controlled debugging. This restores persistent build behavior and is unsafe for normal audits. |
+| `--retention-migration-dry-run [ROOT]` | Print a read-only historical retain-manifest migration plan as JSON; defaults to `~/.code_auditor/results`. |
+| `--retention-manifest-apply [ROOT]` | Atomically create or repair only manifests accepted by a fresh migration plan; never deletes artifacts. |
+| `--retention-entrypoint-repair-dry-run [ROOT]` | Report safe canonical-entrypoint repairs and the exact manual blocker queue; never writes files. |
+| `--retention-entrypoint-repair-apply [ROOT]` | Create only unambiguous `reproduce.sh` wrappers and their validated manifests; never runs PoCs or deletes artifacts. |
+| `--reviewed-cleanup-dry-run [ROOT]` | Plan compilation/cache deletion only for reproduced bugs whose SQLite review status is not `unreviewed`. |
+| `--reviewed-cleanup-apply [ROOT]` | Recheck the database and delete only the compilation/cache directories accepted by the reviewed cleanup plan. |
 
 **Bold** options are required.
+
+### Disposable Stage 5/6 builds and retained artifacts
+
+Build the default sandbox image once before an audit can enter Stage 5:
+
+```bash
+docker build -f docker/code-auditor-sandbox.Dockerfile \
+  -t code-auditor-sandbox:latest docker
+```
+
+Every Stage 5/6 task then receives a fresh source checkout and writable workspace
+under `/tmp/code-auditor/`. The agent CLI and every build/reproduction command it
+starts run in Docker with a read-only root filesystem, dropped capabilities,
+`no-new-privileges`, and CPU, memory, and PID limits. The audited Git object store is
+mounted read-only; only that task's `/tmp` scratch tree is writable. The scratch tree
+and any labelled container are removed when the task finishes.
+
+Before cleanup, CodeAuditor validates `retain-manifest.json` and atomically exports
+only its bounded, regular files. `reproduce.sh` is mandatory, executable, UTF-8, and
+must not reference disposable worktrees, build trees, toolchains, or CodeAuditor
+paths. A custom sandbox image can add project-specific SDKs without weakening this
+runtime boundary.
+
+Historical results are never changed automatically. Inspect a deterministic dry-run
+plan with:
+
+```bash
+code-auditor --retention-migration-dry-run \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > retention-plan.json
+```
+
+The report contains proposed manifests, per-artifact blockers, exact disposable
+paths, allocated-byte estimates, and `mutations: []`. Running outputs and all outputs
+whose database state cannot be verified are marked blocked. `_merged-leftovers`
+always requires manual review. After reviewing the plan, write only the accepted
+manifests with:
+
+```bash
+code-auditor --retention-manifest-apply \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > manifest-apply.json
+```
+
+This command rechecks every artifact immediately before an atomic manifest write,
+is idempotent, and still does not delete or compact historical artifacts.
+
+Missing canonical entrypoints can be repaired in two gated passes:
+
+```bash
+code-auditor --retention-entrypoint-repair-dry-run \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > entrypoint-plan.json
+code-auditor --retention-entrypoint-repair-apply \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > entrypoint-apply.json
+```
+
+Automatic repair is limited to one regular executable legacy script with a shebang
+and no other migration blockers, or one such reproduction-named script explicitly
+invoked by `report.md`. The generated wrapper only delegates and forwards arguments;
+it does not claim that the PoC was re-executed. `blocked_artifacts` preserves exact
+file/marker evidence and recommended fixes for worktree references, missing reports,
+incomplete disclosures, ambiguous entries, and invalid manifests.
+
+Historical compilation results have a separate review-status gate:
+
+```bash
+code-auditor --reviewed-cleanup-dry-run \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db
+code-auditor --reviewed-cleanup-apply \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db
+```
+
+The apply command requires a `reproduced` PoC and a known review status other than
+`unreviewed`, refuses active outputs, and preserves database-registered files, valid
+manifest files, retained files, source worktrees, reports, disclosure bundles, and
+reproduction entrypoints. Unknown, unmapped, non-reproduced, and mixed-status rows
+fail closed.
 
 ### Audit history database
 
@@ -120,17 +204,22 @@ code-auditor --web [--host 127.0.0.1] [--port 8000]
 
 Then open `http://127.0.0.1:8000` in a browser. **New Audit** offers only managed repositories already cloned under `~/.code_auditor/repo/`, or a new HTTPS/Git-over-SSH URL to clone there; arbitrary local target directories are not accepted by the Web API. Web audits write to `~/.code_auditor/results/<repo>/audit-output-<commit>/` by default, so the same repo+commit always resumes in the same output directory. You can start and stop the audit, watch stage progress and live logs (streamed over SSE), and browse vulnerabilities, PoC reports, and disclosure files. The **CVE** sidebar lists the curated public CVE record, project, CVSS, upstream disclosure links, matching confirmed local Disclosure, and matching local PoCs. A **Terminal** action on a CVE, confirmed Disclosure, run, or merged-target vulnerability opens an interactive xterm window backed by a server PTY whose initial directory is that vulnerability's `stage5-pocs/<id>/` directory. Multiple terminals can be open at once. The **Reproduction** sidebar narrows exactly reproduced History vulnerabilities through target-project, commit, and vulnerability selectors, then displays the selected vulnerability's current PoC status. Starting the retest reruns only Stage 5 at the recorded source commit in an isolated Git worktree under `~/.code_auditor/reproductions/`; it does not modify the original audit output.
 
-Backend, model, logging, and all managed output paths are server-side settings and are never accepted from browser requests. On first Web startup CodeAuditor creates `~/.code_auditor/settings.json` with mode `0600`; logging defaults to `DEBUG`, and the default model is selected by the configured backend. An existing `~/.code_auditor/web-config.json` is validated and migrated to the new filename. Edit `settings.json` directly to change server-side Web settings:
+The top-right **LLM Settings** dialog selects Claude or Codex for new jobs, resumed runs, and subsequent agent calls in active jobs. An agent call already in flight keeps an immutable snapshot of the backend/provider settings with which it started; the next call uses the newly saved selection. History records the backends actually invoked in first-use order, without duplicates, just like its model-usage list. Each backend can either reuse its local CLI login and configuration (`~/.claude/` or `~/.codex/config.toml`) through the corresponding Agent SDK, or use a custom base URL, API key, and model name. Custom Codex providers must implement the OpenAI Responses protocol. Audit and reproduction request bodies cannot override this selection.
+
+On first Web startup CodeAuditor creates `~/.code_auditor/settings.json` with mode `0600`; logging defaults to `DEBUG`. The settings API never returns a stored API key, and submitting an empty key preserves the current value. Keys are still stored as plaintext in this server-side file, so protect the host account and do not expose the UI over untrusted, unencrypted networks. An existing `~/.code_auditor/web-config.json` is validated and migrated to the new filename. The dialog is the preferred editor; the underlying shape is:
 
 ```json
 {
   "backend": "claude",
-  "model": null,
   "log_level": "DEBUG",
   "max_parallel": 1,
   "repos_dir": "~/.code_auditor/repo",
   "results_dir": "~/.code_auditor/results",
-  "reproductions_dir": "~/.code_auditor/reproductions"
+  "reproductions_dir": "~/.code_auditor/reproductions",
+  "providers": {
+    "claude": {"mode": "local", "base_url": "", "api_key": "", "model": ""},
+    "codex": {"mode": "local", "base_url": "", "api_key": "", "model": ""}
+  }
 }
 ```
 

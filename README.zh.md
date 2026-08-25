@@ -4,7 +4,7 @@
 
 # CodeAuditor
 
-一个多阶段、智能化的代码审计流水线，支持在 [Claude Code SDK](https://github.com/anthropics/claude-code-sdk-python) 或 [Codex App Server Python SDK](https://github.com/openai/codex/blob/main/sdk/python/README.md) 上运行。给定一个目标源码树，CodeAuditor 会研究项目背景、将代码库分解为分析单元、寻找漏洞、将其评估为安全漏洞、用可工作的 PoC 复现，并最终准备一份可供披露的完整报告包。
+一个多阶段、智能化的代码审计流水线，支持在 [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) 或 [Codex App Server Python SDK](https://github.com/openai/codex/blob/main/sdk/python/README.md) 上运行。给定一个目标源码树，CodeAuditor 会研究项目背景、将代码库分解为分析单元、寻找漏洞、将其评估为安全漏洞、用可工作的 PoC 复现，并最终准备一份可供披露的完整报告包。
 
 CodeAuditor 已在多个广泛使用的开源项目中发现了 CVE — 详见下方的 [已发现漏洞](#已发现漏洞)。
 
@@ -63,7 +63,7 @@ CodeAuditor 已在多个广泛使用的开源项目中发现了 CVE — 详见�
 - Python **3.12+**
 - 已安装的 [Claude Code](https://docs.claude.com/en/docs/claude-code)（用于 `--backend claude`，SDK 会复用其认证）
 - 位于 `/usr/local/bin/codex` 的 Codex CLI，支持 `codex app-server` 和本地 Codex 认证/会话（用于 `--backend codex`）
-- Git，以及目标项目在阶段 5 复现所需的构建工具
+- Git 和可用的 Docker Engine；阶段 5/6 所需构建工具放在沙箱镜像中
 
 ## 安装
 
@@ -99,8 +99,85 @@ code-auditor --target /path/to/project [options]
 | `--host` | Web 界面绑定地址（默认：`127.0.0.1`；使用 `0.0.0.0` 可暴露到网络）。 |
 | `--port` | Web 界面绑定端口（默认：`8000`）。 |
 | `--db` | 审计历史 SQLite 数据库路径（默认：`~/.code_auditor/audits.db`）。 |
+| `--sandbox-image` | 阶段 5/6 使用的 Docker 镜像（默认：`code-auditor-sandbox:latest`）。 |
+| `--sandbox-root` | `/tmp` 下专用的临时根目录（默认：`/tmp/code-auditor`）。 |
+| `--no-docker-sandbox` | 仅在受控调试时禁用 Docker 隔离；这会恢复持久化构建行为，正常审计不安全。 |
+| `--retention-migration-dry-run [ROOT]` | 以 JSON 输出只读的历史 retain-manifest 迁移计划；默认扫描 `~/.code_auditor/results`。 |
+| `--retention-manifest-apply [ROOT]` | 原子创建或修复经最新迁移计划验证通过的 manifest；绝不删除产物。 |
+| `--retention-entrypoint-repair-dry-run [ROOT]` | 输出可安全自动修复的规范入口及精确人工 blocker 队列；绝不写文件。 |
+| `--retention-entrypoint-repair-apply [ROOT]` | 仅创建无歧义的 `reproduce.sh` 包装入口及其有效 manifest；不运行 PoC、不删除产物。 |
+| `--reviewed-cleanup-dry-run [ROOT]` | 仅为 SQLite 审核状态非 `unreviewed` 的已复现漏洞规划编译/缓存清理。 |
+| `--reviewed-cleanup-apply [ROOT]` | 重新检查数据库，仅删除 reviewed cleanup 计划接受的编译/缓存目录。 |
 
 **粗体** 选项为必需。
+
+### 阶段 5/6 临时构建与保留产物
+
+审计进入阶段 5 前，先构建一次默认沙箱镜像：
+
+```bash
+docker build -f docker/code-auditor-sandbox.Dockerfile \
+  -t code-auditor-sandbox:latest docker
+```
+
+之后，每个阶段 5/6 任务都会在 `/tmp/code-auditor/` 下获得全新的源码检出与
+可写工作区。Agent CLI 及其启动的所有构建、复现命令均在 Docker 中运行，使用
+只读根文件系统、丢弃全部 capabilities、启用 `no-new-privileges`，并限制 CPU、
+内存和 PID。被审计仓库的 Git 对象库仅以只读方式挂载；唯一可写的主机 bind
+mount 是该任务自己的 `/tmp` scratch。任务结束后会删除 scratch 和带标签的容器。
+
+清理前，CodeAuditor 会校验 `retain-manifest.json`，并原子导出其中声明的、大小
+受限的普通文件。`reproduce.sh` 为必需的可执行 UTF-8 入口，不能引用临时
+worktree、构建目录、toolchain 或 CodeAuditor 绝对路径。项目需要额外 SDK 时，
+可以扩展自定义沙箱镜像，无需放宽运行时边界。
+
+历史结果不会被自动修改。可用以下命令生成确定性的 dry-run 计划：
+
+```bash
+code-auditor --retention-migration-dry-run \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > retention-plan.json
+```
+
+报告包含建议的 manifest、逐产物 blocker、精确的临时路径、已分配空间估算，且
+固定带有 `mutations: []`。正在运行的输出，以及无法通过数据库确认状态的输出，
+都会标记为 blocked；`_merged-leftovers` 始终要求人工复核。检查计划后，可仅写入
+已通过验证的 manifest：
+
+```bash
+code-auditor --retention-manifest-apply \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > manifest-apply.json
+```
+
+该命令会在每次原子写入前重新检查产物，可重复执行，仍不会删除或压缩任何历史
+产物。
+
+缺少规范入口时，可按两阶段修复：
+
+```bash
+code-auditor --retention-entrypoint-repair-dry-run \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > entrypoint-plan.json
+code-auditor --retention-entrypoint-repair-apply \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db > entrypoint-apply.json
+```
+
+自动修复仅接受一个带 shebang、可执行、普通且没有其他迁移 blocker 的旧脚本；
+或者接受 `report.md` 以 `./相对路径` 明确调用且名称表明用于复现的唯一脚本。
+生成的包装入口只负责委托并透传参数，不代表本次重新执行过 PoC。
+`blocked_artifacts` 会保留工作树引用、报告缺失、披露包不完整、入口歧义及无效
+manifest 的精确文件/marker 证据和建议修复动作。
+
+历史编译结果使用独立的审核状态门禁：
+
+```bash
+code-auditor --reviewed-cleanup-dry-run \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db
+code-auditor --reviewed-cleanup-apply \
+  ~/.code_auditor/results --db ~/.code_auditor/audits.db
+```
+
+apply 要求 PoC 状态为 `reproduced` 且审核状态已知并非 `unreviewed`，拒绝正在运行
+的输出，并保护数据库登记文件、有效 manifest 及其保留文件、源码 worktree、报告、
+披露包和复现入口。未知、未映射、未复现或混合状态均按 fail-closed 处理。
 
 ### 审计历史数据库
 
@@ -120,17 +197,22 @@ code-auditor --web [--host 127.0.0.1] [--port 8000]
 
 然后在浏览器中打开 `http://127.0.0.1:8000`。**New Audit** 只提供 `~/.code_auditor/repo/` 下已有的受管仓库，或输入新的 HTTPS/Git-over-SSH URL 并克隆到该目录；Web API 不接受任意本地目标目录。Web 审计的输出目录默认为 `~/.code_auditor/results/<repo>/audit-output-<commit>/`，同一 repo+commit 总是在同一输出目录中续跑。可启动和停止审计、实时查看阶段进度与日志流（通过 SSE 推送），并浏览 vulnerabilities、PoC 报告和披露文件。**CVEs** 侧边栏显示公开 CVE 记录、项目、CVSS、上游披露网站链接、关联的本地 confirmed Disclosure 与本地 PoC。在 CVE、confirmed Disclosure、单次运行或合并 target 中点击 **Terminal**，会在 Web 页面打开由服务端 PTY 支持的交互式 xterm，并自动进入该漏洞的 `stage5-pocs/<id>/` 目录；页面可同时打开多个终端。**Reproduction** 侧栏通过目标项目、commit、具体漏洞三级下拉框筛选 History 中严格为 `reproduced` 的漏洞，并显示所选漏洞当前的 PoC 状态；启动后会在 `~/.code_auditor/reproductions/` 下使用独立 Git worktree 检出原审计 commit，仅重新运行阶段 5，不修改原审计输出。
 
-Backend、Model、日志级别和所有 Web 受管输出路径都是服务端配置，浏览器请求不能覆盖。Web 首次启动时会创建权限为 `0600` 的 `~/.code_auditor/settings.json`；日志级别默认为 `DEBUG`，模型默认值由所配置的 Backend 决定。既有 `~/.code_auditor/web-config.json` 会先经过校验，再自动迁移到新文件名。需要调整时直接编辑 `settings.json`：
+页面右上角的 **LLM Settings** 对话框用于选择新任务、恢复的 Run 以及活动任务后续 agent 调用所使用的 Claude 或 Codex。已经在途的单次 agent 调用会保留启动时不可变的 backend/provider 快照，下一次调用才使用新保存的选择。History 会像模型使用列表一样，按首次使用顺序记录实际调用过的 backend，并自动去重。每个后端都可以通过对应的 Agent SDK 直接复用本地 CLI 登录与配置（`~/.claude/` 或 `~/.codex/config.toml`），也可以配置自定义 Base URL、API Key 和模型名称。自定义 Codex 供应商必须兼容 OpenAI Responses 协议。审计和复现请求体不能绕过这里的选择。
+
+Web 首次启动时会创建权限为 `0600` 的 `~/.code_auditor/settings.json`，日志级别默认为 `DEBUG`。设置 API 不会把已保存的 API Key 返回给浏览器；提交空白 Key 会保留现有值。Key 仍以明文保存在该服务端文件中，因此需要保护主机账户，并避免通过不可信、未加密的网络暴露页面。既有 `~/.code_auditor/web-config.json` 会先经过校验，再自动迁移到新文件名。推荐使用页面对话框修改；底层结构如下：
 
 ```json
 {
   "backend": "claude",
-  "model": null,
   "log_level": "DEBUG",
   "max_parallel": 1,
   "repos_dir": "~/.code_auditor/repo",
   "results_dir": "~/.code_auditor/results",
-  "reproductions_dir": "~/.code_auditor/reproductions"
+  "reproductions_dir": "~/.code_auditor/reproductions",
+  "providers": {
+    "claude": {"mode": "local", "base_url": "", "api_key": "", "model": ""},
+    "codex": {"mode": "local", "base_url": "", "api_key": "", "model": ""}
+  }
 }
 ```
 

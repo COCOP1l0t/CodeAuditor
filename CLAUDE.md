@@ -81,7 +81,7 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 ```
 code_auditor/
 ├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
-├── config.py            # AuditConfig, Module, AnalysisUnit, ValidationIssue dataclasses
+├── config.py            # AuditConfig, AnalysisUnit, ValidationIssue dataclasses
 ├── disclosures.py       # Stable Disclosure identity + email metadata helpers
 ├── db.py                # SQLite audit history: AuditStore, schema, output-dir scanner,
 │                        #   AU persistence/reuse (seed_analysis_units)

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+from dataclasses import replace
 from pathlib import Path
-
-import pytest
 
 from code_auditor.checkpoint import CheckpointManager
 from code_auditor.config import AuditConfig
@@ -21,6 +21,7 @@ def _stage5_config(tmp_path: Path) -> tuple[AuditConfig, CheckpointManager, Path
         target=str(target),
         output_dir=str(output_dir),
         max_parallel=2,
+        sandbox_enabled=False,
     )
     return config, CheckpointManager(str(output_dir), resume=True), output_dir
 
@@ -236,3 +237,96 @@ def test_run_stage5_skips_fp_on_resume(tmp_path: Path) -> None:
     report = asyncio.run(stage5._run_reproduce(str(vuln), config, checkpoint))
 
     assert report is None
+
+
+def test_run_stage5_exports_only_retained_files_from_scratch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, checkpoint, output_dir = _stage5_config(tmp_path)
+    config.sandbox_enabled = True
+    vuln = _write_vuln_file(output_dir, "H-09")
+    scratch_root = tmp_path / "fake-scratch"
+    instances: list[object] = []
+
+    class FakeScratch:
+        def __init__(self, owner: AuditConfig, _task_name: str) -> None:
+            self.owner = owner
+            self.source_dir = scratch_root / "source"
+            self.artifact_dir = scratch_root / "artifacts"
+            self.input_dir = scratch_root / "inputs"
+            self.closed = False
+            instances.append(self)
+
+        async def prepare(self, _target: str, _commit: str):  # type: ignore[no-untyped-def]
+            self.source_dir.mkdir(parents=True)
+            self.artifact_dir.mkdir(parents=True)
+            self.input_dir.mkdir(parents=True)
+            return self
+
+        def audit_config(self, owner: AuditConfig) -> AuditConfig:
+            return replace(
+                owner,
+                target=str(self.source_dir),
+                output_dir=str(self.artifact_dir),
+                poc_worktree=str(self.source_dir),
+            )
+
+        def copy_input(self, source: str, name: str) -> Path:
+            destination = self.input_dir / name
+            shutil.copyfile(source, destination)
+            return destination
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def fake_run_agent(
+        _prompt: str,
+        work_config: AuditConfig,
+        **_kwargs: object,
+    ) -> str:
+        poc = Path(work_config.output_dir) / "stage5-pocs" / "H-09"
+        poc.mkdir(parents=True, exist_ok=True)
+        (poc / "report.md").write_text(
+            "# H-09\n\n## Reproduction Status\n\nreproduced\n",
+            encoding="utf-8",
+        )
+        reproduce = poc / "reproduce.sh"
+        reproduce.write_text("#!/bin/sh\nexec echo reproduced\n", encoding="utf-8")
+        reproduce.chmod(0o700)
+        (poc / "trigger-graph.json").write_text(
+            json.dumps(_trigger_graph("H-09")), encoding="utf-8"
+        )
+        (poc / "large-build.bin").write_bytes(b"disposable")
+        (poc / "retain-manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entrypoint": "reproduce.sh",
+                    "files": [
+                        {"path": "reproduce.sh", "role": "entrypoint"},
+                        {"path": "report.md", "role": "report"},
+                        {"path": "trigger-graph.json", "role": "evidence"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "done"
+
+    monkeypatch.setattr(stage5, "DockerScratch", FakeScratch)
+    monkeypatch.setattr(stage5, "run_agent", fake_run_agent)
+
+    reports = asyncio.run(stage5.run_stage5([str(vuln)], config, checkpoint))
+
+    persistent = output_dir / "stage5-pocs" / "H-09"
+    assert reports == [str(persistent / "report.md")]
+    assert sorted(path.name for path in persistent.iterdir()) == [
+        "report.md",
+        "reproduce.sh",
+        "retain-manifest.json",
+        "trigger-graph.json",
+    ]
+    assert not (persistent / "large-build.bin").exists()
+    assert instances and instances[0].closed is True  # type: ignore[attr-defined]
+    assert checkpoint.is_complete("stage5:H-09")

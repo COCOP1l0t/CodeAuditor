@@ -82,6 +82,9 @@ Create minimal copies of the PoC artifacts in `__DISCLOSURE_DIR__`. The minimal 
 - Remove debugging scaffolding, diagnostic prints, dead code paths, and verbose comments
 - Be concise enough for a maintainer to read, understand, and run quickly
 - Include a brief header comment in each script describing what the PoC demonstrates
+- Provide an executable `reproduce.sh` as the single portable entry point; it must
+  rebuild from the audited source commit and must not reference CodeAuditor scratch,
+  worktree, build, toolchain, or home-directory paths
 
 Keep the original PoC artifacts in `__POC_DIR__` intact — they are valuable for further investigation.
 
@@ -259,3 +262,28 @@ Create `__DISCLOSURE_DIR__/disclosure.zip` containing:
 - [ ] Zip contains the report and all minimal PoC files (plus any other helpful artifacts)
 - [ ] Email in `__DISCLOSURE_DIR__/email.txt` is ready to send
 - [ ] All artifacts are consistent — report observations match the minimal PoC output, email summary aligns with the report, no internal identifiers anywhere
+
+### Step 6: Declare Retained Files
+
+Create `__DISCLOSURE_DIR__/retain-manifest.json` after the zip has been produced:
+
+```json
+{
+  "schema_version": 1,
+  "entrypoint": "reproduce.sh",
+  "files": [
+    {"path": "reproduce.sh", "role": "entrypoint"},
+    {"path": "report.md", "role": "report"},
+    {"path": "email.txt", "role": "disclosure"},
+    {"path": "disclosure.zip", "role": "disclosure"}
+  ]
+}
+```
+
+List every small script, configuration, crafted input, source harness, report, email,
+and archive needed by the disclosure, using normalized relative paths. Allowed roles
+are `entrypoint`, `script`, `support`, `report`, `evidence`, and `disclosure`. Do not
+list the manifest itself. Build trees, caches, package directories, source checkouts,
+toolchains, generated binaries, core dumps, and large VM/disk images are disposable
+and must not be retained. The directory will be replaced atomically with only the
+files named in this manifest.

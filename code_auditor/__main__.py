@@ -18,11 +18,62 @@ from .config import (
 from .db import DEFAULT_DB_PATH, RUN_CANCELLED, RUN_DONE, RUN_FAILED
 from .logger import configure_logging, get_logger
 from .orchestrator import run_audit
-from .repos import default_audit_output_dir, ensure_repo_sync
+from .repos import DEFAULT_RESULTS_DIR, default_audit_output_dir, ensure_repo_sync
+from .review_cleanup import (
+    ReviewedCleanupError,
+    apply_reviewed_cleanup,
+    build_reviewed_cleanup_report,
+)
+from .retention_migration import (
+    RetentionMigrationError,
+    apply_retention_entrypoint_repairs,
+    apply_retention_manifests,
+    build_retention_entrypoint_repair_report,
+    build_retention_migration_report,
+)
 from .tui import TUIManager
-from .utils import summarize_task_errors
+from .utils import render_json_report, summarize_task_errors
 
 logger = get_logger("main")
+
+_MAINTENANCE_COMMANDS = (
+    (
+        "retention_migration_dry_run",
+        "--retention-migration-dry-run",
+        build_retention_migration_report,
+        RetentionMigrationError,
+    ),
+    (
+        "retention_manifest_apply",
+        "--retention-manifest-apply",
+        apply_retention_manifests,
+        RetentionMigrationError,
+    ),
+    (
+        "retention_entrypoint_repair_dry_run",
+        "--retention-entrypoint-repair-dry-run",
+        build_retention_entrypoint_repair_report,
+        RetentionMigrationError,
+    ),
+    (
+        "retention_entrypoint_repair_apply",
+        "--retention-entrypoint-repair-apply",
+        apply_retention_entrypoint_repairs,
+        RetentionMigrationError,
+    ),
+    (
+        "reviewed_cleanup_dry_run",
+        "--reviewed-cleanup-dry-run",
+        build_reviewed_cleanup_report,
+        ReviewedCleanupError,
+    ),
+    (
+        "reviewed_cleanup_apply",
+        "--reviewed-cleanup-apply",
+        apply_reviewed_cleanup,
+        ReviewedCleanupError,
+    ),
+)
 
 
 def _persist_run_safely(
@@ -111,6 +162,82 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DB_PATH,
         help=f"Audit history SQLite database path (default: {DEFAULT_DB_PATH})",
     )
+    parser.add_argument(
+        "--sandbox-image",
+        default=os.environ.get("CODE_AUDITOR_SANDBOX_IMAGE", "code-auditor-sandbox:latest"),
+        help="Docker image used for Stage 5/6 compilation and reproduction",
+    )
+    parser.add_argument(
+        "--sandbox-root",
+        default=os.environ.get("CODE_AUDITOR_SANDBOX_ROOT", "/tmp/code-auditor"),
+        help="Disposable Stage 5/6 scratch root; must be a dedicated directory under /tmp",
+    )
+    parser.add_argument(
+        "--no-docker-sandbox",
+        action="store_true",
+        help="Disable the Stage 5/6 Docker boundary (unsafe; intended only for controlled debugging)",
+    )
+    retention_group = parser.add_mutually_exclusive_group()
+    retention_group.add_argument(
+        "--retention-migration-dry-run",
+        nargs="?",
+        const=DEFAULT_RESULTS_DIR,
+        metavar="RESULTS_ROOT",
+        help=(
+            "scan historical results and print a retain-manifest migration plan; "
+            f"never writes or deletes files (default root: {DEFAULT_RESULTS_DIR})"
+        ),
+    )
+    retention_group.add_argument(
+        "--retention-manifest-apply",
+        nargs="?",
+        const=DEFAULT_RESULTS_DIR,
+        metavar="RESULTS_ROOT",
+        help=(
+            "create or repair only manifests accepted by the historical migration "
+            f"plan; never deletes artifacts (default root: {DEFAULT_RESULTS_DIR})"
+        ),
+    )
+    retention_group.add_argument(
+        "--retention-entrypoint-repair-dry-run",
+        nargs="?",
+        const=DEFAULT_RESULTS_DIR,
+        metavar="RESULTS_ROOT",
+        help=(
+            "plan canonical reproduce.sh wrappers for unambiguous portable legacy "
+            "entrypoints; never writes files"
+        ),
+    )
+    retention_group.add_argument(
+        "--retention-entrypoint-repair-apply",
+        nargs="?",
+        const=DEFAULT_RESULTS_DIR,
+        metavar="RESULTS_ROOT",
+        help=(
+            "create proven-safe reproduce.sh wrappers and validated retain "
+            "manifests; never deletes artifacts"
+        ),
+    )
+    retention_group.add_argument(
+        "--reviewed-cleanup-dry-run",
+        nargs="?",
+        const=DEFAULT_RESULTS_DIR,
+        metavar="RESULTS_ROOT",
+        help=(
+            "plan deletion of compilation directories only for reproduced bugs "
+            "whose SQLite review status is not unreviewed"
+        ),
+    )
+    retention_group.add_argument(
+        "--reviewed-cleanup-apply",
+        nargs="?",
+        const=DEFAULT_RESULTS_DIR,
+        metavar="RESULTS_ROOT",
+        help=(
+            "delete compilation directories accepted by a fresh reviewed cleanup "
+            "plan; preserves registered and retained artifacts"
+        ),
+    )
     return parser
 
 
@@ -140,9 +267,36 @@ def _run_web(args: argparse.Namespace) -> None:
         _exit_after_keyboard_interrupt()
 
 
+def _run_maintenance_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> bool | None:
+    """Dispatch the selected read/write maintenance mode, if any."""
+    for attribute, flag, handler, error_type in _MAINTENANCE_COMMANDS:
+        results_root = getattr(args, attribute)
+        if results_root is None:
+            continue
+        if args.web or args.target or args.repo_url:
+            parser.error(f"{flag} cannot be combined with an audit or --web")
+        try:
+            report = handler(results_root, db_path=args.db)
+        except error_type as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return False
+        print(render_json_report(report), end="")
+        return True
+    return None
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    maintenance_succeeded = _run_maintenance_command(args, parser)
+    if maintenance_succeeded is not None:
+        if not maintenance_succeeded:
+            sys.exit(1)
+        return
 
     if args.web:
         _run_web(args)
@@ -179,6 +333,9 @@ def main() -> None:
         model=args.model,
         target_au_count=args.target_au_count,
         agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+        sandbox_enabled=not args.no_docker_sandbox,
+        sandbox_image=args.sandbox_image,
+        sandbox_root=args.sandbox_root,
     )
 
     if args.tui:

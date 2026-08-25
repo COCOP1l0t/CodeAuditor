@@ -240,6 +240,7 @@ _RUN_EXTRA_COLUMNS = {
     "dirty": '"dirty" INTEGER DEFAULT 0',
     "submodules": '"submodules" TEXT DEFAULT \'[]\'',
     "target_key": '"target_key" TEXT DEFAULT \'\'',
+    "backends_used": '"backends_used" TEXT DEFAULT \'[]\'',
     "models_used": '"models_used" TEXT DEFAULT \'[]\'',
     "usage_stats": '"usage_stats" TEXT DEFAULT \'{}\'',
     "duration_seconds": '"duration_seconds" REAL NOT NULL DEFAULT 0',
@@ -582,9 +583,29 @@ class AuditStore:
             duration_missing = "duration_seconds" not in existing
             active_started_missing = "active_started_at" not in existing
             duration_known_missing = "duration_known" not in existing
+            backends_used_missing = "backends_used" not in existing
             for column, ddl in _RUN_EXTRA_COLUMNS.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
+            # Preserve the original backend for pre-history rows. New runs
+            # append only when an agent invocation actually starts, matching
+            # models_used semantics.
+            if backends_used_missing and "backend" in existing:
+                legacy_backends = conn.execute(
+                    "SELECT id, backend FROM runs"
+                ).fetchall()
+                conn.executemany(
+                    "UPDATE runs SET backends_used = ? WHERE id = ?",
+                    [
+                        (
+                            json.dumps([str(row["backend"])], ensure_ascii=False)
+                            if row["backend"]
+                            else "[]",
+                            row["id"],
+                        )
+                        for row in legacy_backends
+                    ],
+                )
             # Existing terminal runs only have wall-clock timestamps. Retain
             # that raw migration baseline for diagnostics, but mark every
             # pre-accounting row unknown so the API/UI never presents it as an
@@ -990,8 +1011,9 @@ class AuditStore:
                 INSERT INTO runs (
                     target, output_dir, wiki_path,
                     backend, model, max_parallel, target_au_count, log_level,
-                    status, started_at, active_started_at, duration_known, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, started_at, active_started_at, duration_known, created_at,
+                    backends_used
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     config.target,
@@ -1007,6 +1029,7 @@ class AuditStore:
                     active_started_at,
                     duration_known,
                     time.time(),
+                    json.dumps(config.backends_used, ensure_ascii=False),
                 ),
             )
             return int(cursor.lastrowid)
@@ -1017,6 +1040,7 @@ class AuditStore:
         status: str,
         error: str = "",
         ended_at: float | None = None,
+        backends_used: list[str] | None = None,
         models_used: list[str] | None = None,
         usage_stats: dict[str, float] | None = None,
     ) -> None:
@@ -1046,6 +1070,11 @@ class AuditStore:
                 """,
                 (status, error, finished_at, finished_at, run_id),
             )
+            if backends_used is not None:
+                conn.execute(
+                    "UPDATE runs SET backends_used = ? WHERE id = ?",
+                    (json.dumps(backends_used, ensure_ascii=False), run_id),
+                )
             if models_used is not None:
                 conn.execute(
                     "UPDATE runs SET models_used = ? WHERE id = ?",
@@ -1131,7 +1160,12 @@ class AuditStore:
         return run_ids
 
     def resume_cancelled_run(
-        self, run_id: int, *, resumed_at: float | None = None
+        self,
+        run_id: int,
+        *,
+        resumed_at: float | None = None,
+        backend: str | None = None,
+        model: str | None = None,
     ) -> bool:
         """Atomically move one resumable run back to the running state.
 
@@ -1143,21 +1177,55 @@ class AuditStore:
         """
         active_started_at = time.time() if resumed_at is None else resumed_at
         with self._connect() as conn:
+            if backend is None:
+                cursor = conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, error = '', ended_at = NULL,
+                        active_started_at = ?
+                    WHERE id = ? AND (status IN (?, ?) OR (status = ? AND error != ''))
+                    """,
+                    (
+                        RUN_RUNNING,
+                        active_started_at,
+                        run_id,
+                        RUN_CANCELLED,
+                        RUN_FAILED,
+                        RUN_DONE,
+                    ),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, error = '', ended_at = NULL,
+                        active_started_at = ?, backend = ?, model = ?
+                    WHERE id = ? AND (status IN (?, ?) OR (status = ? AND error != ''))
+                    """,
+                    (
+                        RUN_RUNNING,
+                        active_started_at,
+                        backend,
+                        model,
+                        run_id,
+                        RUN_CANCELLED,
+                        RUN_FAILED,
+                        RUN_DONE,
+                    ),
+                )
+            return cursor.rowcount == 1
+
+    def update_running_run_agent_settings(
+        self, run_id: int, *, backend: str, model: str | None
+    ) -> bool:
+        """Record the backend/model selected for the active execution segment."""
+        with self._connect() as conn:
             cursor = conn.execute(
                 """
-                UPDATE runs
-                SET status = ?, error = '', ended_at = NULL,
-                    active_started_at = ?
-                WHERE id = ? AND (status IN (?, ?) OR (status = ? AND error != ''))
+                UPDATE runs SET backend = ?, model = ?
+                WHERE id = ? AND status = ?
                 """,
-                (
-                    RUN_RUNNING,
-                    active_started_at,
-                    run_id,
-                    RUN_CANCELLED,
-                    RUN_FAILED,
-                    RUN_DONE,
-                ),
+                (backend, model, run_id, RUN_RUNNING),
             )
             return cursor.rowcount == 1
 
@@ -1195,13 +1263,15 @@ class AuditStore:
                 """
                 UPDATE runs
                 SET error = ?, ended_at = ?, duration_seconds = ?,
-                    active_started_at = NULL, models_used = ?, usage_stats = ?
+                    active_started_at = NULL, backends_used = ?, models_used = ?,
+                    usage_stats = ?
                 WHERE id = ?
                 """,
                 (
                     error,
                     finished_at,
                     duration_seconds,
+                    json.dumps(config.backends_used, ensure_ascii=False),
                     json.dumps(config.models_used, ensure_ascii=False),
                     json.dumps(config.usage_stats, ensure_ascii=False),
                     run_id,
@@ -1225,7 +1295,6 @@ class AuditStore:
             (p.stat().st_mtime for p in Path(output_dir).rglob("*") if p.is_file()),
             default=None,
         )
-        config = AuditConfig(target=target, output_dir=output_dir)
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -1764,7 +1833,6 @@ class AuditStore:
         if total == 0:
             return None
         vulns: list[dict] = []
-        poc_by_run: dict[int, dict[str, dict]] = {}
         with self._connect() as conn:
             run_ids = [r["id"] for r in runs]
             placeholders = ",".join("?" * len(run_ids))
@@ -1987,30 +2055,6 @@ class AuditStore:
         if exists is None:
             return None
         return self.import_cve({**record, "cve_id": cve_id})
-
-    def prune_cves_without_local_disclosures(self) -> dict[str, int]:
-        """Remove stale CVEs and links that have no local Stage 6 report."""
-        valid_keys = {
-            entry["dedupe_key"] for entry in self.list_cve_import_candidates()
-        }
-        with self._connect() as conn:
-            links = conn.execute("SELECT cve_id, dedupe_key FROM cve_links").fetchall()
-            invalid_links = [
-                (link["cve_id"], link["dedupe_key"])
-                for link in links
-                if link["dedupe_key"] not in valid_keys
-            ]
-            conn.executemany(
-                "DELETE FROM cve_links WHERE cve_id = ? AND dedupe_key = ?",
-                invalid_links,
-            )
-            before = conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0]
-            conn.execute(
-                "DELETE FROM cves WHERE NOT EXISTS "
-                "(SELECT 1 FROM cve_links WHERE cve_links.cve_id = cves.cve_id)"
-            )
-            after = conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0]
-        return {"cves": before - after, "links": len(invalid_links)}
 
     def list_cves(self, project: str | None = None) -> list[dict]:
         """Return manually imported CVEs backed by local disclosure reports."""

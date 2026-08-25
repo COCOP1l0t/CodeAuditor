@@ -7,32 +7,37 @@ from pathlib import Path
 from typing import Any
 
 
-def _single_line(value: Any) -> str:
+def single_line(value: Any) -> str:
     if value is None:
         return ""
     return " ".join(str(value).split())
 
 
-def _display_list(value: Any) -> list[str]:
+def display_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
-        return [_single_line(item) for item in value if _single_line(item)]
-    text = _single_line(value)
+        result = []
+        for item in value:
+            text = single_line(item)
+            if text:
+                result.append(text)
+        return result
+    text = single_line(value)
     return [text] if text else []
 
 
 def _normalize_text(value: Any) -> str:
-    return " ".join(_single_line(value).lower().split())
+    return " ".join(single_line(value).lower().split())
 
 
 def _normalize_path_text(value: Any) -> str:
-    return " ".join(_single_line(value).replace("\\", "/").split())
+    return " ".join(single_line(value).replace("\\", "/").split())
 
 
 def _normalize_list(value: Any) -> list[str]:
     return sorted(
         {
             _normalize_text(item)
-            for item in _display_list(value)
+            for item in display_list(value)
             if _normalize_text(item)
         }
     )

@@ -303,9 +303,10 @@ def test_resume_cancelled_run_accepts_failed_run(tmp_path) -> None:
     assert run["status"] == RUN_RUNNING
 
 
-def test_record_run_stores_models_used(tmp_path) -> None:
+def test_record_run_stores_backends_and_models_used(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     config = _make_config(tmp_path, out)
+    config.backends_used.extend(["claude", "codex"])
     config.models_used.extend(["model-a", "model-b"])
     store = AuditStore(str(tmp_path / "history.db"))
 
@@ -313,18 +314,25 @@ def test_record_run_stores_models_used(tmp_path) -> None:
 
     run = store.get_run(run_id)
     assert run is not None
+    assert json.loads(run["backends_used"]) == ["claude", "codex"]
     assert json.loads(run["models_used"]) == ["model-a", "model-b"]
 
 
-def test_finish_run_updates_models_used(tmp_path) -> None:
+def test_finish_run_updates_backends_and_models_used(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))
     run_id = store.create_run(_make_config(tmp_path, out), started_at=100.0)
 
-    store.finish_run(run_id, RUN_DONE, models_used=["model-a"])
+    store.finish_run(
+        run_id,
+        RUN_DONE,
+        backends_used=["codex", "claude"],
+        models_used=["model-a"],
+    )
 
     run = store.get_run(run_id)
     assert run is not None
+    assert json.loads(run["backends_used"]) == ["codex", "claude"]
     assert json.loads(run["models_used"]) == ["model-a"]
 
 
@@ -399,7 +407,12 @@ def test_schema_init_is_idempotent(tmp_path) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(pocs)")}
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
     assert {"trigger_graph_path", "asan_report_path"} <= columns
-    assert {"duration_seconds", "active_started_at", "duration_known"} <= run_columns
+    assert {
+        "backends_used",
+        "duration_seconds",
+        "active_started_at",
+        "duration_known",
+    } <= run_columns
 
 
 def test_record_run_persists_run_and_artifacts(tmp_path) -> None:
@@ -526,7 +539,12 @@ def test_resume_cancelled_run_reuses_same_history_row(tmp_path) -> None:
     )
     store.finish_run(run_id, RUN_CANCELLED, "cancelled", ended_at=456.0)
 
-    assert store.resume_cancelled_run(run_id, resumed_at=1000.0) is True
+    assert store.resume_cancelled_run(
+        run_id,
+        resumed_at=1000.0,
+        backend="codex",
+        model="new-codex-model",
+    ) is True
     run = store.get_run(run_id)
     assert run is not None
     assert run["id"] == run_id
@@ -536,11 +554,36 @@ def test_resume_cancelled_run_reuses_same_history_row(tmp_path) -> None:
     assert run["duration_seconds"] == 333.0
     assert run["active_started_at"] == 1000.0
     assert run["error"] == ""
+    assert run["backend"] == "codex"
+    assert run["model"] == "new-codex-model"
     assert store.resume_cancelled_run(run_id) is False
 
     runs, total = store.list_runs()
     assert total == 1
     assert runs[0]["id"] == run_id
+
+
+def test_update_running_run_agent_settings_only_changes_active_run(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(_make_config(tmp_path, out))
+
+    assert store.update_running_run_agent_settings(
+        run_id, backend="codex", model="hot-model"
+    ) is True
+    running = store.get_run(run_id)
+    assert running is not None
+    assert running["backend"] == "codex"
+    assert running["model"] == "hot-model"
+
+    store.finish_run(run_id, RUN_DONE)
+    assert store.update_running_run_agent_settings(
+        run_id, backend="claude", model="late-model"
+    ) is False
+    finished = store.get_run(run_id)
+    assert finished is not None
+    assert finished["backend"] == "codex"
+    assert finished["model"] == "hot-model"
 
 
 def test_resumed_run_duration_excludes_inactive_gap(tmp_path) -> None:
@@ -757,6 +800,40 @@ def test_schema_migration_adds_identity_columns(tmp_path) -> None:
         assert col in columns
     runs, total = store.list_runs()
     assert total == 1  # existing row preserved
+
+
+def test_schema_migration_preserves_legacy_backend_history(tmp_path) -> None:
+    db = str(tmp_path / "legacy-backends.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                target TEXT NOT NULL,
+                output_dir TEXT NOT NULL,
+                backend TEXT,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO runs (
+                id, target, output_dir, backend, status, created_at
+            ) VALUES (?, '/missing', '/missing/out', ?, ?, 1.0)
+            """,
+            [(1, "codex", RUN_DONE), (2, "", RUN_CANCELLED)],
+        )
+
+    store = AuditStore(db)
+
+    first = store.get_run(1)
+    second = store.get_run(2)
+    assert first is not None
+    assert json.loads(first["backends_used"]) == ["codex"]
+    assert second is not None
+    assert json.loads(second["backends_used"]) == []
 
 
 def test_schema_migration_marks_legacy_run_durations_unknown(tmp_path) -> None:

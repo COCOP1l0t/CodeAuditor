@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable, Coroutine, TypeVar
@@ -9,6 +10,45 @@ from .config import ValidationIssue
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+
+def extract_json_object(text: str) -> str | None:
+    """Extract the first valid JSON object from optional prose/fences."""
+    stripped = text.strip()
+    if stripped.startswith("```json"):
+        stripped = stripped.removeprefix("```json").removesuffix("```").strip()
+    elif stripped.startswith("```"):
+        stripped = stripped.removeprefix("```").removesuffix("```").strip()
+
+    try:
+        json.loads(stripped)
+        return stripped
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    start = stripped.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for index, char in enumerate(stripped[start:], start=start):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = stripped[start : index + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    return None
+
+
+def render_json_report(report: dict[str, Any]) -> str:
+    """Render deterministic, human-readable JSON for maintenance commands."""
+    return json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
 
 
 async def run_parallel_limited(

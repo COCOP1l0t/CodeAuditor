@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from rich.console import Console
-from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -30,7 +29,6 @@ from textual.app import App, ComposeResult
 from textual.css.query import NoMatches
 from textual.widgets import Footer, Header, RichLog, Static
 
-from .logger import configure_logging as _configure_logging
 from .logger import format_log_record
 
 TUI_BACKEND = "textual"
@@ -117,17 +115,6 @@ class _TUILogHandler(logging.Handler):
             _clamp_log_scroll_offset(self._state)
         except Exception:
             self.handleError(record)
-
-
-# ── Dashboard renderer ──────────────────────────────────────────────────────
-
-def _make_header() -> Panel:
-    title = Text()
-    title.append("⚡ ", style=SUCCESS)
-    title.append("Code", style=f"{BOLD} {ACCENT}")
-    title.append("Auditor", style=f"{BOLD} {ACCENT2}")
-    title.append(" ⚡", style=SUCCESS)
-    return Panel(title, style=f"bold {ACCENT}", border_style=ACCENT, padding=(0, 2))
 
 
 def _make_config_table(state: TUIState) -> Table:
@@ -244,64 +231,6 @@ def _clamp_log_scroll_offset(state: TUIState) -> None:
     state.log_scroll_offset = _clamped_log_scroll_offset(state)
 
 
-def _build_scrollbar(visible: int, total: int, height: int, offset: int = 0) -> Text:
-    """Build a vertical scrollbar showing position within the log buffer.
-
-    The scrollbar is ``height`` rows tall.  The thumb size and position are
-    proportional to the ratio of *visible* lines to *total* lines.
-    """
-    if total <= visible or height <= 0:
-        return Text("")
-
-    thumb_h = min(height, max(1, int(height * (visible / total))))
-    max_offset = max(0, total - visible)
-    offset = max(0, min(offset, max_offset))
-    track_space = height - thumb_h
-    if max_offset == 0:
-        thumb_top = 0
-    else:
-        first_visible = max_offset - offset
-        thumb_top = round(track_space * (first_visible / max_offset))
-
-    bars: list[str] = []
-    for i in range(height):
-        if thumb_top <= i < thumb_top + thumb_h:
-            bars.append("█")
-        else:
-            bars.append("│")
-    return Text("\n".join(bars), style=DIM)
-
-
-def _make_log_panel(state: TUIState) -> Panel:
-    content: Text | Table
-    if not state.log_lines:
-        content = Text("Waiting for logs...", style=DIM)
-    else:
-        visible_lines = _visible_log_lines(state)
-        visible = len(visible_lines)
-        total = len(state.log_lines)
-        offset = _clamped_log_scroll_offset(state)
-
-        log_text = Text("\n", style="").join(visible_lines)
-        scrollbar = _build_scrollbar(visible, total, visible, offset=offset)
-
-        if scrollbar.plain:
-            table = Table(show_header=False, box=None, padding=0, expand=True)
-            table.add_column(ratio=1)
-            table.add_column(width=1, justify="center")
-            table.add_row(log_text, scrollbar)
-            content = table
-        else:
-            content = log_text
-
-    return Panel(
-        content,
-        title="[bold]Live Log[/bold]",
-        border_style=DIM,
-        padding=(0, 1),
-    )
-
-
 def _make_summary(state: TUIState) -> Panel:
     elapsed = _fmt_duration(time.time() - state.start_time) if state.start_time else "—"
     done = sum(1 for s in state.stages.values() if s.status == "done")
@@ -318,27 +247,6 @@ def _make_summary(state: TUIState) -> Panel:
     if state.error:
         tree.add(f"Error: [red]{state.error}[/red]")
     return Panel(tree, border_style=SUCCESS if not state.error else ERROR, padding=(1, 2))
-
-
-def _render_dashboard(state: TUIState) -> Layout:
-    """Build the full dashboard layout."""
-    layout = Layout()
-    layout.split_column(
-        Layout(_make_header(), size=HEADER_HEIGHT, name="header"),
-        Layout(name="body"),
-    )
-
-    body_children = [
-        Layout(_make_config_table(state), size=CONFIG_HEIGHT, name="config"),
-        Layout(_make_stage_panel(state), size=STAGES_HEIGHT, name="stages"),
-        Layout(_make_log_panel(state), name="logs"),
-    ]
-
-    if state.finished:
-        body_children.append(Layout(_make_summary(state), size=SUMMARY_HEIGHT, name="summary"))
-
-    layout["body"].split_column(*body_children)
-    return layout
 
 
 class CodeAuditorApp(App[None]):
@@ -1106,14 +1014,3 @@ class TUIManager:
             if detail:
                 st.detail = detail
             self._refresh()
-
-    def set_error(self, message: str) -> None:
-        self._state.error = message
-        self._refresh()
-
-
-# ── Convenience: configure Rich logging for non-TUI mode ────────────────────
-
-def configure_rich_logging(level: str) -> None:
-    """Configure non-TUI logging with the same line format used by the TUI."""
-    _configure_logging(level)

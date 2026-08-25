@@ -10,12 +10,14 @@ from typing import Any
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, select_poc_model
-from ..disclosures import build_dedupe_key
+from ..disclosures import build_dedupe_key, display_list, single_line
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
 from ..reproduction_status import is_failed_status, is_reproduced_status, read_reproduction_status
-from ..utils import record_task_error, run_parallel_limited
+from ..retention import export_retained_artifacts
+from ..sandbox import DockerScratch
+from ..utils import extract_json_object, record_task_error, run_parallel_limited
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage6")
@@ -65,17 +67,6 @@ def _read_text(path: str) -> str:
         return ""
 
 
-def _single_line(value: object) -> str:
-    return " ".join(str(value or "").strip().split())
-
-
-def _display_list(value: object) -> list[str]:
-    if isinstance(value, (list, tuple, set)):
-        return [_single_line(item) for item in value if _single_line(item)]
-    text = _single_line(value)
-    return [text] if text else []
-
-
 def _extract_report_title(report_path: str) -> str | None:
     content = _read_text(report_path)
     for line in content.splitlines():
@@ -115,14 +106,14 @@ def _fallback_finding_from_report(report_path: str, vuln_id: str | None) -> dict
         or "Stage 5 reproduction report was processed without a valid Stage 4 finding."
     )
     location = _extract_report_section(content, "Location")
-    fallback_location = _single_line(location) if location else f"stage5-report:{title}"
+    fallback_location = single_line(location) if location else f"stage5-report:{title}"
 
     return {
         "id": vuln_id or Path(report_path).parent.name,
         "title": title,
         "location": fallback_location,
-        "trigger": _single_line(trigger)[:500],
-        "summary": _single_line(summary)[:500],
+        "trigger": single_line(trigger)[:500],
+        "summary": single_line(summary)[:500],
         "cwe_id": [],
         "vulnerability_class": [],
     }
@@ -155,7 +146,7 @@ def _load_candidate(report_path: str, config: AuditConfig, repo_url: str) -> _Di
         finding = _fallback_finding_from_report(report_path, vuln_id)
 
     title = (
-        _single_line(finding.get("title"))
+        single_line(finding.get("title"))
         or _extract_report_title(report_path)
         or vuln_id
         or report_path
@@ -220,37 +211,6 @@ _MAX_DEDUPE_TURNS = 30
 _DEFAULT_DEDUPE_EFFORT = "low"
 
 
-def _extract_json_object(text: str) -> str | None:
-    """Extract the first JSON object from text that may contain prefixes or suffixes."""
-    stripped = text.strip().removeprefix("```json").removesuffix("```").strip()
-    # Try direct parse first
-    try:
-        json.loads(stripped)
-        return stripped
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Find the first '{' and its matching '}'
-    start = stripped.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    for i, ch in enumerate(stripped[start:], start=start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = stripped[start : i + 1]
-                try:
-                    json.loads(candidate)
-                    return candidate
-                except (json.JSONDecodeError, ValueError):
-                    continue
-    return None
-
-
 async def _filter_semantic_duplicates(
     candidates: list[_DisclosureCandidate],
     existing_entries: tuple[dict[str, Any], ...],
@@ -284,11 +244,11 @@ async def _filter_semantic_duplicates(
         label = _candidate_label(candidate)
         prompt = load_prompt("stage6_dedupe.md", {
             "candidate_title": candidate.title,
-            "candidate_location": _single_line(candidate.finding.get("location")),
-            "candidate_cwe": ", ".join(_display_list(candidate.finding.get("cwe_id") or candidate.finding.get("cwe"))),
-            "candidate_vuln_class": ", ".join(_display_list(candidate.finding.get("vulnerability_class"))),
-            "candidate_trigger": _single_line(candidate.finding.get("trigger")),
-            "candidate_summary": _single_line(candidate.finding.get("summary") or candidate.finding.get("description")),
+            "candidate_location": single_line(candidate.finding.get("location")),
+            "candidate_cwe": ", ".join(display_list(candidate.finding.get("cwe_id") or candidate.finding.get("cwe"))),
+            "candidate_vuln_class": ", ".join(display_list(candidate.finding.get("vulnerability_class"))),
+            "candidate_trigger": single_line(candidate.finding.get("trigger")),
+            "candidate_summary": single_line(candidate.finding.get("summary") or candidate.finding.get("description")),
             "existing_entries": existing_text,
         })
 
@@ -304,7 +264,7 @@ async def _filter_semantic_duplicates(
                 effort=_DEFAULT_DEDUPE_EFFORT,
                 log_file=log_file,
             )
-            json_text = _extract_json_object(result)
+            json_text = extract_json_object(result)
             if json_text is None:
                 raise json.JSONDecodeError("No JSON object found in response", result, 0)
             parsed = json.loads(json_text)
@@ -385,20 +345,53 @@ async def _run_disclosure(
         return None
 
     key = _task_key(vuln_id)
-    stage6_vuln_dir = os.path.join(config.output_dir, "stage6-disclosures", vuln_id)
-    disclosure_dir = os.path.join(stage6_vuln_dir, "disclosure")
-    disclosure_report = os.path.join(disclosure_dir, "report.md")
+    persistent_stage6_vuln_dir = os.path.join(
+        config.output_dir, "stage6-disclosures", vuln_id
+    )
+    persistent_disclosure_dir = os.path.join(
+        persistent_stage6_vuln_dir, "disclosure"
+    )
+    persistent_disclosure_report = os.path.join(
+        persistent_disclosure_dir, "report.md"
+    )
 
     if checkpoint.is_complete(key):
         logger.info("Stage 6: %s already complete, skipping.", vuln_id)
-        return disclosure_report if os.path.exists(disclosure_report) else None
+        return (
+            persistent_disclosure_report
+            if os.path.exists(persistent_disclosure_report)
+            else None
+        )
 
     logger.info("Stage 6: Starting disclosure preparation for %s.", vuln_id)
-    os.makedirs(disclosure_dir, exist_ok=True)
-
-    # Locate inputs
+    sandbox: DockerScratch | None = None
+    work_config = config
+    work_report_path = report_path
     poc_dir = str(Path(report_path).parent)
     finding_file = _find_finding_file(vuln_id, config.output_dir)
+    if config.sandbox_enabled:
+        identity = capture_repo_identity(config.target)
+        sandbox = DockerScratch(config, f"stage6-{vuln_id}")
+        try:
+            await sandbox.prepare(config.target, identity.get("commit") or "")
+            work_config = sandbox.audit_config(config)
+            copied_poc_dir = sandbox.copy_input_tree(poc_dir, "stage5-poc")
+            poc_dir = str(copied_poc_dir)
+            work_report_path = str(copied_poc_dir / "report.md")
+            if finding_file:
+                finding_file = str(
+                    sandbox.copy_input(finding_file, "finding.json")
+                )
+        except Exception:
+            await sandbox.close()
+            raise
+
+    stage6_vuln_dir = os.path.join(
+        work_config.output_dir, "stage6-disclosures", vuln_id
+    )
+    disclosure_dir = os.path.join(stage6_vuln_dir, "disclosure")
+    disclosure_report = os.path.join(disclosure_dir, "report.md")
+    os.makedirs(disclosure_dir, exist_ok=True)
 
     if finding_file:
         finding_reference = (
@@ -413,10 +406,10 @@ async def _run_disclosure(
             "Use the vulnerability report for all details."
         )
 
-    poc_target = config.poc_worktree or config.target
+    poc_target = work_config.poc_worktree or work_config.target
 
     prompt = load_prompt("stage6.md", {
-        "vuln_report_path": report_path,
+        "vuln_report_path": work_report_path,
         "poc_dir": poc_dir,
         "finding_reference": finding_reference,
         "target_path": poc_target,
@@ -426,18 +419,42 @@ async def _run_disclosure(
     })
 
     log_file = os.path.join(stage6_vuln_dir, "agent.log")
-    await run_agent(
-        prompt,
-        config,
-        cwd=poc_target,
-        max_turns=_MAX_TURNS,
-        model=select_poc_model(config),
-        effort=_DEFAULT_EFFORT,
-        log_file=log_file,
-    )
+    try:
+        await run_agent(
+            prompt,
+            work_config,
+            cwd=poc_target,
+            max_turns=_MAX_TURNS,
+            model=select_poc_model(config),
+            effort=_DEFAULT_EFFORT,
+            log_file=log_file,
+            sandbox=sandbox,
+        )
+        if sandbox is not None:
+            manifest = export_retained_artifacts(
+                disclosure_dir,
+                persistent_disclosure_dir,
+                required_paths=(
+                    "report.md",
+                    "email.txt",
+                    "disclosure.zip",
+                    "reproduce.sh",
+                ),
+                max_file_bytes=config.retain_max_file_bytes,
+                max_total_bytes=config.retain_max_total_bytes,
+            )
+            logger.info(
+                "Stage 6: Exported %d retained files (%d bytes) for %s.",
+                len(manifest.files),
+                manifest.total_bytes,
+                vuln_id,
+            )
+            disclosure_report = persistent_disclosure_report
+    finally:
+        if sandbox is not None:
+            await sandbox.close()
 
     checkpoint.mark_complete(key)
-
     has_report = os.path.exists(disclosure_report)
     logger.info("Stage 6: %s complete (report=%s)", vuln_id, has_report)
     return disclosure_report if has_report else None

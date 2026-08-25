@@ -10,7 +10,10 @@ from ..config import AuditConfig, select_poc_model
 from ..logger import get_logger
 from ..poc_artifacts import ASAN_REPORT_FILENAME, TRIGGER_GRAPH_FILENAME
 from ..prompts import load_prompt
+from ..repos import capture_repo_identity
 from ..reproduction_status import is_failed_status, read_reproduction_status
+from ..retention import export_retained_artifacts
+from ..sandbox import DockerScratch
 from ..utils import format_validation_issues, record_task_error, run_parallel_limited
 from ..validation.stage5 import validate_stage5_trigger_graph
 from ..wiki import build_wiki_context
@@ -88,25 +91,39 @@ async def _run_reproduce(
         return None
 
     key = _task_key(vuln_id)
-    poc_dir = os.path.join(config.output_dir, "stage5-pocs", vuln_id)
+    persistent_poc_dir = os.path.join(config.output_dir, "stage5-pocs", vuln_id)
 
     if checkpoint.is_complete(key):
         logger.info("Stage 5: %s already complete, skipping.", vuln_id)
-        resolved = _resolve_reproduction_report(poc_dir)
+        resolved = _resolve_reproduction_report(persistent_poc_dir)
         if _is_fp_report(resolved):
             logger.info("Stage 5: %s marked as false positive.", vuln_id)
             return None
         return resolved
 
     logger.info("Stage 5: Starting PoC reproduction for %s.", vuln_id)
+    sandbox: DockerScratch | None = None
+    work_config = config
+    work_vuln_file = vuln_file_path
+    if config.sandbox_enabled:
+        identity = capture_repo_identity(config.target)
+        sandbox = DockerScratch(config, f"stage5-{vuln_id}")
+        try:
+            await sandbox.prepare(config.target, identity.get("commit") or "")
+            work_config = sandbox.audit_config(config)
+            work_vuln_file = str(
+                sandbox.copy_input(vuln_file_path, "finding.json")
+            )
+        except Exception:
+            await sandbox.close()
+            raise
+
+    poc_target = work_config.poc_worktree or work_config.target
+    poc_dir = os.path.join(work_config.output_dir, "stage5-pocs", vuln_id)
     os.makedirs(poc_dir, exist_ok=True)
 
-    # PoC agents build and patch the project; run them inside the isolated
-    # worktree when available so the shared source tree stays clean.
-    poc_target = config.poc_worktree or config.target
-
     prompt = load_prompt("stage5.md", {
-        "finding_file_path": vuln_file_path,
+        "finding_file_path": work_vuln_file,
         "target_path": poc_target,
         "poc_dir": poc_dir,
         "finding_id": vuln_id,
@@ -114,61 +131,92 @@ async def _run_reproduce(
     })
 
     log_file = os.path.join(poc_dir, "agent.log")
-    await run_agent(
-        prompt,
-        config,
-        cwd=poc_target,
-        max_turns=_MAX_TURNS,
-        model=select_poc_model(config),
-        effort=_DEFAULT_EFFORT,
-        log_file=log_file,
-    )
+    resolved_report: str | None = None
+    reproduced = False
+    try:
+        await run_agent(
+            prompt,
+            work_config,
+            cwd=poc_target,
+            max_turns=_MAX_TURNS,
+            model=select_poc_model(config),
+            effort=_DEFAULT_EFFORT,
+            log_file=log_file,
+            sandbox=sandbox,
+        )
 
-    resolved_report = _resolve_reproduction_report(poc_dir)
-    if _is_fp_report(resolved_report):
-        checkpoint.mark_complete(key)
-        logger.info("Stage 5: %s marked as false positive.", vuln_id)
-        return None
-
-    reproduced = bool(
-        resolved_report
-        and read_reproduction_status(resolved_report) == "reproduced"
-    )
-    if reproduced and resolved_report is not None:
-        resolved_poc_dir = os.path.dirname(resolved_report)
-        issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
-        if issues:
-            graph_path = os.path.join(resolved_poc_dir, TRIGGER_GRAPH_FILENAME)
-            logger.warning(
-                "Stage 5: Trigger graph validation failed for %s\n%s",
-                vuln_id,
-                format_validation_issues(issues),
-            )
-            repair_prompt = (
-                f"The Stage 5 trigger graph at `{graph_path}` is missing or invalid. "
-                "Create or repair it using only the call path verified while running "
-                "the PoC. Do not invent stack frames, parameter values, sanitizer "
-                "output, or runtime evidence. Fix every issue below:\n\n"
-                f"```\n{format_validation_issues(issues)}\n```"
-            )
-            await run_agent(
-                repair_prompt,
-                config,
-                cwd=poc_target,
-                max_turns=15,
-                model=select_poc_model(config),
-                effort=_DEFAULT_EFFORT,
-                log_file=log_file,
-            )
+        resolved_report = _resolve_reproduction_report(poc_dir)
+        reproduced = bool(
+            resolved_report
+            and read_reproduction_status(resolved_report) == "reproduced"
+        )
+        if reproduced and resolved_report is not None:
+            resolved_poc_dir = os.path.dirname(resolved_report)
             issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
             if issues:
+                graph_path = os.path.join(resolved_poc_dir, TRIGGER_GRAPH_FILENAME)
                 logger.warning(
-                    "Stage 5: Trigger graph remains unavailable for %s\n%s",
+                    "Stage 5: Trigger graph validation failed for %s\n%s",
                     vuln_id,
                     format_validation_issues(issues),
                 )
+                repair_prompt = (
+                    f"The Stage 5 trigger graph at `{graph_path}` is missing or invalid. "
+                    "Create or repair it using only the call path verified while running "
+                    "the PoC. Do not invent stack frames, parameter values, sanitizer "
+                    "output, or runtime evidence. Fix every issue below:\n\n"
+                    f"```\n{format_validation_issues(issues)}\n```"
+                )
+                await run_agent(
+                    repair_prompt,
+                    work_config,
+                    cwd=poc_target,
+                    max_turns=15,
+                    model=select_poc_model(config),
+                    effort=_DEFAULT_EFFORT,
+                    log_file=log_file,
+                    sandbox=sandbox,
+                )
+                issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
+                if issues:
+                    logger.warning(
+                        "Stage 5: Trigger graph remains unavailable for %s\n%s",
+                        vuln_id,
+                        format_validation_issues(issues),
+                    )
+
+        if sandbox is not None:
+            if resolved_report is None:
+                raise RuntimeError(
+                    f"Stage 5 did not produce report.md for {vuln_id}"
+                )
+            retained_source = os.path.dirname(resolved_report)
+            persistent_destination = persistent_poc_dir
+            if os.path.basename(retained_source).endswith("_fp"):
+                persistent_destination += "_fp"
+            manifest = export_retained_artifacts(
+                retained_source,
+                persistent_destination,
+                required_paths=("report.md", "reproduce.sh"),
+                max_file_bytes=config.retain_max_file_bytes,
+                max_total_bytes=config.retain_max_total_bytes,
+            )
+            logger.info(
+                "Stage 5: Exported %d retained files (%d bytes) for %s.",
+                len(manifest.files),
+                manifest.total_bytes,
+                vuln_id,
+            )
+            resolved_report = os.path.join(persistent_destination, "report.md")
+
+    finally:
+        if sandbox is not None:
+            await sandbox.close()
 
     checkpoint.mark_complete(key)
+    if _is_fp_report(resolved_report):
+        logger.info("Stage 5: %s marked as false positive.", vuln_id)
+        return None
 
     has_report = resolved_report is not None
     has_graph = bool(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ from code_auditor.checkpoint import CheckpointManager
 from code_auditor.config import AuditConfig
 from code_auditor.disclosures import build_dedupe_key, extract_email_subject
 from code_auditor.stages import stage6
+from code_auditor.utils import extract_json_object
 
 
 def _finding(**overrides: object) -> dict[str, object]:
@@ -177,6 +180,106 @@ def test_stage6_handles_missing_stage4_with_report_fallback(
     assert len(result) == 1
 
 
+def test_run_disclosure_exports_only_retained_files_from_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, checkpoint, _target, output_dir = _stage6_config(tmp_path)
+    report = _write_stage5(output_dir, "H-07")
+    scratch_root = tmp_path / "fake-stage6-scratch"
+    instances: list[object] = []
+
+    class FakeScratch:
+        def __init__(self, owner: AuditConfig, _task_name: str) -> None:
+            self.owner = owner
+            self.source_dir = scratch_root / "source"
+            self.artifact_dir = scratch_root / "artifacts"
+            self.input_dir = scratch_root / "inputs"
+            self.closed = False
+            instances.append(self)
+
+        async def prepare(self, _target: str, _commit: str):  # type: ignore[no-untyped-def]
+            self.source_dir.mkdir(parents=True)
+            self.artifact_dir.mkdir(parents=True)
+            self.input_dir.mkdir(parents=True)
+            return self
+
+        def audit_config(self, owner: AuditConfig) -> AuditConfig:
+            return replace(
+                owner,
+                target=str(self.source_dir),
+                output_dir=str(self.artifact_dir),
+                poc_worktree=str(self.source_dir),
+            )
+
+        def copy_input_tree(self, source: str, name: str) -> Path:
+            destination = self.input_dir / name
+            shutil.copytree(source, destination)
+            return destination
+
+        def copy_input(self, source: str, name: str) -> Path:
+            destination = self.input_dir / name
+            shutil.copyfile(source, destination)
+            return destination
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def fake_run_agent(
+        _prompt: str,
+        work_config: AuditConfig,
+        **_kwargs: object,
+    ) -> str:
+        disclosure = (
+            Path(work_config.output_dir)
+            / "stage6-disclosures"
+            / "H-07"
+            / "disclosure"
+        )
+        disclosure.mkdir(parents=True, exist_ok=True)
+        reproduce = disclosure / "reproduce.sh"
+        reproduce.write_text("#!/bin/sh\nexec echo reproduced\n", encoding="utf-8")
+        reproduce.chmod(0o700)
+        (disclosure / "report.md").write_text("# Disclosure\n", encoding="utf-8")
+        (disclosure / "email.txt").write_text("Subject: H-07\n", encoding="utf-8")
+        (disclosure / "disclosure.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
+        (disclosure / "temporary-build.bin").write_bytes(b"disposable")
+        (disclosure / "retain-manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entrypoint": "reproduce.sh",
+                    "files": [
+                        {"path": "reproduce.sh", "role": "entrypoint"},
+                        {"path": "report.md", "role": "report"},
+                        {"path": "email.txt", "role": "disclosure"},
+                        {"path": "disclosure.zip", "role": "disclosure"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "done"
+
+    monkeypatch.setattr(stage6, "DockerScratch", FakeScratch)
+    monkeypatch.setattr(stage6, "run_agent", fake_run_agent)
+
+    result = asyncio.run(stage6._run_disclosure(str(report), config, checkpoint))
+
+    persistent = output_dir / "stage6-disclosures" / "H-07" / "disclosure"
+    assert result == str(persistent / "report.md")
+    assert sorted(path.name for path in persistent.iterdir()) == [
+        "disclosure.zip",
+        "email.txt",
+        "report.md",
+        "reproduce.sh",
+        "retain-manifest.json",
+    ]
+    assert not (persistent / "temporary-build.bin").exists()
+    assert instances and instances[0].closed is True  # type: ignore[attr-defined]
+    assert checkpoint.is_complete("stage6:H-07")
+
+
 def test_semantic_dedupe_uses_database_metadata(tmp_path: Path, monkeypatch) -> None:
     config, _checkpoint, _target, output_dir = _stage6_config(tmp_path)
     finding = _finding()
@@ -249,11 +352,11 @@ def test_extract_email_subject_handles_missing_or_absent_subject(tmp_path: Path)
     ],
 )
 def test_extract_json_object(text: str, decision: str) -> None:
-    result = stage6._extract_json_object(text)
+    result = extract_json_object(text)
 
     assert result is not None
     assert json.loads(result)["decision"] == decision
 
 
 def test_extract_json_object_rejects_invalid_text() -> None:
-    assert stage6._extract_json_object("no json here") is None
+    assert extract_json_object("no json here") is None

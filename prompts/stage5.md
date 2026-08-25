@@ -92,6 +92,10 @@ If any risk exists, note it in the report and proceed cautiously. Use resource l
 
 1. The PoC directory at `__POC_DIR__` has already been created for you. All artifacts go here.
 2. Build the project (and harness, if applicable). Place build outputs in `__POC_DIR__` when the build system supports it; otherwise build in-place. Never install to system directories (`/usr/bin`, `/usr/local/lib`, `/etc`).
+3. You are running inside a disposable Docker scratch workspace. Do not depend on
+   absolute scratch paths in the final artifacts. Build trees, downloaded toolchains,
+   caches, virtual environments, package directories, and generated binaries are
+   temporary and will be deleted after this task.
 
 ### Step 3: Develop and Run the PoC
 
@@ -162,6 +166,41 @@ Write `__POC_DIR__/report.md` containing:
 - **Reproduction Status**: One of: `reproduced`, `partially-reproduced`, `not-reproduced`, `false-positive`
 
 The report must be accurate. Every claim must be supported by evidence. Do not extrapolate or speculate beyond what the evidence shows.
+
+### Step 5.2: Create the Retained Reproduction Entry Point
+
+Create `__POC_DIR__/reproduce.sh` as the single portable entry point. It must:
+
+- start with a shell shebang and be executable;
+- check out or verify the audited source commit rather than referring to this scratch tree;
+- install or download dependencies into a temporary directory, pin versions, and
+  verify cryptographic hashes for downloaded inputs when practical;
+- generate large crafted inputs instead of retaining build trees, disk images, or
+  compiled binaries;
+- build the real target and run the PoC with exact, bounded commands;
+- avoid absolute CodeAuditor, `/tmp/code-auditor`, worktree, build, toolchain, and
+  home-directory paths.
+
+Then create `__POC_DIR__/retain-manifest.json` with this exact top-level shape:
+
+```json
+{
+  "schema_version": 1,
+  "entrypoint": "reproduce.sh",
+  "files": [
+    {"path": "reproduce.sh", "role": "entrypoint"},
+    {"path": "report.md", "role": "report"}
+  ]
+}
+```
+
+List only the small files required for independent reproduction and review. Allowed
+roles are `entrypoint`, `script`, `support`, `report`, `evidence`, and `disclosure`.
+Use normalized relative paths. Do not list the manifest itself. Do not retain build
+directories, caches, package installations, source checkouts, downloaded toolchains,
+generated binaries, core dumps, or large VM/disk images. Add `trigger-graph.json`,
+`asan-report.txt`, small harness sources, configurations, or crafted inputs only when
+they are genuinely required or authoritative evidence.
 
 ### Step 5.1: Record the Verified PoC Trigger Graph
 
@@ -242,3 +281,6 @@ mv __POC_DIR__ __POC_DIR___fp
 ```
 
 This signals to downstream stages that this finding did not reproduce successfully.
+Even for a failed reproduction, keep `reproduce.sh`, `report.md`, and a valid
+`retain-manifest.json` describing the bounded attempt; the disposable build tree will
+still be removed.

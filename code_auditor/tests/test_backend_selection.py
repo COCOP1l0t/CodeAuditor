@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
+import os
+import signal
 import sys
 import threading
 import types
+from collections.abc import AsyncIterator
 from enum import Enum
 from pathlib import Path
 
@@ -26,6 +30,7 @@ from code_auditor.config import (
     AuditConfig,
     select_poc_model,
 )
+from code_auditor.sandbox import DockerScratch
 from code_auditor.tui import TUIManager, TUIState, _TUILogHandler, _make_config_table, _visible_log_lines
 
 
@@ -91,6 +96,86 @@ def test_cli_accepts_tui_flag() -> None:
     args = _build_parser().parse_args(["--target", ".", "--tui"])
 
     assert args.tui is True
+
+
+def test_cli_accepts_retention_migration_dry_run_root() -> None:
+    args = _build_parser().parse_args(
+        ["--retention-migration-dry-run", "/tmp/results"]
+    )
+
+    assert args.retention_migration_dry_run == "/tmp/results"
+
+
+def test_cli_accepts_retention_manifest_apply_root() -> None:
+    args = _build_parser().parse_args(
+        ["--retention-manifest-apply", "/tmp/results"]
+    )
+
+    assert args.retention_manifest_apply == "/tmp/results"
+
+
+def test_cli_rejects_both_retention_migration_modes() -> None:
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            [
+                "--retention-migration-dry-run",
+                "/tmp/results",
+                "--retention-manifest-apply",
+                "/tmp/results",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag", "attribute"),
+    [
+        (
+            "--retention-entrypoint-repair-dry-run",
+            "retention_entrypoint_repair_dry_run",
+        ),
+        (
+            "--retention-entrypoint-repair-apply",
+            "retention_entrypoint_repair_apply",
+        ),
+        ("--reviewed-cleanup-dry-run", "reviewed_cleanup_dry_run"),
+        ("--reviewed-cleanup-apply", "reviewed_cleanup_apply"),
+    ],
+)
+def test_cli_accepts_reviewed_cleanup_modes(flag: str, attribute: str) -> None:
+    args = _build_parser().parse_args([flag, "/tmp/results"])
+
+    assert getattr(args, attribute) == "/tmp/results"
+
+
+def test_main_prints_retention_migration_without_starting_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    results = tmp_path / "results"
+    results.mkdir()
+
+    async def unexpected_audit(_config: AuditConfig) -> None:
+        raise AssertionError("dry-run migration must not start an audit")
+
+    monkeypatch.setattr(main_module, "run_audit", unexpected_audit)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "code-auditor",
+            "--retention-migration-dry-run",
+            str(results),
+            "--db",
+            str(tmp_path / "missing.db"),
+        ],
+    )
+
+    main_module.main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "dry-run"
+    assert payload["mutations"] == []
 
 
 @pytest.mark.parametrize("removed_flag", ["--enable-timeout", "--disable-stale-log-kill"])
@@ -509,6 +594,8 @@ def test_select_poc_model_prefers_global_model_override(
 ) -> None:
     # Isolate from the developer's real ~/.claude/settings.json.
     monkeypatch.setattr(config_module, "local_claude_model", lambda **_: None)
+    monkeypatch.setattr(config_module, "local_codex_model", lambda **_: None)
+    monkeypatch.setattr(config_module, "local_codex_model", lambda **_: None)
     config = AuditConfig(
         target="/tmp/project",
         output_dir="/tmp/output",
@@ -552,6 +639,26 @@ def test_local_claude_model_reads_env_keys(tmp_path) -> None:
     )
 
 
+def test_local_codex_model_reads_active_profile(tmp_path: Path) -> None:
+    settings = tmp_path / "config.toml"
+    settings.write_text(
+        'model = "top-level-model"\n'
+        'profile = "review"\n'
+        '[profiles.review]\n'
+        'model = "profile-model"\n',
+        encoding="utf-8",
+    )
+
+    assert config_module.local_codex_model(str(settings)) == "profile-model"
+
+
+def test_local_codex_model_ignores_invalid_toml(tmp_path: Path) -> None:
+    settings = tmp_path / "config.toml"
+    settings.write_text("model = [", encoding="utf-8")
+
+    assert config_module.local_codex_model(str(settings)) is None
+
+
 def test_local_claude_model_handles_missing_or_invalid_file(tmp_path) -> None:
     assert config_module.local_claude_model(str(tmp_path / "nope.json")) is None
     bad = tmp_path / "bad.json"
@@ -592,6 +699,205 @@ def test_run_agent_dispatches_to_codex_backend(monkeypatch: pytest.MonkeyPatch) 
         assert await agent.run_agent("prompt", config, cwd="/tmp/project") == "codex-result"
 
     asyncio.run(run_case())
+
+
+def test_run_agent_hot_switch_keeps_inflight_snapshot_and_switches_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        codex_started = asyncio.Event()
+        release_codex = asyncio.Event()
+        calls: list[tuple[str, str, str | None, str | None]] = []
+
+        async def fake_codex_agent(_prompt, invocation, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            calls.append(
+                (
+                    invocation.backend,
+                    invocation.provider_mode,
+                    invocation.provider_base_url,
+                    invocation.model,
+                )
+            )
+            codex_started.set()
+            await release_codex.wait()
+            # The owning config changes while this call is blocked, but the
+            # invocation must retain a coherent Codex provider snapshot.
+            assert invocation.backend == "codex"
+            assert invocation.provider_base_url == "https://codex.example.test/v1"
+            assert invocation.model == "codex-model"
+            return "codex-result"
+
+        async def fake_claude_agent(_prompt, invocation, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            calls.append(
+                (
+                    invocation.backend,
+                    invocation.provider_mode,
+                    invocation.provider_base_url,
+                    invocation.model,
+                )
+            )
+            return "claude-result"
+
+        monkeypatch.setattr(agent, "_run_codex_agent", fake_codex_agent)
+        monkeypatch.setattr(agent, "_run_claude_agent", fake_claude_agent)
+
+        owner = AuditConfig(
+            target="/tmp/project",
+            output_dir="/tmp/output",
+            backend="codex",
+            model="codex-model",
+            provider_mode="custom",
+            provider_base_url="https://codex.example.test/v1",
+            provider_api_key="codex-secret",
+        )
+        # Mirrors a Docker scratch config: filesystem paths are private while
+        # agent settings follow the owning Web job.
+        derived = AuditConfig(
+            target="/tmp/scratch/source",
+            output_dir="/tmp/scratch/output",
+            agent_settings_source=owner,
+        )
+
+        first = asyncio.create_task(
+            agent.run_agent("first", derived, cwd=derived.target)
+        )
+        await codex_started.wait()
+        owner.backend = "claude"
+        owner.model = "claude-model"
+        owner.provider_mode = "custom"
+        owner.provider_base_url = "https://claude.example.test/v1"
+        owner.provider_api_key = "claude-secret"
+        release_codex.set()
+
+        assert await first == "codex-result"
+        assert await agent.run_agent("second", derived, cwd=derived.target) == "claude-result"
+        owner.backend = "codex"
+        owner.model = "codex-model"
+        owner.provider_base_url = "https://codex.example.test/v1"
+        owner.provider_api_key = "codex-secret"
+        assert await agent.run_agent("third", derived, cwd=derived.target) == "codex-result"
+        assert calls == [
+            ("codex", "custom", "https://codex.example.test/v1", "codex-model"),
+            ("claude", "custom", "https://claude.example.test/v1", "claude-model"),
+            ("codex", "custom", "https://codex.example.test/v1", "codex-model"),
+        ]
+        assert owner.backends_used == []
+        assert derived.backends_used == ["codex", "claude"]
+        assert owner.models_used == []
+        assert derived.models_used == ["codex-model", "claude-model"]
+
+    asyncio.run(run_case())
+
+
+def test_sandbox_config_follows_owner_agent_settings(tmp_path: Path) -> None:
+    owner = AuditConfig(
+        target="/tmp/project",
+        output_dir="/tmp/output",
+        backend="codex",
+    )
+    scratch = object.__new__(DockerScratch)
+    scratch.source_dir = tmp_path / "source"
+    scratch.artifact_dir = tmp_path / "artifacts"
+
+    derived = scratch.audit_config(owner)
+
+    assert derived.target == str(scratch.source_dir)
+    assert derived.output_dir == str(scratch.artifact_dir)
+    assert derived.agent_settings_source is owner
+
+
+def test_sandbox_ensure_backend_rebuilds_metadata_and_rolls_back_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = object.__new__(DockerScratch)
+    scratch.backend = "codex"
+    rebuilt: list[str] = []
+
+    def fake_rebuild() -> None:
+        rebuilt.append(scratch.backend)
+
+    monkeypatch.setattr(scratch, "_write_spec_and_wrappers", fake_rebuild)
+    scratch.ensure_backend("claude")
+    assert scratch.backend == "claude"
+    assert rebuilt == ["claude"]
+
+    def fail_rebuild() -> None:
+        raise RuntimeError("missing backend runtime")
+
+    monkeypatch.setattr(scratch, "_write_spec_and_wrappers", fail_rebuild)
+    with pytest.raises(RuntimeError, match="missing backend runtime"):
+        scratch.ensure_backend("codex")
+    assert scratch.backend == "claude"
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="requires Linux procfs")
+def test_run_agent_cleans_detached_descendant_after_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_case() -> None:
+        child_pid: int | None = None
+        child_marker: str | None = None
+
+        async def fake_claude_agent(
+            *_args,
+            run_control=None,
+            **_kwargs,
+        ) -> str:  # type: ignore[no-untyped-def]
+            nonlocal child_pid, child_marker
+            assert run_control is not None
+            child_code = "import time; time.sleep(60)"
+            wrapper_code = (
+                "import subprocess, sys; "
+                "child = subprocess.Popen("
+                "[sys.executable, '-c', sys.argv[1]], "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL, start_new_session=True); "
+                "print(child.pid, flush=True)"
+            )
+            env = dict(os.environ)
+            env.update(run_control.subprocess_env())
+            wrapper = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                wrapper_code,
+                child_code,
+                stdout=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            output, _ = await wrapper.communicate()
+            assert wrapper.returncode == 0
+            child_pid = int(output)
+            child_marker = run_control.process_marker
+            assert agent._process_has_agent_marker(child_pid, child_marker)
+            return "complete"
+
+        monkeypatch.setattr(agent, "_run_claude_agent", fake_claude_agent)
+        config = AuditConfig(
+            target=str(tmp_path),
+            output_dir=str(tmp_path),
+            backend="claude",
+        )
+
+        try:
+            result = await agent.run_agent("prompt", config, cwd=str(tmp_path))
+            assert result == "complete"
+            assert child_pid is not None
+            assert child_marker is not None
+            assert not agent._process_has_agent_marker(child_pid, child_marker)
+            try:
+                state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
+            except FileNotFoundError:
+                pass
+            else:
+                assert state == "Z"
+        finally:
+            if (
+                child_pid is not None
+                and child_marker is not None
+                and agent._process_has_agent_marker(child_pid, child_marker)
+            ):
+                os.kill(child_pid, signal.SIGKILL)
 
 
 def test_run_agent_kills_backend_when_semantic_checker_says_finished(
@@ -643,6 +949,43 @@ def test_run_agent_kills_backend_when_semantic_checker_says_finished(
 
         assert process.killed is True
         assert result == "final analysis is already complete\n"
+
+    asyncio.run(run_case())
+
+
+def test_run_agent_runs_process_cleanup_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_case() -> None:
+        started = asyncio.Event()
+        cleaned_markers: list[str] = []
+
+        async def fake_claude_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def fake_cleanup(run_control) -> None:  # type: ignore[no-untyped-def]
+            cleaned_markers.append(run_control.process_marker)
+
+        monkeypatch.setattr(agent, "_run_claude_agent", fake_claude_agent)
+        monkeypatch.setattr(agent._AgentRunControl, "cleanup_processes", fake_cleanup)
+        config = AuditConfig(
+            target=str(tmp_path),
+            output_dir=str(tmp_path),
+            backend="claude",
+        )
+        task = asyncio.create_task(
+            agent.run_agent("prompt", config, cwd=str(tmp_path))
+        )
+        await started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(cleaned_markers) == 1
 
     asyncio.run(run_case())
 
@@ -732,10 +1075,12 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
                 codex_bin: str,
                 cwd: str,
                 config_overrides: tuple[str, ...] = (),
+                env: dict[str, str] | None = None,
             ) -> None:
                 captured["codex_bin"] = codex_bin
                 captured["cwd"] = cwd
                 captured["config_overrides"] = config_overrides
+                captured["env"] = env
 
         class FakeAppServerClient:
             pass
@@ -799,12 +1144,33 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
         monkeypatch.setitem(sys.modules, "openai_codex.types", fake_openai_codex_types)
         monkeypatch.setattr(agent, "_resolve_codex_bin", lambda: "/tmp/codex")
 
-        config = AuditConfig(target="/tmp/project", output_dir="/tmp/output", backend="codex")
+        config = AuditConfig(
+            target="/tmp/project",
+            output_dir="/tmp/output",
+            backend="codex",
+            model="custom-coder",
+            provider_mode="custom",
+            provider_base_url="https://provider.example.test/v1",
+            provider_api_key="secret-key",
+        )
 
         assert await agent._run_codex_agent("prompt", config, cwd="/tmp/project") == "codex-result"
-        assert captured["config_overrides"] == ()
+        overrides = captured["config_overrides"]
+        assert isinstance(overrides, tuple)
+        assert 'model_provider="codeauditor"' in overrides
+        assert (
+            'model_providers.codeauditor.base_url="https://provider.example.test/v1"'
+            in overrides
+        )
+        assert 'model_providers.codeauditor.wire_api="responses"' in overrides
+        assert "secret-key" not in "\n".join(overrides)
+        codex_env = captured["env"]
+        assert isinstance(codex_env, dict)
+        assert codex_env["CODEAUDITOR_PROVIDER_API_KEY"] == "secret-key"
+        assert agent.AGENT_PROCESS_MARKER_ENV in codex_env
+        assert captured["thread_start_kwargs"]["model"] == "custom-coder"
         assert captured["thread_start_approval_mode"] is FakeApprovalMode.deny_all
-        assert "service_tier" not in captured["thread_start_kwargs"]
+        assert captured["thread_start_kwargs"]["service_tier"] == "flex"
         assert captured["run_approval_mode"] is FakeApprovalMode.deny_all
         assert captured["run_sandbox_policy"] == {"type": "dangerFullAccess"}
         assert "service_tier" not in captured["run_kwargs"]
@@ -812,7 +1178,7 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
     asyncio.run(run_case())
 
 
-def test_codex_backend_uses_default_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codex_backend_requests_flex_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run_case() -> None:
         captured: dict[str, object] = {}
         fake_codex_app_server = types.ModuleType("codex_app_server")
@@ -842,10 +1208,12 @@ def test_codex_backend_uses_default_legacy_service_tier(monkeypatch: pytest.Monk
                 codex_bin: str,
                 cwd: str,
                 config_overrides: tuple[str, ...] = (),
+                env: dict[str, str] | None = None,
             ) -> None:
                 captured["codex_bin"] = codex_bin
                 captured["cwd"] = cwd
                 captured["config_overrides"] = config_overrides
+                captured["env"] = env
 
         class FakeAppServerClient:
             def _request_raw(self, _method: str, _params: dict[str, object] | None = None) -> dict[str, object]:
@@ -920,20 +1288,21 @@ def test_codex_backend_uses_default_legacy_service_tier(monkeypatch: pytest.Monk
         assert isinstance(prompt, FakeTextInput)
         assert prompt.text == "prompt"
         assert captured["config_overrides"] == ()
+        assert agent.AGENT_PROCESS_MARKER_ENV in captured["env"]
         assert captured["thread_start_approval_policy"] == "never"
-        assert "service_tier" not in captured["thread_start_kwargs"]
+        assert captured["thread_start_kwargs"]["service_tier"] == "flex"
         assert "service_tier" not in captured["run_kwargs"]
 
     asyncio.run(run_case())
 
 
-def test_codex_sdk_patch_normalizes_priority_service_tier_responses() -> None:
+def test_codex_sdk_patch_normalizes_unsupported_service_tier_responses() -> None:
     class FakeClient:
         def _request_raw(self, _method: str, _params: dict[str, object] | None = None) -> dict[str, object]:
             return {
                 "serviceTier": "priority",
                 "nested": {
-                    "service_tier": "priority",
+                    "service_tier": "default",
                     "unchanged": "priority",
                 },
             }
@@ -944,10 +1313,10 @@ def test_codex_sdk_patch_normalizes_priority_service_tier_responses() -> None:
     class FakeResponseModel:
         @classmethod
         def model_validate(cls, payload: dict[str, object]) -> dict[str, object]:
-            assert payload["serviceTier"] == "fast"
+            assert payload["serviceTier"] == "flex"
             nested = payload["nested"]
             assert isinstance(nested, dict)
-            assert nested["service_tier"] == "fast"
+            assert nested["service_tier"] == "flex"
             assert nested["unchanged"] == "priority"
             return payload
 
@@ -955,7 +1324,7 @@ def test_codex_sdk_patch_normalizes_priority_service_tier_responses() -> None:
 
     result = FakeClient().request("thread/start", None, response_model=FakeResponseModel)
 
-    assert result["serviceTier"] == "fast"
+    assert result["serviceTier"] == "flex"
 
 
 def test_claude_backend_keeps_claude_code_settings_sources(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -970,6 +1339,8 @@ def test_claude_backend_keeps_claude_code_settings_sources(monkeypatch: pytest.M
 
         async def fake_query(*, prompt: str, options: FakeClaudeCodeOptions):  # type: ignore[no-untyped-def]
             captured["extra_args"] = options.extra_args
+            captured["setting_sources"] = options.setting_sources
+            captured["env"] = options.env
             if False:
                 yield None
 
@@ -980,6 +1351,50 @@ def test_claude_backend_keeps_claude_code_settings_sources(monkeypatch: pytest.M
         await agent.run_agent("prompt", config, cwd="/tmp/project")
 
         assert "setting-sources" not in captured["extra_args"]
+        assert captured["setting_sources"] == ["user", "project", "local"]
+        assert agent.AGENT_PROCESS_MARKER_ENV in captured["env"]
+
+    asyncio.run(run_case())
+
+
+def test_claude_backend_injects_custom_provider_via_agent_sdk_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_case() -> None:
+        captured: dict[str, object] = {}
+
+        class FakeClaudeAgentOptions:
+            def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                captured.update(kwargs)
+
+        async def fake_query(*, prompt: str, options: FakeClaudeAgentOptions):  # type: ignore[no-untyped-def]
+            if False:
+                yield prompt, options
+
+        monkeypatch.setattr(
+            agent,
+            "_load_claude_sdk",
+            lambda: (FakeClaudeAgentOptions, fake_query),
+        )
+        config = AuditConfig(
+            target="/tmp/project",
+            output_dir="/tmp/output",
+            backend="claude",
+            model="claude-compatible-model",
+            provider_mode="custom",
+            provider_base_url="https://claude.example.test",
+            provider_api_key="secret-key",
+        )
+
+        await agent.run_agent("prompt", config, cwd="/tmp/project")
+
+        assert captured["model"] == "claude-compatible-model"
+        assert captured["setting_sources"] == []
+        claude_env = captured["env"]
+        assert isinstance(claude_env, dict)
+        assert claude_env["ANTHROPIC_BASE_URL"] == "https://claude.example.test"
+        assert claude_env["ANTHROPIC_AUTH_TOKEN"] == "secret-key"
+        assert agent.AGENT_PROCESS_MARKER_ENV in claude_env
 
     asyncio.run(run_case())
 

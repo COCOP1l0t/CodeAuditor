@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import tomllib
 from dataclasses import dataclass, field
-from datetime import date
 from typing import Any, Literal
 
 AgentBackend = Literal["claude", "codex"]
+ProviderMode = Literal["local", "custom"]
 
 DEFAULT_BACKEND: AgentBackend = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -14,6 +15,11 @@ DEFAULT_CLAUDE_POC_MODEL = "claude-opus-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 DEFAULT_CODEX_POC_MODEL = "gpt-5.5"
 DEFAULT_AGENT_TIMEOUT_SECONDS = 20 * 60
+DEFAULT_SANDBOX_IMAGE = "code-auditor-sandbox:latest"
+DEFAULT_SANDBOX_ROOT = "/tmp/code-auditor"
+DEFAULT_SANDBOX_MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
+DEFAULT_RETAIN_MAX_FILE_BYTES = 64 * 1024 * 1024
+DEFAULT_RETAIN_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
 # Default target analysis-unit count: -1 means "no ceiling — explore as many
 # analysis units as genuinely warrant deep analysis".
@@ -39,6 +45,14 @@ class AuditConfig:
     log_level: str = "INFO"
     backend: AgentBackend = DEFAULT_BACKEND
     model: str | None = None
+    provider_mode: ProviderMode = "local"
+    provider_base_url: str | None = None
+    provider_api_key: str | None = field(default=None, repr=False)
+    # Derived configs (for example, a Stage 5/6 Docker scratch) keep their own
+    # filesystem paths but resolve backend/provider settings from the owning
+    # Web job. ``run_agent`` snapshots these fields at invocation time so a
+    # settings change affects the next call without mutating an in-flight one.
+    agent_settings_source: "AuditConfig | None" = field(default=None, repr=False)
     target_au_count: int = UNLIMITED_AU_COUNT
     agent_timeout_seconds: int | None = DEFAULT_AGENT_TIMEOUT_SECONDS
     known_disclosures: tuple[dict[str, Any], ...] = field(
@@ -49,7 +63,32 @@ class AuditConfig:
     task_errors: list[str] = field(default_factory=list, repr=False)
     # Isolated worktree for Stage 5/6 PoC agents; set up by the orchestrator.
     poc_worktree: str | None = None
-    # Model ids actually used by agent invocations, in first-use order.
+    # Stage 5/6 run in a mandatory disposable Docker workspace by default.
+    # The only writable bind mount is a per-task directory below sandbox_root.
+    sandbox_enabled: bool = True
+    sandbox_root: str = field(
+        default_factory=lambda: os.environ.get(
+            "CODE_AUDITOR_SANDBOX_ROOT", DEFAULT_SANDBOX_ROOT
+        )
+    )
+    sandbox_image: str = field(
+        default_factory=lambda: os.environ.get(
+            "CODE_AUDITOR_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE
+        )
+    )
+    sandbox_docker_bin: str = field(
+        default_factory=lambda: os.environ.get("CODE_AUDITOR_DOCKER_BIN", "docker")
+    )
+    sandbox_network_enabled: bool = True
+    sandbox_memory: str = "16g"
+    sandbox_cpus: str = "8"
+    sandbox_pids_limit: int = 2048
+    sandbox_min_free_bytes: int = DEFAULT_SANDBOX_MIN_FREE_BYTES
+    retain_max_file_bytes: int = DEFAULT_RETAIN_MAX_FILE_BYTES
+    retain_max_total_bytes: int = DEFAULT_RETAIN_MAX_TOTAL_BYTES
+    # Agent backends and model ids actually used by invocations, in first-use
+    # order. Repeated switches/calls do not add duplicates.
+    backends_used: list[str] = field(default_factory=list, repr=False)
     models_used: list[str] = field(default_factory=list, repr=False)
     # Runtime-only accumulator of token/cost usage across agent invocations.
     # Keys: agent_calls, input_tokens, output_tokens,
@@ -92,21 +131,51 @@ def local_claude_model(
     return None
 
 
+def local_codex_model(config_path: str | None = None) -> str | None:
+    """Read the active model from the local Codex CLI configuration."""
+    path = config_path or os.path.join(
+        os.path.expanduser("~"), ".codex", "config.toml"
+    )
+    try:
+        with open(path, "rb") as stream:
+            data = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    profile_name = data.get("profile")
+    profiles = data.get("profiles")
+    if isinstance(profile_name, str) and isinstance(profiles, dict):
+        profile = profiles.get(profile_name)
+        if isinstance(profile, dict):
+            model = profile.get("model")
+            if isinstance(model, str) and model.strip():
+                return model.strip()
+    model = data.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return None
+
+
 def resolve_agent_model(config: AuditConfig, model: str | None = None) -> str:
     """Resolve the effective model id for one agent invocation.
 
-    Priority: explicit per-call model > local Claude config (claude backend)
-    > stored config value > built-in default.
+    Priority: explicit per-call model, then the selected provider's model or
+    local CLI configuration, then the built-in backend default.
     """
     if model:
         return model
-    if config.backend == "claude":
+    if config.backend == "claude" and config.provider_mode == "local":
         return local_claude_model() or config.model or DEFAULT_CLAUDE_MODEL
+    if config.backend == "codex" and config.provider_mode == "local":
+        return config.model or local_codex_model() or DEFAULT_CODEX_MODEL
+    if config.backend == "claude":
+        return config.model or DEFAULT_CLAUDE_MODEL
     return config.model or DEFAULT_CODEX_MODEL
 
 
 def select_poc_model(config: AuditConfig) -> str:
-    if config.backend == "claude":
+    if config.backend == "claude" and config.provider_mode == "local":
         return (
             local_claude_model(
                 keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL")
@@ -114,15 +183,13 @@ def select_poc_model(config: AuditConfig) -> str:
             or config.model
             or DEFAULT_CLAUDE_POC_MODEL
         )
+    if config.backend == "claude":
+        return config.model or DEFAULT_CLAUDE_POC_MODEL
     if config.model:
         return config.model
     if config.backend == "codex":
-        return DEFAULT_CODEX_POC_MODEL
+        return local_codex_model() or DEFAULT_CODEX_POC_MODEL
     raise ValueError(f"Unsupported agent backend: {config.backend}")
-
-
-def default_output_dir(target: str) -> str:
-    return os.path.join(target, f"audit-output-{date.today().strftime('%Y%m%d')}")
 
 
 def resolve_wiki_arg(path: str | None) -> str | None:
@@ -138,15 +205,6 @@ def resolve_wiki_arg(path: str | None) -> str | None:
     if not os.path.isdir(resolved):
         raise ValueError(f"Wiki path is not a directory: {resolved}")
     return resolved
-
-
-@dataclass
-class Module:
-    id: str
-    name: str
-    description: str
-    files_dir: str
-    analyze: bool = True
 
 
 @dataclass

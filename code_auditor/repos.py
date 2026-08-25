@@ -18,6 +18,7 @@ import urllib.parse
 from datetime import datetime
 
 from .logger import get_logger
+from .process_tree import current_audit_subprocess_env
 
 logger = get_logger("repos")
 
@@ -138,7 +139,7 @@ def repo_local_path(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
 
 
 def _clone_env() -> dict[str, str]:
-    env = dict(os.environ)
+    env = current_audit_subprocess_env()
     # Fail fast instead of prompting for credentials on private/missing repos.
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
@@ -208,6 +209,7 @@ def _git(target: str, *args: str, timeout: int = 15) -> str | None:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=current_audit_subprocess_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -272,11 +274,22 @@ def default_audit_output_dir(target: str, results_dir: str = DEFAULT_RESULTS_DIR
     and repeated audits of one commit merge into a single output tree.
     Non-git targets fall back to the current date.
     """
-    identity = capture_repo_identity(target)
-    project = identity["repo_name"] or os.path.basename(os.path.realpath(target))
+    # Output naming needs only the repository name and HEAD.  Calling
+    # ``capture_repo_identity`` here used to add a full dirty-worktree scan and
+    # recursive tree walk to the Web start request, even though neither value
+    # affects this path.  Keep the request path proportional to the two values
+    # it actually consumes.
+    top = _git(target, "rev-parse", "--show-toplevel")
+    commit = _git(target, "rev-parse", "HEAD") if top else ""
+    url = _git(target, "remote", "get-url", "origin") if top else ""
+    project = (
+        url.removesuffix(".git").rstrip("/").split("/")[-1].split(":")[-1]
+        if url
+        else os.path.basename(top or os.path.realpath(target))
+    )
     stamp = (
-        identity["commit"][:12]
-        if identity["commit"]
+        commit[:12]
+        if commit
         else datetime.now().strftime("%Y%m%d")
     )
     return os.path.join(
@@ -302,6 +315,7 @@ async def create_detached_worktree(repo: str, commit: str, destination: str) -> 
         commit,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=current_audit_subprocess_env(),
     )
     try:
         output, _ = await proc.communicate()

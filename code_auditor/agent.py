@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Protocol, TextIO
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Protocol, TextIO
 from uuid import uuid4
 
 from .config import AuditConfig, ValidationIssue, resolve_agent_model
 from .logger import get_logger
-from .utils import format_validation_issues, record_agent_usage
+from .process_tree import AUDIT_PROCESS_MARKER_ENV, CURRENT_AUDIT_PROCESS_MARKER
+from .utils import extract_json_object, format_validation_issues, record_agent_usage
+
+if TYPE_CHECKING:
+    from .sandbox import DockerScratch
 
 AGENT_MAX_RETRIES = 3
 AGENT_RETRY_BASE_DELAY = 10  # seconds
@@ -27,6 +33,10 @@ AGENT_NOISY_SYSTEM_EVENTS = {
     "thinking_tokens": "Reasoning in progress",
     "task_progress": "Task progress active",
 }
+AGENT_PROCESS_MARKER_ENV = "CODE_AUDITOR_AGENT_RUN_ID"
+AGENT_PROCESS_TERM_TIMEOUT_SECONDS = 1.0
+AGENT_PROCESS_KILL_TIMEOUT_SECONDS = 1.0
+PROC_ROOT = "/proc"
 
 logger = get_logger("agent")
 
@@ -50,6 +60,7 @@ class _KillableProcess(Protocol):
 
 
 _claude_sdk_patched = False
+_modern_claude_sdk_patched = False
 _CODEX_SERVICE_TIER_COMPAT_ATTR = "_code_auditor_service_tier_compat"
 _AGENT_PROCESS_REGISTRAR: ContextVar[Callable[[_KillableProcess | None], None] | None] = ContextVar(
     "agent_process_registrar",
@@ -61,6 +72,7 @@ _AGENT_PROCESS_REGISTRAR: ContextVar[Callable[[_KillableProcess | None], None] |
 class _AgentRunControl:
     processes: list[_KillableProcess] = field(default_factory=list)
     killed_after_status_check: bool = False
+    process_marker: str = field(default_factory=lambda: uuid4().hex)
 
     def register_process(self, process: _KillableProcess | None) -> None:
         if process is None or process in self.processes:
@@ -92,6 +104,116 @@ class _AgentRunControl:
             except Exception as exc:
                 logger.warning("Failed to kill stale agent process pid=%s: %s", pid, exc)
 
+    def subprocess_env(self) -> dict[str, str]:
+        """Environment inherited by the agent CLI and every command it starts."""
+        env = {AGENT_PROCESS_MARKER_ENV: self.process_marker}
+        audit_marker = CURRENT_AUDIT_PROCESS_MARKER.get()
+        if audit_marker:
+            env[AUDIT_PROCESS_MARKER_ENV] = audit_marker
+        return env
+
+    async def cleanup_processes(self) -> None:
+        """Stop agent descendants that detached from their original parent."""
+        pids = _marked_agent_process_ids(self.process_marker)
+        if not pids:
+            return
+
+        logger.warning(
+            "Cleaning up %d process(es) left by agent run %s: %s",
+            len(pids),
+            self.process_marker[:8],
+            ", ".join(str(pid) for pid in pids),
+        )
+        _signal_marked_agent_processes(self.process_marker, pids, signal.SIGTERM)
+        survivors = await _wait_for_marked_agent_processes(
+            self.process_marker,
+            AGENT_PROCESS_TERM_TIMEOUT_SECONDS,
+        )
+        if not survivors:
+            return
+
+        logger.warning(
+            "Agent process(es) ignored SIGTERM; sending SIGKILL: %s",
+            ", ".join(str(pid) for pid in survivors),
+        )
+        _signal_marked_agent_processes(
+            self.process_marker,
+            survivors,
+            signal.SIGKILL,
+        )
+        survivors = await _wait_for_marked_agent_processes(
+            self.process_marker,
+            AGENT_PROCESS_KILL_TIMEOUT_SECONDS,
+        )
+        if survivors:
+            logger.error(
+                "Agent process cleanup could not stop pid(s): %s",
+                ", ".join(str(pid) for pid in survivors),
+            )
+
+
+def _process_has_agent_marker(pid: int, process_marker: str) -> bool:
+    """Return whether a live process inherited this exact agent-run marker."""
+    if pid == os.getpid():
+        return False
+    expected = f"{AGENT_PROCESS_MARKER_ENV}={process_marker}".encode()
+    try:
+        with open(os.path.join(PROC_ROOT, str(pid), "environ"), "rb") as proc_env:
+            return expected in proc_env.read().split(b"\0")
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return False
+
+
+def _marked_agent_process_ids(process_marker: str) -> list[int]:
+    """Find same-user descendants even after they have been reparented."""
+    try:
+        entries = os.scandir(PROC_ROOT)
+    except OSError:
+        logger.warning(
+            "Cannot scan %s; detached agent process cleanup is unavailable.",
+            PROC_ROOT,
+        )
+        return []
+
+    with entries:
+        pids = [
+            int(entry.name)
+            for entry in entries
+            if entry.name.isdigit()
+            and _process_has_agent_marker(int(entry.name), process_marker)
+        ]
+    return sorted(pids)
+
+
+def _signal_marked_agent_processes(
+    process_marker: str,
+    pids: list[int],
+    sig: signal.Signals,
+) -> None:
+    for pid in pids:
+        # Recheck the marker immediately before signalling so a reused PID can
+        # never target an unrelated process.
+        if not _process_has_agent_marker(pid, process_marker):
+            continue
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except OSError as exc:
+            logger.warning("Failed to signal stale agent process pid=%s: %s", pid, exc)
+
+
+async def _wait_for_marked_agent_processes(
+    process_marker: str,
+    timeout_seconds: float,
+) -> list[int]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        survivors = _marked_agent_process_ids(process_marker)
+        if not survivors or asyncio.get_running_loop().time() >= deadline:
+            return survivors
+        await asyncio.sleep(0.05)
+
 
 def _register_current_agent_process(process: _KillableProcess | None) -> None:
     registrar = _AGENT_PROCESS_REGISTRAR.get()
@@ -116,41 +238,8 @@ def _read_agent_log(log_file: str, max_chars: int | None = None) -> str:
     return content
 
 
-def _extract_json_object(text: str) -> str | None:
-    stripped = text.strip()
-    if stripped.startswith("```json"):
-        stripped = stripped.removeprefix("```json").removesuffix("```").strip()
-    elif stripped.startswith("```"):
-        stripped = stripped.removeprefix("```").removesuffix("```").strip()
-
-    try:
-        json.loads(stripped)
-        return stripped
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    start = stripped.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    for index, ch in enumerate(stripped[start:], start=start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = stripped[start : index + 1]
-                try:
-                    json.loads(candidate)
-                    return candidate
-                except (json.JSONDecodeError, ValueError):
-                    continue
-    return None
-
-
 def _parse_agent_completion_decision(response: str) -> _AgentCompletionDecision:
-    json_text = _extract_json_object(response)
+    json_text = extract_json_object(response)
     if json_text is None:
         raise ValueError("status-checking subagent did not return a JSON object")
 
@@ -188,6 +277,7 @@ async def _check_agent_log_semantically(
     *,
     cwd: str,
     log_file: str,
+    sandbox: DockerScratch | None = None,
 ) -> _AgentCompletionDecision:
     log_excerpt = _read_agent_log(log_file, max_chars=STATUS_CHECK_LOG_MAX_CHARS)
     if not log_excerpt.strip():
@@ -204,6 +294,7 @@ async def _check_agent_log_semantically(
                 max_turns=10,
                 effort="low",
                 log_file=None,
+                sandbox=sandbox,
             ),
             timeout=STATUS_CHECK_AGENT_TIMEOUT_SECONDS,
         )
@@ -222,6 +313,7 @@ async def _await_agent_with_semantic_timeout(
     cwd: str,
     log_file: str | None,
     run_control: _AgentRunControl,
+    sandbox: DockerScratch | None = None,
 ) -> str:
     timeout_seconds = config.agent_timeout_seconds
     if not log_file or timeout_seconds is None:
@@ -240,7 +332,12 @@ async def _await_agent_with_semantic_timeout(
                 timeout_minutes,
                 log_file,
             )
-            decision = await _check_agent_log_semantically(config, cwd=cwd, log_file=log_file)
+            decision = await _check_agent_log_semantically(
+                config,
+                cwd=cwd,
+                log_file=log_file,
+                sandbox=sandbox,
+            )
 
             if agent_task.done():
                 return await agent_task
@@ -342,7 +439,24 @@ def _patch_claude_sdk(sdk_client, mp, process_error, transport):  # type: ignore
 
 
 def _load_claude_sdk():  # type: ignore[no-untyped-def]
-    global _claude_sdk_patched
+    global _claude_sdk_patched, _modern_claude_sdk_patched
+    try:
+        from claude_agent_sdk import ClaudeAgentOptions, query
+        from claude_agent_sdk._internal.transport import subprocess_cli as transport
+
+        if not _modern_claude_sdk_patched:
+            original_connect = transport.SubprocessCLITransport.connect
+
+            async def connect_and_register(self):  # type: ignore[no-untyped-def]
+                await original_connect(self)
+                _register_current_agent_process(getattr(self, "_process", None))
+
+            transport.SubprocessCLITransport.connect = connect_and_register
+            _modern_claude_sdk_patched = True
+        return ClaudeAgentOptions, query
+    except ImportError:
+        pass
+
     try:
         from claude_code_sdk import ClaudeCodeOptions, query
         from claude_code_sdk._errors import ProcessError
@@ -351,7 +465,7 @@ def _load_claude_sdk():  # type: ignore[no-untyped-def]
         from claude_code_sdk._internal.transport import subprocess_cli as transport
     except ImportError as exc:
         raise RuntimeError(
-            "Claude backend requires the claude-code-sdk package. "
+            "Claude backend requires the claude-agent-sdk package. "
             "Install project dependencies before using --backend claude."
         ) from exc
 
@@ -360,6 +474,28 @@ def _load_claude_sdk():  # type: ignore[no-untyped-def]
         _claude_sdk_patched = True
 
     return ClaudeCodeOptions, query
+
+
+def _accepts_keyword(callable_object: object, name: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_object).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _custom_provider_values(config: AuditConfig) -> tuple[str, str]:
+    base_url = (config.provider_base_url or "").strip()
+    api_key = config.provider_api_key or ""
+    if not base_url or not api_key:
+        raise RuntimeError(
+            f"Custom {config.backend} provider is missing its base URL or API key."
+        )
+    return base_url, api_key
 
 
 DEFAULT_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit", "Bash"]
@@ -416,11 +552,11 @@ def _tool_input_summary(tool_name: str, tool_input: object) -> str:
         "WebSearch": ("query",),
     }.get(tool_name, ("file_path", "path", "pattern", "query", "url"))
     fields = []
-    for field in preferred_fields:
-        value = tool_input.get(field)
+    for field_name in preferred_fields:
+        value = tool_input.get(field_name)
         if value in (None, "", [], {}):
             continue
-        fields.append(f"{field}={_compact_agent_activity(value, 300)}")
+        fields.append(f"{field_name}={_compact_agent_activity(value, 300)}")
     return "; ".join(fields)
 
 
@@ -545,8 +681,11 @@ def _normalize_codex_service_tier_response(value: Any) -> Any:
     if isinstance(value, dict):
         normalized: dict[Any, Any] = {}
         for key, item in value.items():
-            if key in ("serviceTier", "service_tier") and item == "priority":
-                normalized[key] = "fast"
+            if key in ("serviceTier", "service_tier") and item in (
+                "default",
+                "priority",
+            ):
+                normalized[key] = "flex"
             else:
                 normalized[key] = _normalize_codex_service_tier_response(item)
         return normalized
@@ -580,10 +719,12 @@ async def _run_claude_agent(
     effort: str | None = None,
     log_file: str | None = None,
     run_control: _AgentRunControl | None = None,
+    sandbox: DockerScratch | None = None,
 ) -> str:
     ClaudeCodeOptions, query = _load_claude_sdk()
     tools = allowed_tools or DEFAULT_TOOLS
     add_dirs = _additional_directories(config, cwd)
+    run_control = run_control or _AgentRunControl()
 
     extra_args: dict[str, str | None] = {
         # Keep Claude Code settings sources enabled so provider/auth
@@ -593,7 +734,7 @@ async def _run_claude_agent(
     if effort:
         extra_args["effort"] = effort
 
-    options = ClaudeCodeOptions(
+    option_values: dict[str, Any] = dict(
         allowed_tools=tools,
         permission_mode="bypassPermissions",
         max_turns=max_turns,
@@ -601,10 +742,29 @@ async def _run_claude_agent(
         cwd=cwd,
         add_dirs=add_dirs,
         extra_args=extra_args,
+        env=run_control.subprocess_env(),
     )
+    if sandbox is not None:
+        sandbox.ensure_backend("claude")
+        option_values["cli_path"] = sandbox.wrapper_path("claude")
+        option_values["env"].update(sandbox.wrapper_env(cwd))
+    if _accepts_keyword(ClaudeCodeOptions, "setting_sources"):
+        option_values["setting_sources"] = (
+            ["user", "project", "local"]
+            if config.provider_mode == "local"
+            else []
+        )
+    if config.provider_mode == "custom":
+        base_url, api_key = _custom_provider_values(config)
+        option_values["env"].update(
+            {
+                "ANTHROPIC_BASE_URL": base_url,
+                "ANTHROPIC_AUTH_TOKEN": api_key,
+            }
+        )
+    options = ClaudeCodeOptions(**option_values)
 
     log_fh = _open_agent_log(log_file)
-    run_control = run_control or _AgentRunControl()
 
     last_exc: Exception | None = None
     try:
@@ -804,6 +964,7 @@ async def _run_codex_agent(
     effort: str | None = None,
     log_file: str | None = None,
     run_control: _AgentRunControl | None = None,
+    sandbox: DockerScratch | None = None,
 ) -> str:
     codex_sdk = _load_codex_sdk()
     if codex_sdk.flavor == "codex_app_server" and codex_sdk.app_server_client_cls is not None:
@@ -815,8 +976,17 @@ async def _run_codex_agent(
         logger.debug("Codex backend runs one SDK turn per invocation; max_turns is not mapped directly.")
 
     selected_model = resolve_agent_model(config, model)
-    codex_bin = _resolve_codex_bin()
-    sandbox_policy = codex_sdk.sandbox_policy_cls.model_validate({"type": "dangerFullAccess"})
+    if sandbox is not None:
+        sandbox.ensure_backend("codex")
+    codex_bin = sandbox.wrapper_path("codex") if sandbox is not None else _resolve_codex_bin()
+    sandbox_policy = codex_sdk.sandbox_policy_cls.model_validate(
+        {
+            "type": "externalSandbox",
+            "networkAccess": "enabled" if sandbox is not None and sandbox.network_enabled else "restricted",
+        }
+        if sandbox is not None
+        else {"type": "dangerFullAccess"}
+    )
     codex_effort = codex_sdk.reasoning_effort_cls(effort) if effort else None
     if codex_sdk.flavor == "openai_codex":
         if codex_sdk.approval_mode_cls is None:
@@ -838,9 +1008,27 @@ async def _run_codex_agent(
                     log_fh.flush()
 
                 async def run_codex_turn() -> str:
-                    app_server_config = codex_sdk.app_server_config_cls(
+                    app_server_values: dict[str, Any] = dict(
                         codex_bin=codex_bin,
                         cwd=cwd,
+                        env=run_control.subprocess_env(),
+                    )
+                    if sandbox is not None:
+                        app_server_values["env"].update(sandbox.wrapper_env(cwd))
+                    if config.provider_mode == "custom":
+                        base_url, api_key = _custom_provider_values(config)
+                        app_server_values["config_overrides"] = (
+                            'model_provider="codeauditor"',
+                            'model_providers.codeauditor.name="CodeAuditor custom provider"',
+                            f"model_providers.codeauditor.base_url={json.dumps(base_url)}",
+                            'model_providers.codeauditor.env_key="CODEAUDITOR_PROVIDER_API_KEY"',
+                            'model_providers.codeauditor.wire_api="responses"',
+                        )
+                        app_server_values["env"][
+                            "CODEAUDITOR_PROVIDER_API_KEY"
+                        ] = api_key
+                    app_server_config = codex_sdk.app_server_config_cls(
+                        **app_server_values
                     )
                     async with codex_sdk.async_codex_cls(config=app_server_config) as codex:
                         codex_client = getattr(codex, "_client", None)
@@ -851,6 +1039,7 @@ async def _run_codex_agent(
                                 approval_mode=approval_setting,
                                 cwd=cwd,
                                 model=selected_model,
+                                service_tier="flex",
                             )
                             turn = await thread.turn(
                                 prompt,
@@ -865,6 +1054,7 @@ async def _run_codex_agent(
                                 approval_policy=approval_setting,
                                 cwd=cwd,
                                 model=selected_model,
+                                service_tier="flex",
                             )
                             turn_input = (
                                 codex_sdk.text_input_cls(prompt)
@@ -969,11 +1159,27 @@ async def run_agent(
     model: str | None = None,
     effort: str | None = None,
     log_file: str | None = None,
+    sandbox: DockerScratch | None = None,
 ) -> str:
-    if config.backend not in ("codex", "claude"):
-        raise ValueError(f"Unsupported agent backend: {config.backend}")
+    # Backend/provider settings are hot-swappable on the owning Web job.
+    # Freeze them for this invocation so an already-running Codex call cannot
+    # observe Claude provider fields (or vice versa) after a settings update.
+    source = config.agent_settings_source or config
+    invocation_config = replace(
+        config,
+        backend=source.backend,
+        model=source.model,
+        provider_mode=source.provider_mode,
+        provider_base_url=source.provider_base_url,
+        provider_api_key=source.provider_api_key,
+        agent_settings_source=None,
+    )
+    if invocation_config.backend not in ("codex", "claude"):
+        raise ValueError(f"Unsupported agent backend: {invocation_config.backend}")
 
-    selected_model = resolve_agent_model(config, model)
+    selected_model = resolve_agent_model(invocation_config, model)
+    if invocation_config.backend not in config.backends_used:
+        config.backends_used.append(invocation_config.backend)
     if selected_model not in config.models_used:
         config.models_used.append(selected_model)
     subagent_id = uuid4().hex[:8]
@@ -983,7 +1189,7 @@ async def run_agent(
 
     logger.debug(
         "Creating %s subagent subagent_id=%s cwd=%s model=%s log_file=%s",
-        config.backend,
+        invocation_config.backend,
         subagent_id,
         cwd,
         selected_model,
@@ -991,10 +1197,10 @@ async def run_agent(
     )
 
     try:
-        if config.backend == "codex":
+        if invocation_config.backend == "codex":
             agent_call = _run_codex_agent(
                 prompt,
-                config,
+                invocation_config,
                 cwd,
                 allowed_tools=allowed_tools,
                 max_turns=max_turns,
@@ -1002,11 +1208,12 @@ async def run_agent(
                 effort=effort,
                 log_file=log_file,
                 run_control=run_control,
+                sandbox=sandbox,
             )
         else:
             agent_call = _run_claude_agent(
                 prompt,
-                config,
+                invocation_config,
                 cwd,
                 allowed_tools=allowed_tools,
                 max_turns=max_turns,
@@ -1014,14 +1221,16 @@ async def run_agent(
                 effort=effort,
                 log_file=log_file,
                 run_control=run_control,
+                sandbox=sandbox,
             )
 
         result = await _await_agent_with_semantic_timeout(
             agent_call,
-            config=config,
+            config=invocation_config,
             cwd=cwd,
             log_file=log_file,
             run_control=run_control,
+            sandbox=sandbox,
         )
         status = "killed_after_status_check" if run_control.killed_after_status_check else "completed"
         return result
@@ -1029,6 +1238,10 @@ async def run_agent(
         status = "cancelled"
         raise
     finally:
+        try:
+            await run_control.cleanup_processes()
+        except Exception as exc:
+            logger.error("Agent process cleanup failed: %s", exc)
         logger.debug(
             "Destroyed %s subagent subagent_id=%s status=%s elapsed=%.2fs",
             config.backend,

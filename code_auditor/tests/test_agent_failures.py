@@ -68,7 +68,11 @@ def test_stage5_agent_failure_is_recorded_and_not_checkpointed(
         raise RuntimeError("API Error: no left credit")
 
     monkeypatch.setattr(stage5, "run_agent", boom)
-    config = AuditConfig(target=str(tmp_path), output_dir=str(out))
+    config = AuditConfig(
+        target=str(tmp_path),
+        output_dir=str(out),
+        sandbox_enabled=False,
+    )
     checkpoint = CheckpointManager(str(out), resume=True)
 
     reports = asyncio.run(stage5.run_stage5([str(vuln_file)], config, checkpoint))

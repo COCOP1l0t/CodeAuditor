@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+
 from code_auditor.config import AuditConfig
 from code_auditor.stages import stage0
 
@@ -37,3 +40,22 @@ async def test_fresh_setup_still_updates_git_checkout(tmp_path, monkeypatch) -> 
     await stage0.run_setup(AuditConfig(target=str(target), output_dir=str(output)))
 
     assert pulls == [str(target)]
+
+
+async def test_fresh_setup_git_pull_does_not_block_event_loop(
+    tmp_path, monkeypatch
+) -> None:
+    target = tmp_path / "repo"
+    output = tmp_path / "results" / "audit-output-new"
+    (target / ".git").mkdir(parents=True)
+    release = threading.Event()
+
+    def blocking_pull(_path: str) -> None:
+        assert release.wait(timeout=1), "event loop was blocked by git pull"
+
+    monkeypatch.setattr(stage0, "_git_pull", blocking_pull)
+    asyncio.get_running_loop().call_later(0.01, release.set)
+
+    await stage0.run_setup(AuditConfig(target=str(target), output_dir=str(output)))
+
+    assert release.is_set()

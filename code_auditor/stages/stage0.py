@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 
 from ..config import AuditConfig
 from ..logger import get_logger
+from ..process_tree import current_audit_subprocess_env
 
 logger = get_logger("stage0")
 
@@ -21,6 +23,7 @@ def _git_pull(target: str) -> None:
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=target, capture_output=True, text=True, check=True,
+        env=current_audit_subprocess_env(),
     )
     has_changes = bool(status.stdout.strip())
 
@@ -29,12 +32,14 @@ def _git_pull(target: str) -> None:
         subprocess.run(
             ["git", "stash", "--include-untracked"],
             cwd=target, capture_output=True, text=True, check=True,
+            env=current_audit_subprocess_env(),
         )
 
     try:
         result = subprocess.run(
             ["git", "pull"],
             cwd=target, capture_output=True, text=True, check=True,
+            env=current_audit_subprocess_env(),
         )
         logger.info("git pull: %s", result.stdout.strip() or "up to date")
     finally:
@@ -44,6 +49,7 @@ def _git_pull(target: str) -> None:
                 subprocess.run(
                     ["git", "stash", "pop"],
                     cwd=target, capture_output=True, text=True, check=True,
+                    env=current_audit_subprocess_env(),
                 )
             except subprocess.CalledProcessError as e:
                 logger.warning(
@@ -56,7 +62,12 @@ def _git_pull(target: str) -> None:
 
 async def run_setup(config: AuditConfig) -> None:
     if _is_git_repo(config.target) and config.update_repo:
-        _git_pull(config.target)
+        # ``git status`` and especially ``git pull`` can take seconds.  Stage 0
+        # is launched immediately after the Web start endpoint creates its
+        # background task, so running them on the event-loop thread delays the
+        # HTTP 202 response (and every other Web request).  Keep the blocking
+        # subprocess sequence intact, but move it to a worker thread.
+        await asyncio.to_thread(_git_pull, config.target)
     elif _is_git_repo(config.target):
         logger.info(
             "Resuming pinned source checkout; skipping git pull for %s.",

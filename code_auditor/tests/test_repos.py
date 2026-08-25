@@ -312,6 +312,31 @@ def test_default_audit_output_dir_non_git_falls_back_to_date(tmp_path) -> None:
     assert out == str(tmp_path / "results" / tmp_path.name / f"audit-output-{stamp}")
 
 
+def test_default_audit_output_dir_skips_full_worktree_identity(
+    tmp_path, monkeypatch
+) -> None:
+    from code_auditor import repos
+
+    target = str(tmp_path / "checkout")
+    calls = []
+
+    def fake_git(_target, *args):  # type: ignore[no-untyped-def]
+        calls.append(args)
+        return {
+            ("rev-parse", "--show-toplevel"): target,
+            ("rev-parse", "HEAD"): "a" * 40,
+            ("remote", "get-url", "origin"): "https://example.test/org/project.git",
+        }.get(args)
+
+    monkeypatch.setattr(repos, "_git", fake_git)
+
+    out = repos.default_audit_output_dir(target, str(tmp_path / "results"))
+
+    assert out == str(tmp_path / "results" / "project" / f"audit-output-{'a' * 12}")
+    assert ("status", "--porcelain") not in calls
+    assert ("ls-tree", "-r", "HEAD") not in calls
+
+
 # ── PoC worktree isolation ────────────────────────────────────────────────
 
 

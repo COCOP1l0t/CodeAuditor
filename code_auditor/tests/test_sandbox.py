@@ -11,6 +11,7 @@ from code_auditor.sandbox import (
     DOCKER_CWD_ENV,
     DOCKER_SPEC_ENV,
     DockerSandboxError,
+    _locate_codex_vendor,
     _require_tmp_root,
     docker_cli_command,
 )
@@ -27,6 +28,39 @@ def test_sandbox_root_must_be_a_dedicated_tmp_directory() -> None:
         _require_tmp_root("/tmp")
     with pytest.raises(DockerSandboxError, match="under /tmp"):
         _require_tmp_root("/var/tmp/code-auditor")
+
+
+def test_codex_vendor_follows_codex_selected_from_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "new-codex"
+    launcher = package_root / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    vendor = (
+        package_root
+        / "node_modules"
+        / "@openai"
+        / "codex-linux-x64"
+        / "vendor"
+        / "x86_64-unknown-linux-musl"
+    )
+    binary = vendor / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("binary", encoding="utf-8")
+    binary.chmod(0o755)
+    legacy_root = tmp_path / "old-codex"
+
+    from code_auditor import sandbox as sandbox_module
+
+    monkeypatch.delenv("CODE_AUDITOR_CODEX_BIN", raising=False)
+    monkeypatch.delenv("CODE_AUDITOR_CODEX_VENDOR", raising=False)
+    monkeypatch.setattr(sandbox_module.shutil, "which", lambda _name: str(launcher))
+    monkeypatch.setattr(sandbox_module, "_LEGACY_CODEX_PACKAGE_ROOT", legacy_root)
+
+    assert _locate_codex_vendor() == vendor.resolve()
 
 
 @pytest.mark.parametrize("tool", ["claude", "codex"])

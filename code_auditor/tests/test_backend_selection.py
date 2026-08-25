@@ -666,18 +666,62 @@ def test_local_claude_model_handles_missing_or_invalid_file(tmp_path) -> None:
     assert config_module.local_claude_model(str(bad)) is None
 
 
-def test_resolve_codex_bin_uses_default_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_resolve_codex_bin_prefers_path_over_legacy_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    old_codex_bin = tmp_path / "old-codex"
+    old_codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    old_codex_bin.chmod(0o755)
     codex_bin = tmp_path / "codex"
-    codex_bin.write_text("#!/bin/sh\n")
+    codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
     codex_bin.chmod(0o755)
-    monkeypatch.setattr(agent, "DEFAULT_CODEX_BIN", str(codex_bin))
+    monkeypatch.delenv(agent.CODEX_BIN_ENV, raising=False)
+    monkeypatch.setattr(agent, "DEFAULT_CODEX_BIN", str(old_codex_bin))
+    monkeypatch.setattr(agent.shutil, "which", lambda _name: str(codex_bin))
 
     assert agent._resolve_codex_bin() == str(codex_bin)
 
 
-def test_resolve_codex_bin_rejects_missing_default(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_resolve_codex_bin_honors_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    codex_bin = tmp_path / "custom-codex"
+    codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_bin.chmod(0o755)
+    monkeypatch.setenv(agent.CODEX_BIN_ENV, str(codex_bin))
+    monkeypatch.setattr(
+        agent.shutil,
+        "which",
+        lambda _name: (_ for _ in ()).throw(AssertionError("PATH must not be read")),
+    )
+
+    assert agent._resolve_codex_bin() == str(codex_bin)
+
+
+def test_resolve_codex_bin_falls_back_to_legacy_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    codex_bin = tmp_path / "codex"
+    codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_bin.chmod(0o755)
+    monkeypatch.delenv(agent.CODEX_BIN_ENV, raising=False)
+    monkeypatch.setattr(agent, "DEFAULT_CODEX_BIN", str(codex_bin))
+    monkeypatch.setattr(agent.shutil, "which", lambda _name: None)
+
+    assert agent._resolve_codex_bin() == str(codex_bin)
+
+
+def test_resolve_codex_bin_rejects_missing_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     missing = tmp_path / "missing-codex"
+    monkeypatch.delenv(agent.CODEX_BIN_ENV, raising=False)
     monkeypatch.setattr(agent, "DEFAULT_CODEX_BIN", str(missing))
+    monkeypatch.setattr(agent.shutil, "which", lambda _name: None)
 
     with pytest.raises(RuntimeError, match="Codex CLI binary not found"):
         agent._resolve_codex_bin()

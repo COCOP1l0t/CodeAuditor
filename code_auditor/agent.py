@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -27,6 +28,7 @@ AGENT_RETRY_BASE_DELAY = 10  # seconds
 STATUS_CHECK_AGENT_TIMEOUT_SECONDS = 5 * 60
 STATUS_CHECK_LOG_MAX_CHARS = 200_000
 DEFAULT_CODEX_BIN = "/usr/local/bin/codex"
+CODEX_BIN_ENV = "CODE_AUDITOR_CODEX_BIN"
 AGENT_ACTIVITY_MAX_CHARS = 800
 AGENT_SYSTEM_ACTIVITY_INTERVAL_SECONDS = 5.0
 AGENT_NOISY_SYSTEM_EVENTS = {
@@ -600,11 +602,14 @@ def _codex_item_activity(method: str, payload: object) -> str | None:
 
 
 def _resolve_codex_bin() -> str:
-    if not os.path.isfile(DEFAULT_CODEX_BIN):
-        raise RuntimeError(f"Codex CLI binary not found: {DEFAULT_CODEX_BIN}")
-    if not os.access(DEFAULT_CODEX_BIN, os.X_OK):
-        raise RuntimeError(f"Codex CLI binary is not executable: {DEFAULT_CODEX_BIN}")
-    return DEFAULT_CODEX_BIN
+    configured = os.environ.get(CODEX_BIN_ENV)
+    candidate = configured or shutil.which("codex") or DEFAULT_CODEX_BIN
+    source = CODEX_BIN_ENV if configured else "PATH/default"
+    if not os.path.isfile(candidate):
+        raise RuntimeError(f"Codex CLI binary not found via {source}: {candidate}")
+    if not os.access(candidate, os.X_OK):
+        raise RuntimeError(f"Codex CLI binary is not executable via {source}: {candidate}")
+    return candidate
 
 
 @dataclass(frozen=True)

@@ -46,6 +46,8 @@ _FORWARDED_ENV_NAMES = frozenset(
 
 logger = get_logger("sandbox")
 
+_LEGACY_CODEX_PACKAGE_ROOT = Path("/usr/local/lib/node_modules/@openai/codex")
+
 
 class DockerSandboxError(RuntimeError):
     """Raised when the mandatory Docker sandbox cannot be prepared."""
@@ -109,8 +111,20 @@ def _locate_codex_vendor() -> Path:
     if override:
         candidates = [Path(override).expanduser()]
     else:
-        candidates = list(
-            Path("/usr/local/lib/node_modules/@openai/codex").glob(
+        candidates: list[Path] = []
+        codex_bin = os.environ.get("CODE_AUDITOR_CODEX_BIN") or shutil.which("codex")
+        if codex_bin:
+            resolved_bin = Path(codex_bin).expanduser().resolve()
+            package_or_vendor_root = resolved_bin.parent.parent
+            if (package_or_vendor_root / "bin" / "codex").resolve() == resolved_bin:
+                candidates.append(package_or_vendor_root)
+            candidates.extend(
+                package_or_vendor_root.glob(
+                    "node_modules/@openai/codex-linux-*/vendor/*-unknown-linux-musl"
+                )
+            )
+        candidates.extend(
+            _LEGACY_CODEX_PACKAGE_ROOT.glob(
                 "node_modules/@openai/codex-linux-*/vendor/*-unknown-linux-musl"
             )
         )

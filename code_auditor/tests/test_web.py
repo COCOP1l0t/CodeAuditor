@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -11,8 +13,10 @@ import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from code_auditor import agent as agent_module
 from code_auditor.config import AuditConfig
-from code_auditor.db import RUN_CANCELLED, RUN_DONE, compute_target_key
+from code_auditor.db import RUN_CANCELLED, RUN_DONE, AuditStore, compute_target_key
+from code_auditor.process_tree import CURRENT_AUDIT_PROCESS_MARKER
 from code_auditor.web import create_app
 from code_auditor.web import job as job_module
 from code_auditor.web.job import (
@@ -195,6 +199,161 @@ async def test_start_conflict_while_running(tmp_path, monkeypatch) -> None:
     assert job.state == STATE_DONE
 
 
+async def test_start_preparation_does_not_block_event_loop(
+    tmp_path, monkeypatch
+) -> None:
+    release = threading.Event()
+
+    def blocking_seed(self, config):  # type: ignore[no-untyped-def]
+        assert release.wait(timeout=1), "event loop was blocked by run preparation"
+
+    async def fake_run_audit(config, tui=None):
+        return None
+
+    monkeypatch.setattr(AuditJob, "_seed_analysis_units", blocking_seed)
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    manager = AuditJobManager()
+    job = await manager.start(AuditStartParams(target=str(tmp_path)))
+    asyncio.get_running_loop().call_later(0.01, release.set)
+
+    await job.task
+
+    assert release.is_set()
+    assert job.state == STATE_DONE
+
+
+async def test_manager_hot_switches_active_run_config_params_and_history(
+    tmp_path, monkeypatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_run_audit(config, tui=None):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    target = tmp_path / "target"
+    target.mkdir()
+    store = AuditStore(str(tmp_path / "history.db"))
+    manager = AuditJobManager(store=store)
+    params = AuditStartParams(
+        target=str(target),
+        results_dir=str(tmp_path / "results"),
+        backend="codex",
+        model="old-model",
+        provider_mode="custom",
+        provider_base_url="https://old.example.test/v1",
+        provider_api_key="old-secret",
+    )
+    job = await manager.start(params)
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    switched = manager.hot_switch_agent_settings(
+        backend="claude",
+        model="new-model",
+        provider_mode="custom",
+        provider_base_url="https://new.example.test/v1",
+        provider_api_key="new-secret",
+    )
+
+    assert switched == [job.job_key]
+    assert job.status()["backend"] == "claude"
+    assert job.status()["model"] == "new-model"
+    assert job.status()["provider_mode"] == "custom"
+    assert job.config is not None
+    assert job.config.provider_base_url == "https://new.example.test/v1"
+    assert job.config.provider_api_key == "new-secret"
+    assert params.backend == "claude"
+    assert params.model == "new-model"
+    assert params.provider_base_url == "https://new.example.test/v1"
+    assert params.provider_api_key == "new-secret"
+    assert job.run_id is not None
+    history = store.get_run(job.run_id)
+    assert history is not None
+    assert history["backend"] == "claude"
+    assert history["model"] == "new-model"
+    assert any(
+        event.get("type") == "log" and "subsequent calls" in event.get("message", "")
+        for event in job.bus.backlog()
+    )
+    assert manager.hot_switch_agent_settings(
+        backend="claude",
+        model="new-model",
+        provider_mode="custom",
+        provider_base_url="https://new.example.test/v1",
+        provider_api_key="new-secret",
+    ) == []
+
+    release.set()
+    await job.task
+    assert job.state == STATE_DONE
+
+
+async def test_manager_hot_switch_appends_actual_backend_after_prior_and_persists(
+    tmp_path, monkeypatch
+) -> None:
+    codex_started = asyncio.Event()
+    release_codex = asyncio.Event()
+
+    async def fake_codex_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+        codex_started.set()
+        await release_codex.wait()
+        return "codex-result"
+
+    async def fake_claude_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+        return "claude-result"
+
+    async def fake_run_audit(config, tui=None):
+        assert (
+            await agent_module.run_agent("first", config, cwd=config.target)
+            == "codex-result"
+        )
+        assert (
+            await agent_module.run_agent("second", config, cwd=config.target)
+            == "claude-result"
+        )
+
+    monkeypatch.setattr(agent_module, "_run_codex_agent", fake_codex_agent)
+    monkeypatch.setattr(agent_module, "_run_claude_agent", fake_claude_agent)
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    target = tmp_path / "target"
+    target.mkdir()
+    store = AuditStore(str(tmp_path / "history.db"))
+    manager = AuditJobManager(store=store)
+    job = await manager.start(
+        AuditStartParams(
+            target=str(target),
+            results_dir=str(tmp_path / "results"),
+            backend="codex",
+            model="codex-model",
+            provider_mode="custom",
+            provider_base_url="https://codex.example.test/v1",
+            provider_api_key="codex-secret",
+        )
+    )
+    await asyncio.wait_for(codex_started.wait(), timeout=1)
+
+    assert manager.hot_switch_agent_settings(
+        backend="claude",
+        model="claude-model",
+        provider_mode="custom",
+        provider_base_url="https://claude.example.test/v1",
+        provider_api_key="claude-secret",
+    ) == [job.job_key]
+    assert job.status()["backends_used"] == ["codex"]
+    release_codex.set()
+    await job.task
+
+    assert job.state == STATE_DONE
+    assert job.status()["backends_used"] == ["codex", "claude"]
+    assert job.run_id is not None
+    history = store.get_run(job.run_id)
+    assert history is not None
+    assert json.loads(history["backends_used"]) == ["codex", "claude"]
+    assert json.loads(history["models_used"]) == ["codex-model", "claude-model"]
+
+
 async def test_concurrent_jobs_on_different_targets(tmp_path, monkeypatch) -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -243,6 +402,20 @@ async def test_concurrent_jobs_on_different_targets(tmp_path, monkeypatch) -> No
         e["job_key"] for e in manager.bus.backlog() if e["type"] == "job"
     }
     assert global_keys == {job_a.job_key, job_b.job_key}
+
+
+async def test_job_launch_sets_run_process_marker(tmp_path, monkeypatch) -> None:
+    observed_markers: list[str | None] = []
+
+    async def fake_run_audit(config, tui=None):
+        observed_markers.append(CURRENT_AUDIT_PROCESS_MARKER.get())
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    manager = AuditJobManager()
+    job = await manager.start(AuditStartParams(target=str(tmp_path)))
+    await job.task
+
+    assert observed_markers == [job.process_marker]
 
 
 async def test_concurrent_job_limit_is_enforced(tmp_path, monkeypatch) -> None:
@@ -362,6 +535,7 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         "branch": identity["branch"],
         "commit": identity["commit"],
         "target_key": compute_target_key(identity),
+        "backends_used": '["claude"]',
         "models_used": '["old-model"]',
         "usage_stats": '{"agent_calls": 5, "input_tokens": 900, "cost_usd": 0.5}',
         "duration_seconds": 75.0,
@@ -379,16 +553,37 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         def disclosure_dedupe_index(self):
             return []
 
-        def resume_cancelled_run(self, run_id, *, resumed_at=None):
-            self.resumed.append((run_id, resumed_at))
+        def resume_cancelled_run(
+            self, run_id, *, resumed_at=None, backend=None, model=None
+        ):
+            self.resumed.append((run_id, resumed_at, backend, model))
             run["status"] = "running"
             return True
 
         def seed_analysis_units(self, target_key, output_dir):
             return 0
 
-        def finish_run(self, run_id, status, error, ended_at, models_used=None, usage_stats=None):
-            self.finished.append((run_id, status, error, ended_at))
+        def finish_run(
+            self,
+            run_id,
+            status,
+            error,
+            ended_at,
+            backends_used=None,
+            models_used=None,
+            usage_stats=None,
+        ):
+            self.finished.append(
+                (
+                    run_id,
+                    status,
+                    error,
+                    ended_at,
+                    backends_used,
+                    models_used,
+                    usage_stats,
+                )
+            )
 
     audited = []
     checkouts = []
@@ -414,6 +609,11 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         repos_dir=str(tmp_path / "repo"),
         results_dir=str(tmp_path / "results"),
         wikis_dir=str(tmp_path / "wiki"),
+        backend="codex",
+        provider_mode="custom",
+        provider_base_url="https://codex.example.test/v1",
+        provider_api_key="secret-key",
+        model="fresh-codex-model",
     )
     assert job.state == STATE_RESTORING
     restoring_status = job.status()
@@ -433,7 +633,7 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
 
     assert len(store.resumed) == 1
     assert store.resumed[0][0] == 17
-    assert store.resumed[0][1] == job.started_at
+    assert store.resumed[0][1:] == (job.started_at, "codex", "fresh-codex-model")
     assert checkouts == [(str(target), "a" * 40, "main")]
     assert job.state == STATE_DONE
     assert job.status()["run_id"] == 17
@@ -445,8 +645,14 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     assert audited[0].output_dir == str(output)
     assert audited[0].resume is True
     assert audited[0].update_repo is False
+    assert audited[0].backend == "codex"
+    assert audited[0].provider_mode == "custom"
+    assert audited[0].provider_base_url == "https://codex.example.test/v1"
+    assert audited[0].provider_api_key == "secret-key"
+    assert audited[0].model == "fresh-codex-model"
     # Accounting from the original session is carried into the resumed run so
     # the finish update extends it instead of overwriting it.
+    assert audited[0].backends_used == ["claude"]
     assert audited[0].models_used == ["old-model"]
     assert audited[0].usage_stats == {
         "agent_calls": 5.0,
@@ -454,6 +660,7 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         "cost_usd": 0.5,
     }
     assert store.finished[0][0:3] == (17, STATE_DONE, "")
+    assert store.finished[0][4] == ["claude"]
 
 
 async def test_resume_cancelled_job_keeps_run_cancelled_when_checkout_fails(
@@ -491,7 +698,9 @@ async def test_resume_cancelled_job_keeps_run_cancelled_when_checkout_fails(
         def disclosure_dedupe_index(self):
             return []
 
-        def resume_cancelled_run(self, run_id, *, resumed_at=None):
+        def resume_cancelled_run(
+            self, run_id, *, resumed_at=None, backend=None, model=None
+        ):
             self.resumed.append(run_id)
             return True
 
@@ -565,7 +774,9 @@ async def test_resume_cancelled_job_auto_stashes_dirty_checkout(
         def disclosure_dedupe_index(self):
             return []
 
-        def resume_cancelled_run(self, run_id, *, resumed_at=None):
+        def resume_cancelled_run(
+            self, run_id, *, resumed_at=None, backend=None, model=None
+        ):
             run["status"] = "running"
             return True
 
@@ -970,6 +1181,122 @@ def test_api_config_returns_defaults(tmp_path) -> None:
     assert "default_models" not in body
 
 
+def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    client = TestClient(app)
+
+    initial = client.get("/api/settings")
+    assert initial.status_code == 200
+    assert initial.headers["cache-control"] == "no-store"
+    assert initial.json()["backend"] == "claude"
+    assert initial.json()["providers"]["codex"]["mode"] == "local"
+
+    saved = client.put(
+        "/api/settings",
+        json={
+            "backend": "codex",
+            "mode": "custom",
+            "base_url": "https://models.example.test/v1",
+            "api_key": "secret-key",
+            "model": "coder-model",
+        },
+    )
+
+    assert saved.status_code == 200
+    assert saved.headers["cache-control"] == "no-store"
+    body = saved.json()
+    assert body["backend"] == "codex"
+    assert body["providers"]["codex"]["api_key_configured"] is True
+    assert body["active_jobs_updated"] == 0
+    assert "secret-key" not in saved.text
+    stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    assert stored["providers"]["codex"]["api_key"] == "secret-key"
+
+    preserved = client.put(
+        "/api/settings",
+        json={
+            "backend": "codex",
+            "mode": "custom",
+            "base_url": "https://models.example.test/v1",
+            "model": "coder-model-v2",
+        },
+    )
+    assert preserved.status_code == 200
+    assert app.state.web_settings.codex_provider.api_key == "secret-key"
+
+
+def test_api_settings_hot_switches_active_jobs(tmp_path, monkeypatch) -> None:
+    app = _make_app(tmp_path)
+    captured = {}
+
+    def fake_hot_switch(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return ["7", "repro-abc123def456"]
+
+    monkeypatch.setattr(
+        app.state.manager, "hot_switch_agent_settings", fake_hot_switch
+    )
+    response = TestClient(app).put(
+        "/api/settings",
+        json={
+            "backend": "codex",
+            "mode": "custom",
+            "base_url": "https://codex.example.test/v1",
+            "api_key": "secret-key",
+            "model": "codex-model",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_jobs_updated"] == 2
+    assert captured == {
+        "backend": "codex",
+        "model": "codex-model",
+        "provider_mode": "custom",
+        "provider_base_url": "https://codex.example.test/v1",
+        "provider_api_key": "secret-key",
+    }
+
+
+def test_api_audit_snapshots_selected_provider_settings(tmp_path, monkeypatch) -> None:
+    repository = "github.com/user/repo"
+    _make_managed_repo(tmp_path, repository)
+    app = _make_app(tmp_path)
+    captured = {}
+
+    class FakeJob:
+        @staticmethod
+        def status() -> dict:
+            return {"state": "running", "job_key": "1"}
+
+    async def fake_start(params):
+        captured["params"] = params
+        return FakeJob()
+
+    monkeypatch.setattr(app.state.manager, "start", fake_start)
+    client = TestClient(app)
+    assert client.put(
+        "/api/settings",
+        json={
+            "backend": "claude",
+            "mode": "custom",
+            "base_url": "https://claude.example.test",
+            "api_key": "secret-key",
+            "model": "claude-compatible-model",
+        },
+    ).status_code == 200
+
+    response = client.post("/api/audit", json={"repository": repository})
+
+    assert response.status_code == 202
+    params = captured["params"]
+    assert params.backend == "claude"
+    assert params.provider_mode == "custom"
+    assert params.provider_base_url == "https://claude.example.test"
+    assert params.provider_api_key == "secret-key"
+    assert params.model == "claude-compatible-model"
+
+
 def test_api_index_serves_html(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
     res = client.get("/")
@@ -1007,13 +1334,24 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="btn-run-resume"' in res.text
     assert 'id="notification-center"' in res.text
     assert 'id="btn-full-agent-log"' in res.text
+    assert 'id="process-tree-panel"' in res.text
+    assert 'id="process-tree"' in res.text
+    assert 'id="process-command-panel"' in res.text
+    assert 'id="process-command"' in res.text
     assert 'id="results-agent-logs"' in res.text
+    assert 'id="btn-settings"' in res.text
+    assert 'id="settings-dialog"' in res.text
+    assert 'id="s-backend"' in res.text
+    assert 'id="s-mode"' in res.text
+    assert "Active jobs switch on their next agent call" in res.text
     assert res.text.count('class="table-shell"') == 3
     assert 'id="trash-table"' in res.text
     assert 'class="col-disclosure-title"' in res.text
     assert 'class="col-cve-local"' in res.text
     assert "⚡" not in res.text
     assert "⏳" not in res.text
+    html_ids = re.findall(r'\bid="([^"]+)"', res.text)
+    assert len(html_ids) == len(set(html_ids))
     for removed_id in (
         "f-target",
         "f-discovered",
@@ -1047,16 +1385,24 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "duration_known" in script.text
     assert "durationKnownByRun" in script.text
     assert 'return "N/A"' in script.text
+    assert 'btnStart.textContent = "Starting…"' in script.text
     assert "openCveDialog" in script.text
     assert "appendEvidenceActionButtons" in script.text
     assert "renderTriggerGraph" in script.text
     assert "openAsanReport" in script.text
     assert "pollDetailHeartbeat" in script.text
+    assert "pollAuditProcessTree" in script.text
+    assert "renderAuditProcessTree" in script.text
+    assert "/processes`" in script.text
     assert "resumeCancelledAudit" in script.text
     assert "BUSY_JOB_STATES" in script.text
     assert "busyJobForRun" in script.text
     assert "connectGlobalJobEvents" in script.text
     assert "connectDetailEvents" in script.text
+    assert "active_jobs_updated" in script.text
+    assert "backend_switched" in script.text
+    assert "backendsUsedDisplay" in script.text
+    assert "Backends used" in res.text
     assert "/api/jobs/events" in script.text
     assert "/resume`" in script.text
     assert "notifyStageCompleted" in script.text
@@ -1356,8 +1702,63 @@ def test_api_job_endpoints_404_for_unknown_run(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
     assert client.get("/api/audit/1/status").status_code == 404
     assert client.post("/api/audit/1/stop").status_code == 404
+    assert client.get("/api/audit/1/processes").status_code == 404
     assert client.get("/api/audit/1/events").status_code == 404
     assert client.get("/api/history/1/agent-log").status_code == 404
+
+
+def test_api_process_tree_is_available_only_while_running(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = _make_app(tmp_path)
+    manager = app.state.manager
+    job = AuditJob(manager, "audit")
+    job.job_key = "7"
+    job.run_id = 7
+    job.state = STATE_RUNNING
+
+    class RunningTask:
+        @staticmethod
+        def done() -> bool:
+            return False
+
+    job.task = RunningTask()
+    manager._jobs[job.job_key] = job
+    expected = {
+        "sampled_at": 123.0,
+        "total": 1,
+        "roots": [
+            {
+                "pid": 10,
+                "ppid": 1,
+                "name": "agent",
+                "state": "S",
+                "command": "agent --run",
+                "children": [],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        job_module,
+        "snapshot_process_tree",
+        lambda marker: expected if marker == job.process_marker else None,
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/audit/7/processes")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == expected
+
+    job.state = STATE_RESTORING
+    response = client.get("/api/audit/7/processes")
+    assert response.status_code == 409
+    assert "only while the audit is running" in response.json()["detail"]
+
+    job.state = STATE_DONE
+    assert client.get("/api/audit/7/processes").status_code == 409
 
 
 def test_api_serves_and_downloads_latest_agent_log(tmp_path) -> None:
@@ -1408,44 +1809,48 @@ def test_api_full_job_lifecycle_and_results(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(job_module, "local_claude_model", lambda *a, **kw: None)
 
     app = _make_app(tmp_path)
-    client = TestClient(app)
     _make_managed_repo(tmp_path)
     wiki = _make_managed_wiki(tmp_path)
 
-    res = client.post(
-        "/api/audit",
-        json={"repository": "github.com/user/repo", "wiki": "qemu-security"},
-    )
-    assert res.status_code == 202
-    run_id = res.json()["run_id"]
+    # Keep one ASGI portal alive while the background audit task runs, as a
+    # real Uvicorn worker does between requests.
+    with TestClient(app) as client:
+        res = client.post(
+            "/api/audit",
+            json={"repository": "github.com/user/repo", "wiki": "qemu-security"},
+        )
+        assert res.status_code == 202
+        run_id = res.json()["run_id"]
 
-    status = _wait_for_state(app, "done")
-    assert status["stages"][0]["status"] == "done"
+        status = _wait_for_state(app, "done")
+        assert status["stages"][0]["status"] == "done"
 
-    # Live job endpoints stay available for the finished job's retention
-    # window; results are served from the run-scoped history endpoints.
-    res = client.get(f"/api/audit/{run_id}/status")
-    assert res.status_code == 200
-    assert res.json()["state"] == "done"
+        # Live job endpoints stay available for the finished job's retention
+        # window; results are served from the run-scoped history endpoints.
+        res = client.get(f"/api/audit/{run_id}/status")
+        assert res.status_code == 200
+        assert res.json()["state"] == "done"
 
-    res = client.get(f"/api/history/{run_id}/results")
-    assert res.status_code == 200
-    assert "findings" not in res.json()
+        res = client.get(f"/api/history/{run_id}/results")
+        assert res.status_code == 200
+        assert "findings" not in res.json()
 
-    res = client.get(
-        f"/api/history/{run_id}/file",
-        params={"path": "stage3-findings/AU-1-F-1.json"},
-    )
-    assert res.status_code == 200
-    assert res.text == "{}"
+        res = client.get(
+            f"/api/history/{run_id}/file",
+            params={"path": "stage3-findings/AU-1-F-1.json"},
+        )
+        assert res.status_code == 200
+        assert res.text == "{}"
 
-    res = client.get(
-        f"/api/history/{run_id}/file", params={"path": "../../etc/passwd"}
-    )
-    assert res.status_code == 400
+        res = client.get(
+            f"/api/history/{run_id}/file", params={"path": "../../etc/passwd"}
+        )
+        assert res.status_code == 400
 
-    res = client.get(f"/api/history/{run_id}/file", params={"path": "nope.json"})
-    assert res.status_code == 404
+        res = client.get(
+            f"/api/history/{run_id}/file", params={"path": "nope.json"}
+        )
+        assert res.status_code == 404
 
     # The completed job was recorded in the history database.
     runs, total = app.state.store.list_runs()
@@ -1508,7 +1913,13 @@ def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> No
         "submodules": [],
     }
     run_id = app.state.store.create_run(
-        AuditConfig(target=target, output_dir=output),
+        AuditConfig(
+            target=target,
+            output_dir=output,
+            backend="codex",
+            model="old-codex-model",
+            backends_used=["codex"],
+        ),
         status=RUN_CANCELLED,
         started_at=100.0,
     )
@@ -1536,6 +1947,8 @@ def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> No
 
         detail = client.get(f"/api/history/{run_id}").json()
         assert detail["status"] == STATE_DONE
+        assert detail["backend"] == "claude"
+        assert json.loads(detail["backends_used"]) == ["codex"]
         assert detail["started_at"] == 100.0
         assert 0 <= detail["duration_seconds"] < 60
         assert detail["active_started_at"] is None
@@ -1546,6 +1959,7 @@ def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> No
     assert audited[0].output_dir == output
     assert audited[0].resume is True
     assert audited[0].update_repo is False
+    assert audited[0].backend == "claude"
 
 
 def test_api_resume_missing_history_run_returns_404(tmp_path) -> None:
@@ -1625,6 +2039,7 @@ async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch)
     job.job_key = "audit-test"
 
     async def fake_run_audit(cfg, tui=None):
+        cfg.backends_used.extend(["claude", "codex"])
         cfg.models_used.append("model-x")
         cfg.usage_stats.update({"agent_calls": 2, "input_tokens": 900, "cost_usd": 0.03})
         cfg.task_errors.append("stage5:H-03: Agent ended with an error result: API Error: 400")
@@ -1635,6 +2050,7 @@ async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch)
 
     assert job.state == STATE_FAILED
     assert "stage5:H-03" in job.error
+    assert job.status()["backends_used"] == ["claude", "codex"]
     assert job.status()["models_used"] == ["model-x"]
     assert job.status()["usage_stats"] == {
         "agent_calls": 2,
@@ -1985,17 +2401,17 @@ def test_api_start_with_git_url(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
 
     app = _make_app(tmp_path)
-    client = TestClient(app)
-    res = client.post(
-        "/api/audit", json={"git_url": "https://github.com/user/repo.git"}
-    )
-    assert res.status_code == 202
-    run_id = res.json()["run_id"]
-    _wait_for_state(app, "done")
-    job = app.state.manager.get_job(str(run_id))
-    assert job is not None
-    assert job.config is not None
-    assert job.config.target == str(cloned)
+    with TestClient(app) as client:
+        res = client.post(
+            "/api/audit", json={"git_url": "https://github.com/user/repo.git"}
+        )
+        assert res.status_code == 202
+        run_id = res.json()["run_id"]
+        _wait_for_state(app, "done")
+        job = app.state.manager.get_job(str(run_id))
+        assert job is not None
+        assert job.config is not None
+        assert job.config.target == str(cloned)
 
 
 # ── Repos & history target filter API ────────────────────────────────────────

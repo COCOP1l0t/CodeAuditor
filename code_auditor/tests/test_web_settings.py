@@ -10,6 +10,7 @@ from code_auditor.web.settings import (
     WebSettings,
     WebSettingsError,
     load_web_settings,
+    update_agent_settings,
 )
 
 
@@ -26,6 +27,8 @@ def test_load_web_settings_creates_secure_debug_defaults(tmp_path: Path) -> None
     assert settings.results_dir == str(state_dir / "results")
     assert settings.reproductions_dir == str(state_dir / "reproductions")
     assert settings.wikis_dir == str(state_dir / "wiki")
+    assert settings.claude_provider.mode == "local"
+    assert settings.codex_provider.mode == "local"
     assert os.stat(state_dir).st_mode & 0o777 == 0o700
     assert os.stat(config_path).st_mode & 0o777 == 0o600
 
@@ -100,3 +103,65 @@ def test_load_web_settings_renames_legacy_web_config(tmp_path: Path) -> None:
     assert settings_path.is_file()
     assert not legacy_path.exists()
     assert os.stat(settings_path).st_mode & 0o777 == 0o600
+
+
+def test_update_agent_settings_persists_custom_provider_without_public_key(
+    tmp_path: Path,
+) -> None:
+    settings = load_web_settings(str(tmp_path / "settings.json"))
+
+    updated = update_agent_settings(
+        settings,
+        backend="codex",
+        mode="custom",
+        base_url="https://models.example.test/v1",
+        model="secure-coder",
+        api_key="secret-token",
+    )
+
+    assert updated.backend == "codex"
+    assert updated.codex_provider.api_key == "secret-token"
+    assert updated.public_agent_settings()["providers"]["codex"] == {
+        "mode": "custom",
+        "base_url": "https://models.example.test/v1",
+        "model": "secure-coder",
+        "api_key_configured": True,
+    }
+    assert "secret-token" not in json.dumps(updated.public_agent_settings())
+    stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    assert stored["providers"]["codex"]["api_key"] == "secret-token"
+    assert os.stat(tmp_path / "settings.json").st_mode & 0o777 == 0o600
+
+    preserved = update_agent_settings(
+        updated,
+        backend="codex",
+        mode="custom",
+        base_url="https://models.example.test/v1",
+        model="secure-coder-v2",
+    )
+    assert preserved.codex_provider.api_key == "secret-token"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///tmp/provider",
+        "https://user:password@example.test/v1",
+        "https://example.test/v1#fragment",
+        "https://example.test/\nheader",
+    ],
+)
+def test_update_agent_settings_rejects_unsafe_provider_urls(
+    tmp_path: Path, base_url: str
+) -> None:
+    settings = load_web_settings(str(tmp_path / "settings.json"))
+
+    with pytest.raises(WebSettingsError):
+        update_agent_settings(
+            settings,
+            backend="claude",
+            mode="custom",
+            base_url=base_url,
+            model="model",
+            api_key="key",
+        )

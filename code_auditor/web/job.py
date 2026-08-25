@@ -17,19 +17,26 @@ import re
 import signal
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
 from ..checkpoint import CheckpointManager
 from ..config import (
     DEFAULT_AGENT_TIMEOUT_SECONDS,
+    AgentBackend,
     AuditConfig,
+    ProviderMode,
     local_claude_model,
     resolve_wiki_arg,
 )
 from ..db import RUN_CANCELLED, RUN_DONE, RUN_FAILED, AuditStore, compute_target_key
 from ..logger import get_logger
+from ..process_tree import (
+    CURRENT_AUDIT_PROCESS_MARKER,
+    current_audit_subprocess_env,
+    snapshot_process_tree,
+)
 from ..orchestrator import run_audit
 from ..repos import (
     DEFAULT_REPOS_DIR,
@@ -85,6 +92,9 @@ class AuditStartParams:
     max_parallel: int = 1
     backend: str = "claude"
     model: str | None = None
+    provider_mode: ProviderMode = "local"
+    provider_base_url: str | None = None
+    provider_api_key: str | None = field(default=None, repr=False)
     target_au_count: int = -1
     log_level: str = "DEBUG"
     repos_dir: str = DEFAULT_REPOS_DIR
@@ -97,6 +107,9 @@ class ReproductionStartParams:
     vuln_id: str
     backend: str = "claude"
     model: str | None = None
+    provider_mode: ProviderMode = "local"
+    provider_base_url: str | None = None
+    provider_api_key: str | None = field(default=None, repr=False)
     log_level: str = "DEBUG"
     output_dir: str | None = None
     reproductions_dir: str = DEFAULT_REPRODUCTIONS_DIR
@@ -149,6 +162,7 @@ def _local_branch_points_to(target: str, branch: str, commit: str) -> bool:
             capture_output=True,
             text=True,
             check=False,
+            env=current_audit_subprocess_env(),
         )
     except OSError:
         return False
@@ -179,6 +193,7 @@ async def _run_resume_git_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            env=current_audit_subprocess_env(),
         )
     except OSError as exc:
         raise JobValidationError(
@@ -260,6 +275,7 @@ class AuditJob:
         self.state: str = STATE_IDLE
         self.error: str = ""
         self.config: AuditConfig | None = None
+        self.start_params: AuditStartParams | ReproductionStartParams | None = None
         self.reporter: WebProgressReporter = WebProgressReporter(self.bus)
         self.started_at: float = time.time()
         self.active_started_at: float = self.started_at
@@ -269,6 +285,7 @@ class AuditJob:
         self.task: asyncio.Task | None = None
         self.job_key: str = ""
         self.run_id: int | None = None
+        self.process_marker: str = uuid4().hex
         # Realpath of the shared source checkout; used for same-repo mutual
         # exclusion across concurrent jobs.
         self.target_path: str = ""
@@ -286,6 +303,11 @@ class AuditJob:
             "status": self.state,
             "error": self.error,
             "run_id": self.run_id,
+            "backend": self.config.backend if self.config else "",
+            "model": self.config.model if self.config else None,
+            "provider_mode": self.config.provider_mode if self.config else "",
+            "backends_used": list(self.config.backends_used) if self.config else [],
+            "models_used": list(self.config.models_used) if self.config else [],
             "started_at": self.started_at,
             "duration_seconds": self.duration_seconds,
             "active_started_at": self.active_started_at,
@@ -379,6 +401,10 @@ class AuditJob:
             "active_started_at": self.active_started_at,
             "duration_known": self.duration_known,
             "run_id": self.run_id,
+            "backend": self.config.backend if self.config else "",
+            "model": self.config.model if self.config else None,
+            "provider_mode": self.config.provider_mode if self.config else "",
+            "backends_used": list(self.config.backends_used) if self.config else [],
             "models_used": list(self.config.models_used) if self.config else [],
             "usage_stats": dict(self.config.usage_stats) if self.config else {},
             "stages": self.reporter.snapshot(),
@@ -386,7 +412,105 @@ class AuditJob:
             "reproduction_reports": self.reproduction_reports,
         }
 
+    def process_tree(self) -> dict:
+        """Snapshot processes owned by this Audit Run while it is running."""
+        self.reconcile()
+        if self.kind != JOB_AUDIT or self.state != STATE_RUNNING:
+            raise JobConflictError(
+                "The process tree is available only while the audit is running."
+            )
+        return snapshot_process_tree(self.process_marker)
+
     # ── config / run-row helpers ────────────────────────────────────────────
+
+    def hot_switch_agent_settings(
+        self,
+        *,
+        backend: AgentBackend,
+        model: str | None,
+        provider_mode: ProviderMode,
+        provider_base_url: str | None,
+        provider_api_key: str | None,
+    ) -> bool:
+        """Apply settings to future agent calls without interrupting in-flight calls."""
+        self.reconcile()
+        if self.state not in BUSY_STATES:
+            return False
+
+        effective_model = (
+            local_claude_model() or model
+            if backend == "claude" and provider_mode == "local"
+            else model
+        )
+        targets = [
+            target
+            for target in (self.config, self.start_params)
+            if target is not None
+        ]
+        incoming = (
+            backend,
+            effective_model,
+            provider_mode,
+            provider_base_url,
+            provider_api_key,
+        )
+        if targets and all(
+            (
+                target.backend,
+                target.model,
+                target.provider_mode,
+                target.provider_base_url,
+                target.provider_api_key,
+            )
+            == incoming
+            for target in targets
+        ):
+            return False
+        previous_backend = (
+            self.config.backend
+            if self.config is not None
+            else self.start_params.backend if self.start_params is not None else ""
+        )
+        if self.config is not None:
+            self.config.backend = backend
+            self.config.model = effective_model
+            self.config.provider_mode = provider_mode
+            self.config.provider_base_url = provider_base_url
+            self.config.provider_api_key = provider_api_key
+        if self.start_params is not None:
+            self.start_params.backend = backend
+            self.start_params.model = effective_model
+            self.start_params.provider_mode = provider_mode
+            self.start_params.provider_base_url = provider_base_url
+            self.start_params.provider_api_key = provider_api_key
+
+        if self.store is not None and self.kind == JOB_AUDIT and self.run_id is not None:
+            try:
+                updated = self.store.update_running_run_agent_settings(
+                    self.run_id, backend=backend, model=effective_model
+                )
+                if self.state == STATE_RUNNING and not updated:
+                    logger.warning(
+                        "Run #%d switched backend in memory but its active history row "
+                        "was not updated.",
+                        self.run_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to update Run #%d backend history after hot switch: %s",
+                    self.run_id,
+                    exc,
+                )
+
+        message = (
+            f"LLM backend switched from {previous_backend or 'uninitialized'} to {backend}. "
+            "In-flight agent calls keep their invocation snapshot; subsequent calls use "
+            "the new backend."
+        )
+        logger.info(message)
+        self.bus.publish({"type": "log", "message": message})
+        self.publish_job_event(backend_switched=True)
+        return True
 
     def _build_config(
         self, params: AuditStartParams, target: str, wiki_path: str | None
@@ -406,6 +530,9 @@ class AuditJob:
             log_level=params.log_level,
             backend=params.backend,  # type: ignore[arg-type]
             model=self._resolve_model(params),
+            provider_mode=params.provider_mode,
+            provider_base_url=params.provider_base_url,
+            provider_api_key=params.provider_api_key,
             target_au_count=params.target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             known_disclosures=tuple(
@@ -434,6 +561,9 @@ class AuditJob:
             log_level=params.log_level,
             backend=params.backend,  # type: ignore[arg-type]
             model=self._resolve_model(params),
+            provider_mode=params.provider_mode,
+            provider_base_url=params.provider_base_url,
+            provider_api_key=params.provider_api_key,
             target_au_count=params.target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             known_disclosures=tuple(
@@ -449,7 +579,7 @@ class AuditJob:
         ``~/.claude/settings.json`` so the stored ``run.model`` reflects the
         model agents will actually use, not the web settings fallback.
         """
-        if params.backend == "claude":
+        if params.backend == "claude" and params.provider_mode == "local":
             return local_claude_model() or params.model
         return params.model
 
@@ -500,7 +630,11 @@ class AuditJob:
                         self.run_id, config.output_dir
                     )
             assert config is not None
-            self._seed_analysis_units(config)
+            # Repository identity collection invokes several synchronous Git
+            # commands.  This task is scheduled before the start endpoint has
+            # necessarily flushed its 202 response, so never run that work on
+            # the event loop.
+            await asyncio.to_thread(self._seed_analysis_units, config)
             logger.info("Starting audit of %s (web UI)", config.target)
             await run_audit(config, tui=self.reporter)
             self.error = summarize_task_errors(config.task_errors)
@@ -525,6 +659,7 @@ class AuditJob:
                         self.state,
                         self.error,
                         self.ended_at,
+                        backends_used=list(config.backends_used) if config else None,
                         models_used=list(config.models_used) if config else None,
                         usage_stats=dict(config.usage_stats) if config else None,
                     )
@@ -581,7 +716,10 @@ class AuditJob:
                     "The source or submodule identity no longer matches the cancelled run."
                 )
             if not self.store.resume_cancelled_run(
-                run_id, resumed_at=self.active_started_at
+                run_id,
+                resumed_at=self.active_started_at,
+                backend=config.backend,
+                model=config.model,
             ):
                 raise JobConflictError(
                     "The run is no longer resumable; refresh History and try again."
@@ -646,6 +784,9 @@ class AuditJob:
                 log_level=params.log_level,
                 backend=params.backend,  # type: ignore[arg-type]
                 model=params.model,
+                provider_mode=params.provider_mode,
+                provider_base_url=params.provider_base_url,
+                provider_api_key=params.provider_api_key,
                 agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             )
             self.reporter.begin_stage(
@@ -784,11 +925,13 @@ class AuditJobManager:
     @staticmethod
     def _launch(job: AuditJob, coroutine) -> None:
         """Start the job task with the log-routing context variable set."""
-        token = CURRENT_JOB_KEY.set(job.job_key)
+        job_token = CURRENT_JOB_KEY.set(job.job_key)
+        process_token = CURRENT_AUDIT_PROCESS_MARKER.set(job.process_marker)
         try:
             job.task = asyncio.create_task(coroutine)
         finally:
-            CURRENT_JOB_KEY.reset(token)
+            CURRENT_AUDIT_PROCESS_MARKER.reset(process_token)
+            CURRENT_JOB_KEY.reset(job_token)
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -850,6 +993,7 @@ class AuditJobManager:
         self._check_start_allowed(target_path)
         job.target_path = target_path
         job.config = config
+        job.start_params = params
         job.state = STATE_RUNNING
         job._create_run_row(config)
         job.job_key = (
@@ -869,6 +1013,11 @@ class AuditJobManager:
         repos_dir: str = DEFAULT_REPOS_DIR,
         results_dir: str = DEFAULT_RESULTS_DIR,
         wikis_dir: str = DEFAULT_WIKIS_DIR,
+        backend: AgentBackend | None = None,
+        provider_mode: ProviderMode = "local",
+        provider_base_url: str | None = None,
+        provider_api_key: str | None = None,
+        model: str | None = None,
     ) -> AuditJob:
         """Start restoring a cancelled audit in its original output directory."""
         self._prune_finished_jobs()
@@ -891,6 +1040,18 @@ class AuditJobManager:
                 "This run was recorded from a dirty checkout and cannot be safely continued."
             )
 
+        recorded_backend = str(run.get("backend") or "")
+        selected_backend = backend or recorded_backend
+        if selected_backend not in {"claude", "codex"}:
+            raise JobValidationError(
+                f"Unsupported selected backend: {selected_backend or 'empty'}"
+            )
+        selected_model = (
+            local_claude_model() or model
+            if selected_backend == "claude" and provider_mode == "local"
+            else model
+        )
+
         target = os.path.realpath(run.get("target") or "")
         output_dir = os.path.realpath(run.get("output_dir") or "")
         if not _path_is_within(target, repos_dir):
@@ -907,9 +1068,6 @@ class AuditJobManager:
             repos_root = os.path.realpath(os.path.expanduser(repos_dir))
             rel = os.path.relpath(target, repos_root)
             git_url = "https://" + rel.replace(os.sep, "/")
-            backend = str(run.get("backend") or "")
-            if backend not in {"claude", "codex"}:
-                raise JobValidationError(f"Unsupported recorded backend: {backend or 'empty'}")
             max_parallel = run.get("max_parallel")
             target_au_count = run.get("target_au_count")
             if not isinstance(max_parallel, int) or not 1 <= max_parallel <= 16:
@@ -924,8 +1082,11 @@ class AuditJobManager:
                 repos_dir=repos_dir,
                 results_dir=results_dir,
                 max_parallel=max_parallel,
-                backend=backend,
-                model=None,
+                backend=selected_backend,
+                model=selected_model,
+                provider_mode=provider_mode,
+                provider_base_url=provider_base_url,
+                provider_api_key=provider_api_key,
                 target_au_count=target_au_count,
                 log_level=str(run.get("log_level") or "INFO"),
                 wiki=wiki_path,
@@ -936,13 +1097,17 @@ class AuditJobManager:
             job.duration_seconds = max(float(run.get("duration_seconds") or 0), 0.0)
             job.duration_known = bool(run.get("duration_known", True))
             if not self.store.resume_cancelled_run(
-                run_id, resumed_at=job.active_started_at
+                run_id,
+                resumed_at=job.active_started_at,
+                backend=config.backend,
+                model=config.model,
             ):
                 raise JobConflictError(
                     "The run is no longer resumable; refresh History and try again."
                 )
             job.target_path = target
             job.config = config
+            job.start_params = clone_params
             job.state = STATE_RUNNING
             job.run_id = run_id
             job.job_key = str(run_id)
@@ -967,9 +1132,6 @@ class AuditJobManager:
                 "The cancelled run has no pinned source identity and cannot be safely continued."
             )
 
-        backend = str(run.get("backend") or "")
-        if backend not in {"claude", "codex"}:
-            raise JobValidationError(f"Unsupported recorded backend: {backend or 'empty'}")
         max_parallel = run.get("max_parallel")
         target_au_count = run.get("target_au_count")
         if not isinstance(max_parallel, int) or not 1 <= max_parallel <= 16:
@@ -992,17 +1154,33 @@ class AuditJobManager:
             resume=True,
             update_repo=False,
             log_level=str(run.get("log_level") or "INFO"),
-            backend=backend,  # type: ignore[arg-type]
+            backend=selected_backend,  # type: ignore[arg-type]
             # Do not pin the recorded model id: providers rename models, so
             # resolve it fresh from the local Claude config at agent time.
-            model=None,
+            model=selected_model,
+            provider_mode=provider_mode,
+            provider_base_url=provider_base_url,
+            provider_api_key=provider_api_key,
             target_au_count=target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             known_disclosures=tuple(self.store.disclosure_dedupe_index()),
         )
         # Carry forward the original session's accounting: finish_run writes
-        # config.models_used / config.usage_stats wholesale, so seed them from
-        # the run row or the earlier session's models/costs would be lost.
+        # these collectors wholesale, so seed them from the run row or the
+        # earlier session's backend/model/cost history would be lost.
+        try:
+            prior_backends = json.loads(str(run.get("backends_used") or "[]"))
+        except ValueError:
+            prior_backends = []
+        if not isinstance(prior_backends, list) or not prior_backends:
+            prior_backends = [recorded_backend] if recorded_backend else []
+        for prior_backend in prior_backends:
+            backend_name = str(prior_backend)
+            if (
+                backend_name in {"claude", "codex"}
+                and backend_name not in config.backends_used
+            ):
+                config.backends_used.append(backend_name)
         try:
             prior_models = json.loads(str(run.get("models_used") or "[]"))
         except ValueError:
@@ -1024,8 +1202,11 @@ class AuditJobManager:
             output_dir=output_dir,
             wiki=wiki_path,
             max_parallel=max_parallel,
-            backend=backend,
+            backend=selected_backend,
             model=config.model,
+            provider_mode=provider_mode,
+            provider_base_url=provider_base_url,
+            provider_api_key=provider_api_key,
             target_au_count=target_au_count,
             log_level=config.log_level,
             repos_dir=repos_dir,
@@ -1037,6 +1218,7 @@ class AuditJobManager:
         job.duration_known = bool(run.get("duration_known", True))
         job.target_path = target
         job.config = config
+        job.start_params = params
         job.state = STATE_RESTORING
         job.run_id = run_id
         job.job_key = str(run_id)
@@ -1099,6 +1281,7 @@ class AuditJobManager:
 
         self._check_start_allowed(os.path.realpath(candidate["target"]))
         job = AuditJob(self, JOB_REPRODUCTION)
+        job.start_params = params
         job.target_path = os.path.realpath(candidate["target"])
         job.state = STATE_RUNNING
         job.run_id = None
@@ -1123,3 +1306,25 @@ class AuditJobManager:
         )
         self._launch(job, job._run_reproduction(params, candidate, reproduction_root))
         return job
+
+    def hot_switch_agent_settings(
+        self,
+        *,
+        backend: AgentBackend,
+        model: str | None,
+        provider_mode: ProviderMode,
+        provider_base_url: str | None,
+        provider_api_key: str | None,
+    ) -> list[str]:
+        """Apply one provider selection to every active audit/reproduction job."""
+        switched: list[str] = []
+        for job in self._active_jobs():
+            if job.hot_switch_agent_settings(
+                backend=backend,
+                model=model,
+                provider_mode=provider_mode,
+                provider_base_url=provider_base_url,
+                provider_api_key=provider_api_key,
+            ):
+                switched.append(job.job_key)
+        return switched

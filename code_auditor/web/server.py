@@ -40,7 +40,9 @@ from .progress import install_web_log_handler
 from .settings import (
     DEFAULT_SETTINGS_PATH,
     WebSettings,
+    WebSettingsError,
     load_web_settings,
+    update_agent_settings,
 )
 from .terminal import serve_poc_terminal
 
@@ -98,6 +100,15 @@ class AuditStartRequest(StrictRequest):
 class ReproductionStartRequest(StrictRequest):
     run_id: int = Field(ge=1, le=9_223_372_036_854_775_807)
     vuln_id: str = Field(min_length=1, max_length=64, pattern=_VULN_ID_PATTERN)
+
+
+class AgentSettingsRequest(StrictRequest):
+    backend: Literal["claude", "codex"]
+    mode: Literal["local", "custom"]
+    base_url: str = Field(default="", max_length=2048)
+    model: str = Field(default="", max_length=256)
+    api_key: str | None = Field(default=None, max_length=8192)
+    clear_api_key: bool = False
 
 
 def _sse(event: dict) -> str:
@@ -197,7 +208,6 @@ def _run_stage_summary(run: dict) -> list[dict]:
     vuln_total = len(run.get("vulnerabilities") or []) + len(
         run.get("poc_issues") or []
     )
-    reproduced_total = int(run.get("reproduced_vulns_count") or 0)
     disclosures_total = int(run.get("disclosures_count") or 0)
     failed = run.get("status") == "failed"
 
@@ -322,18 +332,17 @@ def _websocket_origin_allowed(websocket: WebSocket) -> bool:
     )
 
 
+def _validate_http_url(value: str) -> str:
+    if not value:
+        return value
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL must use http or https")
+    return value
+
+
 class ImportRequest(StrictRequest):
     output_dir: str = Field(min_length=1, max_length=4096)
-
-
-class DisclosureStatusRequest(StrictRequest):
-    project: str = Field(
-        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"
-    )
-    dedupe_key: str = Field(
-        min_length=71, max_length=71, pattern=_DEDUPE_KEY_PATTERN
-    )
-    status: DisclosureStatus
 
 
 class DisclosureIdentityRequest(StrictRequest):
@@ -345,13 +354,11 @@ class DisclosureIdentityRequest(StrictRequest):
     )
 
 
-class DisclosureUpdateRequest(StrictRequest):
-    project: str = Field(
-        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"
-    )
-    dedupe_key: str = Field(
-        min_length=71, max_length=71, pattern=_DEDUPE_KEY_PATTERN
-    )
+class DisclosureStatusRequest(DisclosureIdentityRequest):
+    status: DisclosureStatus
+
+
+class DisclosureUpdateRequest(DisclosureIdentityRequest):
     title: str = Field(default="", max_length=512)
     location: str = Field(default="", max_length=4096)
     cwe: str = Field(default="", max_length=512)
@@ -369,12 +376,7 @@ class DisclosureUpdateRequest(StrictRequest):
     @field_validator("repo_url")
     @classmethod
     def validate_repo_url(cls, value: str) -> str:
-        if not value:
-            return value
-        parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("URL must use http or https")
-        return value
+        return _validate_http_url(value)
 
     @field_validator("audit_finished_date")
     @classmethod
@@ -408,10 +410,7 @@ class CveReferenceRequest(StrictRequest):
     @field_validator("url")
     @classmethod
     def validate_url(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("URL must use http or https")
-        return value
+        return _validate_http_url(value)
 
 
 class CveImportRequest(StrictRequest):
@@ -442,12 +441,7 @@ class CveImportRequest(StrictRequest):
     @field_validator("cve_url", "project_url", "reference_url")
     @classmethod
     def validate_http_url(cls, value: str) -> str:
-        if not value:
-            return value
-        parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("URL must use http or https")
-        return value
+        return _validate_http_url(value)
 
 
 def _cve_references(request: CveImportRequest) -> list[dict[str, str]]:
@@ -532,6 +526,10 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
+        elif request.url.path == "/api/settings" or re.fullmatch(
+            r"/api/audit/\d+/processes", request.url.path
+        ):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/", include_in_schema=False)
@@ -556,6 +554,38 @@ def create_app(
             "terminal_token": app.state.terminal_token,
         }
 
+    @app.get("/api/settings")
+    async def get_agent_settings() -> dict:
+        return settings.public_agent_settings()
+
+    @app.put("/api/settings")
+    async def put_agent_settings(request: AgentSettingsRequest) -> dict:
+        nonlocal settings
+        try:
+            settings = update_agent_settings(
+                settings,
+                backend=request.backend,
+                mode=request.mode,
+                base_url=request.base_url,
+                model=request.model,
+                api_key=request.api_key,
+                clear_api_key=request.clear_api_key,
+            )
+        except (OSError, WebSettingsError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        app.state.web_settings = settings
+        provider = settings.provider()
+        switched_jobs = manager.hot_switch_agent_settings(
+            backend=settings.backend,  # type: ignore[arg-type]
+            model=provider.model if provider.mode == "custom" else None,
+            provider_mode=provider.mode,
+            provider_base_url=provider.base_url or None,
+            provider_api_key=provider.api_key or None,
+        )
+        response = settings.public_agent_settings()
+        response["active_jobs_updated"] = len(switched_jobs)
+        return response
+
     @app.post("/api/audit", status_code=202)
     async def start_audit(request: AuditStartRequest) -> dict:
         if bool(request.repository) == bool(request.git_url):
@@ -579,6 +609,7 @@ def create_app(
                 git_url = validate_remote_repo_url(request.git_url or "")
             except RepoError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+        provider = settings.provider()
         try:
             job = await manager.start(
                 AuditStartParams(
@@ -587,6 +618,10 @@ def create_app(
                     wiki=wiki_path,
                     max_parallel=request.max_parallel,
                     backend=settings.backend,
+                    model=provider.model if provider.mode == "custom" else None,
+                    provider_mode=provider.mode,
+                    provider_base_url=provider.base_url or None,
+                    provider_api_key=provider.api_key or None,
                     target_au_count=-1,
                     log_level=settings.log_level,
                     repos_dir=settings.repos_dir,
@@ -618,6 +653,13 @@ def create_app(
     @app.get("/api/audit/{run_id}/status")
     async def audit_status(run_id: int) -> dict:
         return _audit_job_or_404(run_id).status()
+
+    @app.get("/api/audit/{run_id}/processes")
+    async def audit_processes(run_id: int) -> dict:
+        try:
+            return _audit_job_or_404(run_id).process_tree()
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/audit/{run_id}/events")
     async def audit_events(run_id: int) -> StreamingResponse:
@@ -778,12 +820,17 @@ def create_app(
 
     @app.post("/api/reproduction", status_code=202)
     async def start_reproduction(request: ReproductionStartRequest) -> dict:
+        provider = settings.provider()
         try:
             job = await manager.start_reproduction(
                 ReproductionStartParams(
                     run_id=request.run_id,
                     vuln_id=request.vuln_id,
                     backend=settings.backend,
+                    model=provider.model if provider.mode == "custom" else None,
+                    provider_mode=provider.mode,
+                    provider_base_url=provider.base_url or None,
+                    provider_api_key=provider.api_key or None,
                     log_level=settings.log_level,
                     reproductions_dir=settings.reproductions_dir,
                     wikis_dir=settings.wikis_dir,
@@ -940,12 +987,18 @@ def create_app(
     @app.post("/api/history/{run_id}/resume", status_code=202)
     async def resume_history_run(run_id: int) -> dict:
         _get_history_run(run_id)
+        provider = settings.provider()
         try:
             job = await manager.resume_cancelled(
                 run_id,
                 repos_dir=settings.repos_dir,
                 results_dir=settings.results_dir,
                 wikis_dir=settings.wikis_dir,
+                backend=settings.backend,  # type: ignore[arg-type]
+                provider_mode=provider.mode,
+                provider_base_url=provider.base_url or None,
+                provider_api_key=provider.api_key or None,
+                model=provider.model if provider.mode == "custom" else None,
             )
         except JobValidationError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1172,6 +1225,5 @@ def run_web_server(host: str, port: int, defaults: dict | None = None) -> None:
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
 
-    display_host = "127.0.0.1" if host == "0.0.0.0" else host
-    logger.info("Web UI available at http://%s:%d", display_host, port)
+    logger.info("Web UI available at http://%s:%d", host, port)
     asyncio.run(server.serve())

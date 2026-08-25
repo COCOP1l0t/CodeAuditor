@@ -440,7 +440,169 @@ tr.stage-failed .stage-status::before {
   text-decoration: none;
 }
 
-#results-columns {
+.process-tree-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.process-tree-header h2 {
+  margin-bottom: 0.15rem;
+}
+
+.process-tree-note {
+  color: var(--dim);
+  font-size: 0.74rem;
+}
+
+.process-tree-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.15fr) minmax(300px, 0.85fr);
+  gap: 0.85rem;
+  align-items: stretch;
+}
+
+.process-tree-browser,
+.process-command-panel {
+  min-width: 0;
+  min-height: 180px;
+  max-height: 390px;
+  overflow: auto;
+  background: var(--inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.8rem;
+}
+
+.process-run-root {
+  width: fit-content;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  font-weight: 700;
+  padding: 0.38rem 0.55rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--panel-raised);
+}
+
+.process-tree-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.process-tree-roots,
+.process-tree-children {
+  margin-left: 1rem;
+  padding-left: 1rem;
+  border-left: 1px solid var(--border-strong);
+}
+
+.process-tree-roots {
+  margin-top: 0.35rem;
+}
+
+.process-tree-item {
+  position: relative;
+  padding-top: 0.35rem;
+}
+
+.process-tree-item::before {
+  content: "";
+  position: absolute;
+  top: 1.25rem;
+  left: -1rem;
+  width: 1rem;
+  border-top: 1px solid var(--border-strong);
+}
+
+.process-tree-node {
+  width: 100%;
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) auto auto;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.38rem 0.5rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.process-tree-node:hover,
+.process-tree-node-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.process-tree-node:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.process-tree-name,
+.process-tree-pid,
+.process-tree-state,
+.process-command-panel pre {
+  font-family: var(--mono);
+}
+
+.process-tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.79rem;
+  font-weight: 650;
+}
+
+.process-tree-pid {
+  color: var(--dim);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.process-tree-state {
+  color: var(--dim);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 0.08rem 0.28rem;
+  font-size: 0.64rem;
+  line-height: 1.35;
+}
+
+.process-tree-state-R {
+  color: #77e388;
+  border-color: rgba(63, 185, 80, 0.55);
+}
+
+.process-command-panel h3 {
+  margin: 0 0 0.6rem;
+  color: var(--dim);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.process-command-panel pre {
+  margin: 0;
+  color: var(--fg);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#process-tree-empty {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.results-columns {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
@@ -528,6 +690,45 @@ tr.stage-failed .stage-status::before {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+#workspace-toolbar {
+  min-height: 56px;
+  flex: 0 0 56px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.8rem;
+  padding: 0 1.2rem;
+  background: #0c1118;
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-settings-summary {
+  min-width: 0;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-settings-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex: 0 0 auto;
+}
+
+.workspace-settings-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 #sidebar {
@@ -724,18 +925,6 @@ button.tab {
 .sidebar-footer[data-state="cancelled"] .status-dot {
   background: var(--err);
   box-shadow: 0 0 6px var(--err);
-}
-
-#job-badge {
-  min-height: 0;
-  padding: 0;
-  border: 0;
-  color: var(--fg);
-  font-size: 0.86rem;
-  font-weight: 620;
-  justify-content: flex-start;
-  overflow-wrap: anywhere;
-  text-align: left;
 }
 
 #job-list {
@@ -1423,6 +1612,7 @@ th[aria-sort="descending"] .sort-button::after {
 #disclosure-edit-dialog,
 #trigger-graph-dialog,
 #asan-report-dialog,
+#settings-dialog,
 #new-audit-dialog {
   width: min(860px, calc(100vw - 2rem));
   max-height: calc(100vh - 2rem);
@@ -1439,6 +1629,7 @@ th[aria-sort="descending"] .sort-button::after {
 #disclosure-edit-dialog::backdrop,
 #trigger-graph-dialog::backdrop,
 #asan-report-dialog::backdrop,
+#settings-dialog::backdrop,
 #new-audit-dialog::backdrop {
   background: rgba(4, 7, 10, 0.66);
   backdrop-filter: blur(3px);
@@ -1449,8 +1640,56 @@ th[aria-sort="descending"] .sort-button::after {
 #disclosure-edit-dialog h2,
 #trigger-graph-dialog h2,
 #asan-report-dialog h2,
+#settings-dialog h2,
 #new-audit-dialog h2 {
   margin-top: 0;
+}
+
+#settings-dialog {
+  width: min(720px, calc(100vw - 2rem));
+}
+
+.settings-intro {
+  margin: -0.35rem 0 1rem;
+}
+
+.settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+#s-custom-fields {
+  margin-top: 1rem;
+}
+
+.settings-wide-field {
+  grid-column: 1 / -1;
+}
+
+.settings-local-hint {
+  min-height: 48px;
+  margin: 1rem 0 0;
+  padding: 0.7rem 0.8rem;
+  color: var(--dim);
+  background: var(--inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.84rem;
+}
+
+.settings-checkbox {
+  grid-column: 1 / -1;
+  flex-direction: row;
+  align-items: center;
+  width: max-content;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.settings-checkbox input {
+  min-height: auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
 }
 
 #trigger-graph-dialog {
@@ -2204,6 +2443,18 @@ body.terminal-resizing {
     flex-basis: 176px;
   }
 
+  .agent-settings-summary {
+    display: none;
+  }
+
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-wide-field {
+    grid-column: auto;
+  }
+
   #terminal-dock {
     min-height: 180px;
     max-height: calc(100vh - 180px);
@@ -2221,6 +2472,16 @@ body.terminal-resizing {
   .log-panel-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .process-tree-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .process-tree-browser,
+  .process-command-panel {
+    min-height: 140px;
+    max-height: 320px;
   }
 
   .notification-center {

@@ -48,11 +48,17 @@ let liveDetailRunId = null;
 // Run id currently displayed on the run detail page (live or static).
 let detailRunId = null;
 let detailEventSource = null;
+let processTreeTimer = null;
+let processTreeRunId = null;
+let processTreePending = false;
+let processTreeGeneration = 0;
+let selectedProcessPid = null;
 // Reproduction job currently attached to the Reproduction view.
 let activeReproKey = null;
 let reproEventSource = null;
 let reproductionCandidates = [];
 let configuredGitUrl = "";
+let agentSettings = null;
 let managedResultsDir = "";
 let terminalToken = "";
 let terminalEnabled = false;
@@ -92,6 +98,7 @@ const MAX_LOG_PANE_CHARS = 200000;
 const MAX_LOG_PANE_ENTRIES = 2000;
 const LOG_RENDER_INTERVAL_MS = 100;
 const AGENT_LOG_FALLBACK_CHARS = 20000;
+const PROCESS_TREE_REFRESH_MS = 2000;
 const logBuffers = new Map();
 const tableCollator = new Intl.Collator(undefined, {
   numeric: true,
@@ -133,6 +140,129 @@ async function loadConfig() {
     reproductionFormError.textContent = `Failed to load config: ${e}`;
   }
 }
+
+function agentBackendLabel(backend) {
+  return backend === "codex" ? "Codex SDK" : "Claude Agent SDK";
+}
+
+function updateAgentSettingsSummary() {
+  if (!agentSettings) return;
+  const backend = agentSettings.backend || "claude";
+  const provider = (agentSettings.providers || {})[backend] || {};
+  const summary = provider.mode === "custom"
+    ? `${agentBackendLabel(backend)} · ${provider.model || "custom provider"}`
+    : `${agentBackendLabel(backend)} · local CLI configuration`;
+  $("agent-settings-summary").textContent = summary;
+  $("f-agent-summary").textContent = summary;
+}
+
+async function loadAgentSettings() {
+  const res = await fetch("/api/settings", { cache: "no-store" });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  agentSettings = data;
+  updateAgentSettingsSummary();
+  return data;
+}
+
+function renderAgentSettingsForm() {
+  if (!agentSettings) return;
+  const backend = $("s-backend").value;
+  const provider = (agentSettings.providers || {})[backend] || {
+    mode: "local",
+    base_url: "",
+    model: "",
+    api_key_configured: false,
+  };
+  $("s-mode").value = provider.mode || "local";
+  $("s-base-url").value = provider.base_url || "";
+  $("s-model").value = provider.model || "";
+  $("s-api-key").value = "";
+  $("s-clear-key").checked = false;
+  $("s-clear-key-label").hidden = !provider.api_key_configured;
+  $("s-api-key").placeholder = provider.api_key_configured
+    ? "Stored key (leave blank to keep)"
+    : "Enter API key";
+  updateAgentSettingsMode();
+}
+
+function updateAgentSettingsMode() {
+  const local = $("s-mode").value === "local";
+  const backend = $("s-backend").value;
+  const provider = ((agentSettings || {}).providers || {})[backend] || {};
+  $("s-custom-fields").hidden = local;
+  $("s-local-hint").hidden = !local;
+  $("s-local-hint").textContent = backend === "codex"
+    ? "Uses the local Codex CLI login and ~/.codex/config.toml through the Codex app-server."
+    : "Uses the local Claude Code login and settings through the Claude Agent SDK.";
+  $("s-base-url").required = !local;
+  $("s-model").required = !local;
+  $("s-api-key").required =
+    !local && (!provider.api_key_configured || $("s-clear-key").checked);
+}
+
+const settingsDialog = $("settings-dialog");
+$("btn-settings").addEventListener("click", async () => {
+  $("settings-error").textContent = "";
+  try {
+    await loadAgentSettings();
+    $("s-backend").value = agentSettings.backend || "claude";
+    renderAgentSettingsForm();
+    settingsDialog.showModal();
+  } catch (error) {
+    $("agent-settings-summary").textContent = `Settings unavailable: ${error}`;
+  }
+});
+$("btn-settings-cancel").addEventListener("click", () => settingsDialog.close());
+$("s-backend").addEventListener("change", renderAgentSettingsForm);
+$("s-mode").addEventListener("change", updateAgentSettingsMode);
+$("s-clear-key").addEventListener("change", updateAgentSettingsMode);
+
+$("settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const errorBox = $("settings-error");
+  const saveButton = $("btn-settings-save");
+  errorBox.textContent = "";
+  const body = {
+    backend: $("s-backend").value,
+    mode: $("s-mode").value,
+    base_url: $("s-base-url").value.trim(),
+    model: $("s-model").value.trim(),
+    clear_api_key: $("s-clear-key").checked,
+  };
+  const apiKey = $("s-api-key").value;
+  if (apiKey) body.api_key = apiKey;
+  saveButton.disabled = true;
+  try {
+    const res = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const detail = Array.isArray(data.detail)
+        ? data.detail.map((item) => item.msg || String(item)).join("; ")
+        : data.detail;
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    agentSettings = data;
+    updateAgentSettingsSummary();
+    const updatedJobs = Number(data.active_jobs_updated || 0);
+    if (updatedJobs > 0) {
+      $("agent-settings-summary").textContent +=
+        ` · ${updatedJobs} active job${updatedJobs === 1 ? "" : "s"} updated`;
+      window.setTimeout(() => {
+        if (agentSettings === data) updateAgentSettingsSummary();
+      }, 5000);
+    }
+    settingsDialog.close();
+  } catch (error) {
+    errorBox.textContent = `Failed to save settings: ${error.message || error}`;
+  } finally {
+    saveButton.disabled = false;
+  }
+});
 
 // ── Cloned repositories ─────────────────────────────────────────────────────
 async function loadRepos() {
@@ -262,6 +392,9 @@ form.addEventListener("submit", async (e) => {
   const wiki = $("f-wiki-select").value;
   if (wiki) body.wiki = wiki;
 
+  const startButtonLabel = btnStart.textContent;
+  btnStart.disabled = true;
+  btnStart.textContent = "Starting…";
   try {
     const res = await fetch("/api/audit", {
       method: "POST",
@@ -281,6 +414,9 @@ form.addEventListener("submit", async (e) => {
     location.hash = data.run_id ? `#/run/${data.run_id}` : "#/history";
   } catch (err) {
     formError.textContent = `Start failed: ${err}`;
+  } finally {
+    btnStart.disabled = false;
+    btnStart.textContent = startButtonLabel;
   }
 });
 
@@ -515,13 +651,14 @@ function applyJobStatus(status) {
 }
 
 function jobDisplayLabel(job) {
+  const backend = job.backend ? ` · ${agentBackendLabel(job.backend)}` : "";
   if (job.kind === "reproduction") {
     const candidate = job.reproduction_candidate || {};
     return candidate.vuln_id
-      ? `repro ${candidate.vuln_id}`
-      : `repro ${String(job.job_key).slice(0, 12)}`;
+      ? `repro ${candidate.vuln_id}${backend}`
+      : `repro ${String(job.job_key).slice(0, 12)}${backend}`;
   }
-  return `Run #${job.run_id ?? "?"}`;
+  return `Run #${job.run_id ?? "?"}${backend}`;
 }
 
 function renderJobList() {
@@ -582,6 +719,11 @@ function handleJobLifecycleEvent(ev) {
       state: ev.status,
       error: ev.error || "",
       run_id: ev.run_id ?? prev.run_id ?? null,
+      backend: ev.backend || prev.backend || "",
+      model: ev.model ?? prev.model ?? null,
+      provider_mode: ev.provider_mode || prev.provider_mode || "",
+      backends_used: ev.backends_used ?? prev.backends_used ?? [],
+      models_used: ev.models_used ?? prev.models_used ?? [],
       started_at: ev.started_at || prev.started_at || 0,
       duration_seconds: ev.duration_seconds ?? prev.duration_seconds ?? 0,
       active_started_at: ev.active_started_at ?? prev.active_started_at ?? 0,
@@ -597,6 +739,16 @@ function handleJobLifecycleEvent(ev) {
     return;
   }
   const runId = ev.run_id != null ? Number(ev.run_id) : null;
+  if (ev.backend_switched && runId !== null && detailRunId === runId) {
+    loadRunDetail(runId);
+  }
+  if (runId !== null && detailRunId === runId) {
+    if (ev.status === "running") {
+      startAuditProcessTree(runId);
+    } else {
+      stopAuditProcessTree();
+    }
+  }
   if (terminal && runId !== null && liveDetailRunId === runId) {
     // The run page we are watching just ended: switch it to the static view.
     disconnectDetailEvents();
@@ -877,6 +1029,178 @@ async function pollActiveAgentLog() {
   return true;
 }
 
+// ── Audit Run process tree ─────────────────────────────────────────────────
+function processStateLabel(state) {
+  return (
+    {
+      R: "running",
+      S: "sleeping",
+      D: "disk wait",
+      T: "stopped",
+      t: "tracing",
+      Z: "zombie",
+      X: "dead",
+      I: "idle",
+    }[state] || state || "unknown"
+  );
+}
+
+function showProcessCommand(process) {
+  selectedProcessPid = process.pid;
+  $("process-command-title").textContent = `${process.name} · PID ${process.pid}`;
+  $("process-command").textContent = process.command || `[${process.name}]`;
+  $("process-command-panel").hidden = false;
+  document.querySelectorAll(".process-tree-node").forEach((node) => {
+    node.classList.toggle(
+      "process-tree-node-selected",
+      Number(node.dataset.pid) === selectedProcessPid
+    );
+  });
+}
+
+function appendProcessNode(parent, process) {
+  const item = document.createElement("li");
+  item.className = "process-tree-item";
+  item.setAttribute("role", "none");
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "process-tree-node";
+  button.dataset.pid = String(process.pid);
+  button.setAttribute("role", "treeitem");
+  button.setAttribute("aria-label", `${process.name}, PID ${process.pid}`);
+  if (process.pid === selectedProcessPid) {
+    button.classList.add("process-tree-node-selected");
+  }
+
+  const name = document.createElement("span");
+  name.className = "process-tree-name";
+  name.textContent = process.name;
+  const pid = document.createElement("span");
+  pid.className = "process-tree-pid";
+  pid.textContent = `PID ${process.pid}`;
+  const state = document.createElement("span");
+  state.className = `process-tree-state process-tree-state-${process.state}`;
+  state.textContent = processStateLabel(process.state);
+  button.append(name, pid, state);
+  button.addEventListener("click", () => showProcessCommand(process));
+  item.appendChild(button);
+
+  if (Array.isArray(process.children) && process.children.length) {
+    button.setAttribute("aria-expanded", "true");
+    const children = document.createElement("ul");
+    children.className = "process-tree-list process-tree-children";
+    children.setAttribute("role", "group");
+    for (const child of process.children) appendProcessNode(children, child);
+    item.appendChild(children);
+  }
+  parent.appendChild(item);
+}
+
+function findProcessByPid(processes, pid) {
+  for (const process of processes) {
+    if (process.pid === pid) return process;
+    const child = findProcessByPid(process.children || [], pid);
+    if (child) return child;
+  }
+  return null;
+}
+
+function renderAuditProcessTree(payload, runId) {
+  const roots = Array.isArray(payload.roots) ? payload.roots : [];
+  const total = Number(payload.total) || 0;
+  const tree = $("process-tree");
+  const empty = $("process-tree-empty");
+  $("process-tree-count").textContent = `(${total})`;
+  tree.replaceChildren();
+  empty.hidden = total !== 0;
+  tree.hidden = total === 0;
+
+  if (total === 0) {
+    selectedProcessPid = null;
+    $("process-command-panel").hidden = true;
+    return;
+  }
+
+  const runRoot = document.createElement("div");
+  runRoot.className = "process-run-root";
+  runRoot.textContent = `Audit Run #${runId}`;
+  tree.appendChild(runRoot);
+  const list = document.createElement("ul");
+  list.className = "process-tree-list process-tree-roots";
+  list.setAttribute("role", "group");
+  for (const process of roots) appendProcessNode(list, process);
+  tree.appendChild(list);
+
+  if (selectedProcessPid !== null) {
+    const selected = findProcessByPid(roots, selectedProcessPid);
+    if (selected) {
+      showProcessCommand(selected);
+    } else {
+      selectedProcessPid = null;
+      $("process-command-panel").hidden = true;
+    }
+  }
+}
+
+async function pollAuditProcessTree() {
+  if (processTreeRunId === null || processTreePending) return;
+  const runId = processTreeRunId;
+  const generation = processTreeGeneration;
+  processTreePending = true;
+  try {
+    const res = await fetch(`/api/audit/${runId}/processes`, {
+      cache: "no-store",
+    });
+    if (generation !== processTreeGeneration || runId !== processTreeRunId) return;
+    if (res.status === 404 || res.status === 409) {
+      stopAuditProcessTree();
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    renderAuditProcessTree(await res.json(), runId);
+  } catch (error) {
+    if (generation !== processTreeGeneration || runId !== processTreeRunId) return;
+    $("process-tree").hidden = true;
+    $("process-tree-empty").hidden = false;
+    $("process-tree-empty").textContent = `Process tree unavailable: ${error}`;
+  } finally {
+    if (generation === processTreeGeneration) processTreePending = false;
+  }
+}
+
+function startAuditProcessTree(runId) {
+  const numericRunId = Number(runId);
+  if (processTreeRunId === numericRunId && processTreeTimer !== null) {
+    $("process-tree-panel").hidden = false;
+    return;
+  }
+  stopAuditProcessTree();
+  processTreeRunId = numericRunId;
+  $("process-tree-panel").hidden = false;
+  $("process-tree-empty").textContent = "No child processes are active right now.";
+  pollAuditProcessTree();
+  processTreeTimer = window.setInterval(
+    pollAuditProcessTree,
+    PROCESS_TREE_REFRESH_MS
+  );
+}
+
+function stopAuditProcessTree() {
+  if (processTreeTimer !== null) {
+    window.clearInterval(processTreeTimer);
+    processTreeTimer = null;
+  }
+  processTreeGeneration += 1;
+  processTreeRunId = null;
+  processTreePending = false;
+  selectedProcessPid = null;
+  $("process-tree-panel").hidden = true;
+  $("process-tree").replaceChildren();
+  $("process-tree-empty").hidden = true;
+  $("process-command-panel").hidden = true;
+}
+
 async function pollDetailHeartbeat() {
   if (liveDetailRunId === null || auditHeartbeatPending) return;
   auditHeartbeatPending = true;
@@ -892,6 +1216,11 @@ async function pollDetailHeartbeat() {
     }
     const status = await res.json();
     applyJobStatus(status);
+    if (status.state === "running") {
+      startAuditProcessTree(status.run_id);
+    } else {
+      stopAuditProcessTree();
+    }
     if (!BUSY_JOB_STATES.has(status.state)) {
       handleJobLifecycleEvent({
         type: "job",
@@ -1175,12 +1504,19 @@ function severityBadge(sev) {
 }
 
 function parseJsonList(text) {
+  if (Array.isArray(text)) return text.map(String);
   try {
     const v = JSON.parse(text || "[]");
     return Array.isArray(v) ? v : [String(v)];
   } catch {
     return [];
   }
+}
+
+function backendsUsedDisplay(run) {
+  const backends = parseJsonList(run.backends_used);
+  const effective = backends.length ? backends : run.backend ? [run.backend] : [];
+  return effective.map(agentBackendLabel).join(", ");
 }
 
 function modelsUsedDisplay(run) {
@@ -1303,7 +1639,7 @@ async function loadHistory() {
         fmtTime(run.started_at || run.created_at),
         run.status === "imported" ? "—" : fmtRunDuration(liveJob || run),
         { kind: "status" },
-        run.backend || "—",
+        backendsUsedDisplay(liveJob || run) || "—",
         usageStatsDisplay(run) || "—",
         run.reproduced_vulns_count,
       ];
@@ -1431,6 +1767,7 @@ $("btn-import").addEventListener("click", async () => {
 
 // ── Run detail view ─────────────────────────────────────────────────────────
 async function loadRunDetail(runId) {
+  stopAuditProcessTree();
   const resumeButton = $("btn-run-resume");
   resumeButton.hidden = true;
   resumeButton.dataset.resumeRun = "";
@@ -1498,6 +1835,7 @@ async function loadRunDetail(runId) {
       `/api/history/${run.id}/agent-log?download=true`;
     resultsPanel.hidden = true;
     viewerPanel.hidden = true;
+    if (status.state === "running") startAuditProcessTree(run.id);
     connectDetailEvents(run.id);
   } else {
     await loadRunResults(run);
@@ -1540,8 +1878,8 @@ async function loadRunDetail(runId) {
         : "—",
     ],
     ["Output", baseName(run.output_dir)],
-    ["Backend", run.backend || "—"],
-    ["Models used", modelsUsedDisplay(run) || "—"],
+    ["Backends used", backendsUsedDisplay(isLive ? status : run) || "—"],
+    ["Models used", modelsUsedDisplay(isLive ? status : run) || "—"],
     ["Tokens / Cost", usageStatsDisplay(run) || "—"],
     ["Started", fmtTime(run.started_at)],
     ["Ended", fmtTime(run.ended_at)],
@@ -3314,6 +3652,7 @@ function route() {
   if (!runMatch) {
     // Leaving the run detail page: stop streaming its events.
     disconnectDetailEvents();
+    stopAuditProcessTree();
     liveDetailRunId = null;
     detailRunId = null;
   }
@@ -3403,7 +3742,12 @@ function initScrollTopButton() {
 async function boot() {
   resetStages();
   resetReproductionStage();
-  await loadConfig();
+  await Promise.all([
+    loadConfig(),
+    loadAgentSettings().catch((error) => {
+      $("agent-settings-summary").textContent = `Settings unavailable: ${error}`;
+    }),
+  ]);
   try {
     const res = await fetch("/api/jobs");
     if (res.ok) {

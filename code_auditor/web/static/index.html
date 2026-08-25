@@ -50,7 +50,67 @@
   </aside>
 
   <div id="workspace">
+  <header id="workspace-toolbar">
+    <span id="agent-settings-summary" class="agent-settings-summary">Loading LLM backend…</span>
+    <button type="button" id="btn-settings" class="btn workspace-settings-button"
+            aria-haspopup="dialog" aria-controls="settings-dialog" title="Configure LLM backend">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
+      <span>LLM Settings</span>
+    </button>
+  </header>
   <main id="content-pane">
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <form id="settings-form">
+        <h2 id="settings-title">LLM backend settings</h2>
+        <p class="dim settings-intro">
+          Choose an Agent SDK and use its local CLI configuration, or provide a compatible API endpoint. Active jobs switch on their next agent call; calls already in flight finish with their existing backend snapshot.
+        </p>
+        <div class="form-grid settings-grid">
+          <label>
+            Agent backend
+            <select id="s-backend" required>
+              <option value="claude">Claude Agent SDK</option>
+              <option value="codex">Codex SDK</option>
+            </select>
+          </label>
+          <label>
+            Configuration source
+            <select id="s-mode" required>
+              <option value="local">Local CLI configuration</option>
+              <option value="custom">Custom model provider</option>
+            </select>
+          </label>
+        </div>
+        <p id="s-local-hint" class="settings-local-hint"></p>
+        <div id="s-custom-fields" class="form-grid settings-grid" hidden>
+          <label class="settings-wide-field">
+            Provider base URL <span class="required">*</span>
+            <input id="s-base-url" type="url" maxlength="2048"
+                   autocomplete="url" placeholder="https://api.example.com/v1" />
+          </label>
+          <label>
+            Model name <span class="required">*</span>
+            <input id="s-model" type="text" maxlength="256"
+                   autocomplete="off" placeholder="model-id" />
+          </label>
+          <label>
+            API key <span class="required">*</span>
+            <input id="s-api-key" type="password" maxlength="8192"
+                   autocomplete="new-password" placeholder="Enter API key" />
+            <span id="s-api-key-hint" class="hint">The key is stored server-side and is never returned to the browser.</span>
+          </label>
+          <label id="s-clear-key-label" class="settings-checkbox" hidden>
+            <input id="s-clear-key" type="checkbox" />
+            Remove the stored API key
+          </label>
+        </div>
+        <p id="settings-error" class="error" role="alert"></p>
+        <div class="button-row">
+          <button type="submit" id="btn-settings-save" class="btn btn-start">Save settings</button>
+          <button type="button" id="btn-settings-cancel" class="btn">Cancel</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="new-audit-dialog" aria-labelledby="new-audit-title">
     <section class="panel" id="config-panel">
       <h2 id="new-audit-title">New Audit</h2>
@@ -89,8 +149,9 @@
           </label>
         </div>
         <p class="hint">
-          Backend, model, DEBUG logging, output roots, and the Discovered
-          registry are loaded from <code id="f-config-path">~/.code_auditor/settings.json</code>.
+          New jobs and subsequent calls in active jobs use <strong id="f-agent-summary">the selected LLM backend</strong>.
+          Settings, DEBUG logging, output roots, and the Discovered registry are
+          loaded from <code id="f-config-path">~/.code_auditor/settings.json</code>.
         </p>
         <div class="button-row">
           <button type="submit" id="btn-start" class="btn btn-start">Start Audit</button>
@@ -127,6 +188,25 @@
         </table>
       </section>
 
+      <section class="panel" id="process-tree-panel" hidden>
+        <header class="process-tree-header">
+          <div>
+            <h2>Processes <span id="process-tree-count" class="dim"></span></h2>
+            <span class="process-tree-note">Live process relationships · refreshes every 2 seconds</span>
+          </div>
+        </header>
+        <div class="process-tree-layout">
+          <div class="process-tree-browser">
+            <div id="process-tree" role="tree" aria-label="Audit Run process tree"></div>
+            <p id="process-tree-empty" class="dim" hidden>No child processes are active right now.</p>
+          </div>
+          <aside id="process-command-panel" class="process-command-panel" hidden>
+            <h3 id="process-command-title">Command</h3>
+            <pre id="process-command"></pre>
+          </aside>
+        </div>
+      </section>
+
       <section class="panel" id="logs-panel">
         <header class="log-panel-header">
           <div>
@@ -144,7 +224,7 @@
       <section class="panel" id="results-panel" hidden>
         <h2>Results</h2>
         <p id="results-output-dir" class="dim"></p>
-        <div id="results-columns">
+        <div class="results-columns">
           <details class="results-group">
             <summary>Vulnerabilities <span class="dim results-count" id="results-vulnerabilities-count"></span></summary>
             <ul id="results-vulnerabilities" class="file-list"></ul>
@@ -266,7 +346,7 @@
       <section class="panel" id="reproduction-results-panel" hidden>
         <h2>Results</h2>
         <p id="reproduction-results-output-dir" class="dim"></p>
-        <div id="results-columns">
+        <div class="results-columns">
           <div>
             <h3>Vulnerability</h3>
             <ul id="reproduction-vulnerabilities" class="file-list"></ul>
@@ -309,7 +389,7 @@
           <thead>
             <tr>
               <th>ID</th><th>Target</th><th>Commit</th><th>Started</th><th>Duration</th>
-              <th>Status</th><th>Backend</th><th>Tokens / Cost</th>
+              <th>Status</th><th>Backends used</th><th>Tokens / Cost</th>
               <th>Reproduced Vulns</th><th>Actions</th>
             </tr>
           </thead>

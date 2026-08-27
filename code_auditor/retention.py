@@ -56,6 +56,7 @@ ALLOWED_RETAIN_ROLES = frozenset(
         "support",
         "report",
         "evidence",
+        "input",
         "disclosure",
     }
 )
@@ -152,6 +153,10 @@ def _read_manifest_data(artifact_dir: Path) -> dict[str, Any]:
         raise RetentionError(f"{RETAIN_MANIFEST_FILENAME} must be a regular file")
     if stat_result.st_nlink != 1:
         raise RetentionError(f"{RETAIN_MANIFEST_FILENAME} must not be hard-linked")
+    if stat.S_IMODE(stat_result.st_mode) & 0o077:
+        raise RetentionError(
+            f"{RETAIN_MANIFEST_FILENAME} must not be group/world accessible"
+        )
     if stat_result.st_size > MAX_RETAIN_MANIFEST_BYTES:
         raise RetentionError(
             f"{RETAIN_MANIFEST_FILENAME} exceeds {MAX_RETAIN_MANIFEST_BYTES} bytes"

@@ -60,6 +60,31 @@ def _write_runs_db(path: Path, active_output: Path | None = None) -> None:
             )
 
 
+def _write_poc_status_db(
+    path: Path,
+    output: Path,
+    *,
+    vuln_id: str = "H-01",
+    poc_status: str | None = "reproduced",
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY, output_dir TEXT, status TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE pocs (run_id INTEGER, vuln_id TEXT, status TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (1, ?, 'done')",
+            (str(output),),
+        )
+        if poc_status is not None:
+            connection.execute(
+                "INSERT INTO pocs VALUES (1, ?, ?)",
+                (vuln_id, poc_status),
+            )
+
+
 def test_history_migration_is_dry_run_and_blocks_active_outputs(
     tmp_path: Path,
 ) -> None:
@@ -125,6 +150,88 @@ def test_history_migration_fails_closed_when_database_is_missing(
     assert report["summary"]["estimated_safe_reclaimable_bytes"] == 0
 
 
+def test_history_migration_exempts_database_confirmed_nonreproduced_artifact(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    output = results / "project" / "audit-output-one"
+    artifact = output / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    (artifact / "reproduce.sh").unlink()
+    db = tmp_path / "history.db"
+    _write_poc_status_db(db, output, poc_status="not-reproduced")
+
+    report = build_retention_migration_report(results, db_path=db)
+    plan = report["outputs"][0]["artifacts"][0]
+
+    assert plan["migration_required"] is False
+    assert plan["migration_state"] == "exempt-not-reproduced"
+    assert plan["ignored_blockers"] == [{"type": "missing_reproduce_sh"}]
+    assert report["summary"]["migration_required_artifact_count"] == 0
+    assert report["summary"]["exempt_not_reproduced_artifact_count"] == 1
+    assert report["summary"]["blocked_artifact_count"] == 0
+    repair = build_retention_entrypoint_repair_report(results, db_path=db)
+    assert repair["repairs"] == []
+    assert repair["blocked_artifacts"] == []
+
+
+def test_history_migration_blocks_unmapped_artifact_when_status_gate_exists(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    output = results / "project" / "audit-output-one"
+    artifact = output / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    db = tmp_path / "history.db"
+    _write_poc_status_db(db, output, poc_status=None)
+
+    report = build_retention_migration_report(results, db_path=db)
+    plan = report["outputs"][0]["artifacts"][0]
+
+    assert plan["migration_required"] is True
+    assert plan["migration_state"] == "blocked-unmapped-poc-status"
+    assert {item["type"] for item in plan["blockers"]} == {
+        "poc_status_unmapped"
+    }
+
+
+def test_history_migration_supersedes_blocked_stage5_only_after_stage6_manifest(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    output = results / "project" / "audit-output-one"
+    stage5 = output / "stage5-pocs" / "H-01"
+    stage6 = output / "stage6-disclosures" / "H-01" / "disclosure"
+    _write_artifact(stage5)
+    (stage5 / "reproduce.sh").unlink()
+    _write_disclosure(stage6)
+    db = tmp_path / "history.db"
+    _write_poc_status_db(db, output)
+
+    before = build_retention_migration_report(results, db_path=db)
+    before_stage5 = next(
+        item for item in before["outputs"][0]["artifacts"] if item["kind"] == "stage5"
+    )
+    assert before_stage5["migration_required"] is True
+    assert before_stage5["ready"] is False
+    assert before["summary"]["superseded_stage5_artifact_count"] == 0
+
+    applied = apply_retention_manifests(results, db_path=db)
+    assert applied["mutations"] == [
+        {"action": "create", "path": str(stage6 / RETAIN_MANIFEST_FILENAME)}
+    ]
+
+    after = build_retention_migration_report(results, db_path=db)
+    after_stage5 = next(
+        item for item in after["outputs"][0]["artifacts"] if item["kind"] == "stage5"
+    )
+    assert after_stage5["migration_required"] is False
+    assert after_stage5["migration_state"] == "superseded-by-stage6"
+    assert after_stage5["superseded_by"] == str(stage6)
+    assert after_stage5["ignored_blockers"] == [{"type": "missing_reproduce_sh"}]
+    assert after["summary"]["superseded_stage5_artifact_count"] == 1
+
+
 def test_history_migration_reports_nonportable_script_blocker(
     tmp_path: Path,
 ) -> None:
@@ -144,6 +251,53 @@ def test_history_migration_reports_nonportable_script_blocker(
     disposable = report["outputs"][0]["disposable_roots"][0]
     assert disposable["ready"] is False
     assert disposable["blocker"] == "artifact_migration_blocked"
+
+
+def test_history_migration_allows_checkout_local_target_debug_reference(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    output = results / "project" / "audit-output-one"
+    artifact = output / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    (artifact / "reproduce.sh").write_text(
+        "#!/bin/sh\nset -eu\ncargo build\nexec ./target/debug/reproducer\n",
+        encoding="utf-8",
+    )
+    (artifact / "reproduce.sh").chmod(0o700)
+    db = tmp_path / "history.db"
+    _write_runs_db(db)
+
+    report = build_retention_migration_report(results, db_path=db)
+
+    assert report["outputs"][0]["artifacts"][0]["ready"] is True
+
+
+def test_history_migration_treats_evidence_paths_as_nonportable_records(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    output = results / "project" / "audit-output-one"
+    artifact = output / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    evidence = artifact / "evidence" / "observed.json"
+    evidence.parent.mkdir()
+    evidence.write_text(
+        '{"old_path":"/tmp/code-auditor/finished/target"}\n',
+        encoding="utf-8",
+    )
+    db = tmp_path / "history.db"
+    _write_runs_db(db)
+
+    report = build_retention_migration_report(results, db_path=db)
+    plan = report["outputs"][0]["artifacts"][0]
+
+    assert plan["ready"] is True
+    assert next(
+        item
+        for item in plan["candidate_files"]
+        if item["path"] == "evidence/observed.json"
+    )["role"] == "evidence"
 
 
 def test_history_migration_does_not_treat_historical_report_path_as_runtime_use(
@@ -179,6 +333,7 @@ def test_history_migration_skips_generated_trees_but_keeps_builder_source(
         artifact / ".dart_tool" / "generated.py",
         artifact / ".gradle" / "generated.py",
         artifact / "deps" / "generated.py",
+        artifact / "harness" / "obj" / "generated.json",
         artifact / "qemu-bundle" / "generated.py",
     ]
     for path in generated:
@@ -200,6 +355,29 @@ def test_history_migration_skips_generated_trees_but_keeps_builder_source(
     assert not candidate_paths.intersection(
         {path.relative_to(artifact).as_posix() for path in generated}
     )
+
+
+def test_history_migration_keeps_virtualization_reproduction_inputs(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    artifact = results / "project" / "audit-output-one" / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    for name in ("malicious.ovf", "state.sav", "disk.vhdx", "stream.mig"):
+        (artifact / name).write_bytes(b"input")
+    db = tmp_path / "history.db"
+    _write_runs_db(db)
+
+    report = build_retention_migration_report(results, db_path=db)
+
+    candidates = {
+        item["path"]: item["role"]
+        for item in report["outputs"][0]["artifacts"][0]["candidate_files"]
+    }
+    assert candidates["malicious.ovf"] == "support"
+    assert candidates["state.sav"] == "input"
+    assert candidates["disk.vhdx"] == "input"
+    assert candidates["stream.mig"] == "input"
 
 
 def test_history_migration_rejects_symlink_results_root(tmp_path: Path) -> None:
@@ -297,6 +475,25 @@ def test_stage6_manifest_requires_complete_disclosure_bundle(tmp_path: Path) -> 
         "missing_disclosure_zip",
         "missing_email",
     }
+
+
+def test_history_migration_ignores_empty_artifact_directories(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    output = results / "project" / "audit-output-one"
+    (output / "stage5-pocs" / "H-01").mkdir(parents=True)
+    (output / "stage6-disclosures" / "H-02" / "disclosure").mkdir(
+        parents=True
+    )
+    db = tmp_path / "history.db"
+    _write_runs_db(db)
+
+    report = build_retention_migration_report(results, db_path=db)
+
+    assert report["summary"]["artifact_count"] == 0
+    assert report["summary"]["blocked_artifact_count"] == 0
+    assert report["outputs"][0]["artifacts"] == []
 
 
 def test_entrypoint_repair_dry_run_finds_unambiguous_portable_legacy_script(
@@ -414,5 +611,74 @@ def test_entrypoint_repair_accepts_unique_script_invoked_by_report(
 
     apply_retention_entrypoint_repairs(results, db_path=db)
     assert 'exec "$SCRIPT_DIR/poc_case.py" "$@"' in (
+        artifact / "reproduce.sh"
+    ).read_text(encoding="utf-8")
+
+
+def test_entrypoint_repair_accepts_unique_executable_reproduction_named_script(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    artifact = results / "project" / "audit-output-one" / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    (artifact / "reproduce.sh").unlink()
+    script = artifact / "poc_case.py"
+    script.write_text("#!/usr/bin/env python3\nprint('reproduced')\n", encoding="utf-8")
+    script.chmod(0o700)
+    db = tmp_path / "history.db"
+    _write_runs_db(db)
+
+    report = build_retention_entrypoint_repair_report(results, db_path=db)
+
+    candidate = report["repairs"][0]["legacy_entrypoints"][0]
+    assert candidate["name"] == "poc_case.py"
+    assert candidate["source"] == "unique-reproduction-script"
+    assert report["repairs"][0]["ready"] is True
+
+
+def test_entrypoint_repair_accepts_unique_nested_recognized_script(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    artifact = results / "project" / "audit-output-one" / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    (artifact / "reproduce.sh").unlink()
+    script = artifact / "poc" / "run_poc.sh"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\nset -eu\necho reproduced\n", encoding="utf-8")
+    script.chmod(0o700)
+    db = tmp_path / "history.db"
+    _write_runs_db(db)
+
+    report = build_retention_entrypoint_repair_report(results, db_path=db)
+
+    candidate = report["repairs"][0]["legacy_entrypoints"][0]
+    assert candidate["name"] == "poc/run_poc.sh"
+    assert candidate["source"] == "recognized-nested-name"
+    assert report["repairs"][0]["ready"] is True
+
+
+def test_entrypoint_repair_invokes_nonexecutable_script_through_shebang_runtime(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "results"
+    artifact = results / "project" / "audit-output-one" / "stage5-pocs" / "H-01"
+    _write_artifact(artifact)
+    (artifact / "reproduce.sh").unlink()
+    script = artifact / "poc_case.py"
+    script.write_text("#!/usr/bin/env python3\nprint('reproduced')\n", encoding="utf-8")
+    script.chmod(0o600)
+    db = tmp_path / "history.db"
+    _write_runs_db(db)
+
+    dry_run = build_retention_entrypoint_repair_report(results, db_path=db)
+
+    candidate = dry_run["repairs"][0]["legacy_entrypoints"][0]
+    assert candidate["executable"] is False
+    assert candidate["interpreter"] == "python3"
+    assert dry_run["repairs"][0]["ready"] is True
+
+    apply_retention_entrypoint_repairs(results, db_path=db)
+    assert 'exec python3 "$SCRIPT_DIR/poc_case.py" "$@"' in (
         artifact / "reproduce.sh"
     ).read_text(encoding="utf-8")

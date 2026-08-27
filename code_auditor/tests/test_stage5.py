@@ -298,7 +298,8 @@ def test_run_stage5_exports_only_retained_files_from_scratch(
             json.dumps(_trigger_graph("H-09")), encoding="utf-8"
         )
         (poc / "large-build.bin").write_bytes(b"disposable")
-        (poc / "retain-manifest.json").write_text(
+        manifest_path = poc / "retain-manifest.json"
+        manifest_path.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
@@ -312,6 +313,7 @@ def test_run_stage5_exports_only_retained_files_from_scratch(
             ),
             encoding="utf-8",
         )
+        manifest_path.chmod(0o600)
         return "done"
 
     monkeypatch.setattr(stage5, "DockerScratch", FakeScratch)

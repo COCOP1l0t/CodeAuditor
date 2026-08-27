@@ -22,7 +22,8 @@ def _write_retained_tree(root: Path) -> None:
     (root / "report.md").write_text("# Reproduction\n", encoding="utf-8")
     (root / "build").mkdir()
     (root / "build" / "large-object.o").write_bytes(b"temporary")
-    (root / RETAIN_MANIFEST_FILENAME).write_text(
+    manifest_path = root / RETAIN_MANIFEST_FILENAME
+    manifest_path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
@@ -35,6 +36,7 @@ def _write_retained_tree(root: Path) -> None:
         ),
         encoding="utf-8",
     )
+    manifest_path.chmod(0o600)
 
 
 def test_export_retained_artifacts_replaces_destination_with_manifest_only(
@@ -92,6 +94,15 @@ def test_manifest_rejects_hardlinked_files(tmp_path: Path) -> None:
         load_retain_manifest(source)
 
 
+def test_manifest_rejects_group_or_world_access(tmp_path: Path) -> None:
+    source = tmp_path / "scratch"
+    _write_retained_tree(source)
+    (source / RETAIN_MANIFEST_FILENAME).chmod(0o644)
+
+    with pytest.raises(RetentionError, match="group/world accessible"):
+        load_retain_manifest(source)
+
+
 def test_manifest_rejects_nonportable_support_file(tmp_path: Path) -> None:
     source = tmp_path / "scratch"
     _write_retained_tree(source)
@@ -105,6 +116,20 @@ def test_manifest_rejects_nonportable_support_file(tmp_path: Path) -> None:
 
     with pytest.raises(RetentionError, match="references disposable"):
         load_retain_manifest(source)
+
+
+def test_manifest_allows_bounded_binary_reproduction_input(tmp_path: Path) -> None:
+    source = tmp_path / "scratch"
+    _write_retained_tree(source)
+    (source / "state.sav").write_bytes(b"\0binary-state")
+    manifest_path = source / RETAIN_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].append({"path": "state.sav", "role": "input"})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = load_retain_manifest(source)
+
+    assert any(item.path == "state.sav" for item in loaded.files)
 
 
 def test_manifest_allows_historical_disposable_path_in_report(tmp_path: Path) -> None:

@@ -43,6 +43,7 @@ _LEGACY_ENTRYPOINT_NAMES = frozenset(
 
 _DISPOSABLE_COMPONENTS = DISPOSABLE_DIRECTORY_NAMES | {
     ".git",
+    "obj",
     "qemu-worktree",
     "repro-worktree",
 }
@@ -60,6 +61,7 @@ _SUPPORT_SUFFIXES = frozenset(
         ".h",
         ".ini",
         ".json",
+        ".ovf",
         ".patch",
         ".rs",
         ".toml",
@@ -67,6 +69,7 @@ _SUPPORT_SUFFIXES = frozenset(
         ".yml",
     }
 )
+_INPUT_SUFFIXES = frozenset({".mig", ".sav", ".vhd", ".vhdx", ".vmdk"})
 _SUPPORT_NAMES = frozenset(
     {
         "Cargo.lock",
@@ -82,7 +85,6 @@ _DISCLOSURE_NAMES = frozenset({"disclosure.zip", "email.txt"})
 _REFERENCE_MARKERS = (
     ".poc-worktree",
     "/toolchain/",
-    "/target/debug/",
     "/build-asan/",
     "/build-debug/",
     "/build-release/",
@@ -124,6 +126,13 @@ def _candidate_role(relative_path: str) -> str | None:
         return "disclosure"
     if suffix in _SCRIPT_SUFFIXES:
         return "script"
+    if suffix in _INPUT_SUFFIXES:
+        return "input"
+    if any(
+        part.lower() in {"evidence", "poc-output"}
+        for part in path.parts[:-1]
+    ):
+        return "evidence"
     if suffix in _SUPPORT_SUFFIXES or name in _SUPPORT_NAMES:
         return "support"
     return None
@@ -152,6 +161,19 @@ def _walk_files(root: Path) -> Iterator[tuple[str, Path, os.stat_result]]:
                 continue
             relative_path = path.relative_to(root).as_posix()
             yield relative_path, path, file_stat
+
+
+def _has_artifact_content(root: Path) -> bool:
+    """Return whether a historical artifact directory contains any entry."""
+    try:
+        next(root.iterdir())
+    except StopIteration:
+        return False
+    except OSError:
+        # Let the normal planner surface unreadable content instead of silently
+        # dropping an artifact from the migration inventory.
+        return True
+    return True
 
 
 def _inode_key(file_stat: os.stat_result) -> tuple[int, int]:
@@ -357,6 +379,115 @@ def _active_output_dirs(db_path: str | os.PathLike[str] | None) -> tuple[set[str
     }, ""
 
 
+def _poc_status_inventory(
+    db_path: str | os.PathLike[str] | None,
+) -> tuple[dict[tuple[str, str], set[str]] | None, str]:
+    if not db_path:
+        return None, "database path was not supplied"
+    resolved = Path(db_path).expanduser().resolve()
+    if not resolved.is_file():
+        return None, f"database is missing: {resolved}"
+    try:
+        connection = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if not {"pocs", "runs"}.issubset(tables):
+                return None, "database does not contain PoC status history"
+            rows = connection.execute(
+                """
+                SELECT r.output_dir, p.vuln_id, p.status
+                FROM pocs p JOIN runs r ON r.id = p.run_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return None, f"cannot read PoC status history: {exc}"
+
+    statuses: dict[tuple[str, str], set[str]] = {}
+    for output_dir, vuln_id, poc_status in rows:
+        if not output_dir or not vuln_id or not poc_status:
+            continue
+        key = (
+            os.path.realpath(os.path.expanduser(str(output_dir))),
+            str(vuln_id),
+        )
+        statuses.setdefault(key, set()).add(str(poc_status))
+    return statuses, ""
+
+
+def _apply_poc_status_gate(
+    artifact: dict[str, Any],
+    *,
+    output: Path,
+    vuln_id: str,
+    statuses: dict[tuple[str, str], set[str]] | None,
+) -> None:
+    artifact["vuln_id"] = vuln_id
+    known = (
+        sorted(statuses.get((str(output), vuln_id), set()))
+        if statuses is not None
+        else []
+    )
+    artifact["poc_statuses"] = known
+    artifact["migration_required"] = True
+    artifact["migration_state"] = "required"
+    if statuses is None:
+        artifact["poc_status_gate"] = "unavailable"
+        return
+    artifact["poc_status_gate"] = "verified"
+    if "reproduced" in known:
+        return
+    if known:
+        artifact["migration_required"] = False
+        artifact["migration_state"] = "exempt-not-reproduced"
+        artifact["ignored_blockers"] = artifact["blockers"]
+        artifact["blockers"] = []
+        artifact["ready"] = True
+        artifact["manifest_action"] = "none"
+        return
+    artifact["migration_state"] = "blocked-unmapped-poc-status"
+    artifact["ready"] = False
+    artifact["blockers"].append({"type": "poc_status_unmapped"})
+
+
+def _apply_stage5_supersession(artifacts: list[dict[str, Any]]) -> None:
+    retained_stage6 = {
+        str(artifact["vuln_id"]): artifact
+        for artifact in artifacts
+        if artifact["kind"] == "stage6"
+        and artifact.get("poc_status_gate") == "verified"
+        and "reproduced" in artifact.get("poc_statuses", [])
+        and artifact.get("migration_required", True)
+        and artifact["ready"]
+        and artifact["existing_manifest"].get("state") == "valid"
+    }
+    for artifact in artifacts:
+        if (
+            artifact["kind"] != "stage5"
+            or not artifact.get("migration_required", True)
+            or artifact["ready"]
+            or artifact.get("poc_status_gate") != "verified"
+            or "reproduced" not in artifact.get("poc_statuses", [])
+        ):
+            continue
+        replacement = retained_stage6.get(str(artifact["vuln_id"]))
+        if replacement is None:
+            continue
+        artifact["migration_required"] = False
+        artifact["migration_state"] = "superseded-by-stage6"
+        artifact["superseded_by"] = replacement["path"]
+        artifact["ignored_blockers"] = artifact["blockers"]
+        artifact["blockers"] = []
+        artifact["ready"] = True
+        artifact["manifest_action"] = "none"
+
+
 def build_retention_migration_report(
     results_root: str | os.PathLike[str],
     *,
@@ -374,9 +505,13 @@ def build_retention_migration_report(
 
     active_outputs, database_warning = _active_output_dirs(db_path)
     database_verified = not database_warning
+    poc_statuses, poc_status_warning = _poc_status_inventory(db_path)
     output_plans: list[dict[str, Any]] = []
     total_artifacts = 0
     ready_artifacts = 0
+    required_artifacts = 0
+    exempt_artifacts = 0
+    superseded_artifacts = 0
     reclaimable_bytes = 0
     disposable_bytes = 0
 
@@ -385,8 +520,19 @@ def build_retention_migration_report(
         stage5 = output / "stage5-pocs"
         if stage5.is_dir() and not stage5.is_symlink():
             for poc_dir in sorted(stage5.iterdir(), key=lambda path: path.name):
-                if poc_dir.is_dir() and not poc_dir.is_symlink():
-                    artifacts.append(_plan_artifact(poc_dir, kind="stage5"))
+                if (
+                    poc_dir.is_dir()
+                    and not poc_dir.is_symlink()
+                    and _has_artifact_content(poc_dir)
+                ):
+                    plan = _plan_artifact(poc_dir, kind="stage5")
+                    _apply_poc_status_gate(
+                        plan,
+                        output=output,
+                        vuln_id=poc_dir.name.removesuffix("_fp"),
+                        statuses=poc_statuses,
+                    )
+                    artifacts.append(plan)
 
         stage6 = output / "stage6-disclosures"
         stage6_disposable_paths: list[dict[str, Any]] = []
@@ -395,8 +541,18 @@ def build_retention_migration_report(
                 if not vuln_dir.is_dir() or vuln_dir.is_symlink():
                     continue
                 disclosure = vuln_dir / "disclosure"
-                if disclosure.is_dir() and not disclosure.is_symlink():
+                if (
+                    disclosure.is_dir()
+                    and not disclosure.is_symlink()
+                    and _has_artifact_content(disclosure)
+                ):
                     plan = _plan_artifact(disclosure, kind="stage6")
+                    _apply_poc_status_gate(
+                        plan,
+                        output=output,
+                        vuln_id=vuln_dir.name.removesuffix("_fp"),
+                        statuses=poc_statuses,
+                    )
                     artifacts.append(plan)
                 for child in sorted(vuln_dir.iterdir(), key=lambda path: path.name):
                     if child == disclosure or child.is_symlink():
@@ -415,6 +571,8 @@ def build_retention_migration_report(
                                 "allocated_bytes": size,
                             }
                         )
+
+        _apply_stage5_supersession(artifacts)
 
         disposable_roots: list[dict[str, Any]] = []
         for name in (".poc-worktree", "toolchain"):
@@ -442,7 +600,8 @@ def build_retention_migration_report(
         if not disposable_blocker and not artifacts:
             disposable_blocker = "no_retained_artifacts"
         if not disposable_blocker and any(
-            not artifact["ready"] for artifact in artifacts
+            artifact["migration_required"] and not artifact["ready"]
+            for artifact in artifacts
         ):
             disposable_blocker = "artifact_migration_blocked"
         for disposable in disposable_roots:
@@ -450,14 +609,31 @@ def build_retention_migration_report(
             if disposable_blocker:
                 disposable["blocker"] = disposable_blocker
         total_artifacts += len(artifacts)
-        ready_artifacts += sum(1 for artifact in artifacts if artifact["ready"])
+        required_artifacts += sum(
+            1 for artifact in artifacts if artifact["migration_required"]
+        )
+        exempt_artifacts += sum(
+            1
+            for artifact in artifacts
+            if artifact.get("migration_state") == "exempt-not-reproduced"
+        )
+        superseded_artifacts += sum(
+            1
+            for artifact in artifacts
+            if artifact.get("migration_state") == "superseded-by-stage6"
+        )
+        ready_artifacts += sum(
+            1
+            for artifact in artifacts
+            if artifact["migration_required"] and artifact["ready"]
+        )
         artifact_reclaim = sum(
             artifact["estimated_reclaimable_bytes"] for artifact in artifacts
         )
         ready_artifact_reclaim = sum(
             artifact["estimated_reclaimable_bytes"]
             for artifact in artifacts
-            if artifact["ready"]
+            if artifact["migration_required"] and artifact["ready"]
         )
         output_disposable_bytes = sum(
             item["allocated_bytes"] for item in disposable_roots
@@ -500,12 +676,17 @@ def build_retention_migration_report(
             "verified": database_verified,
             "warning": database_warning,
             "active_output_count": len(active_outputs),
+            "poc_status_gate_verified": poc_statuses is not None,
+            "poc_status_warning": poc_status_warning,
         },
         "summary": {
             "output_count": len(output_plans),
             "artifact_count": total_artifacts,
+            "migration_required_artifact_count": required_artifacts,
+            "exempt_not_reproduced_artifact_count": exempt_artifacts,
+            "superseded_stage5_artifact_count": superseded_artifacts,
             "ready_artifact_count": ready_artifacts,
-            "blocked_artifact_count": total_artifacts - ready_artifacts,
+            "blocked_artifact_count": required_artifacts - ready_artifacts,
             "estimated_artifact_reclaimable_bytes": reclaimable_bytes,
             "disposable_root_bytes": disposable_bytes,
             "unregistered_leftover_bytes": leftover_bytes,
@@ -556,6 +737,13 @@ def _atomic_write_manifest(root: Path, manifest: dict[str, Any]) -> None:
 
 
 def _entrypoint_wrapper(legacy_name: str) -> bytes:
+    return _entrypoint_wrapper_with_interpreter(legacy_name, None)
+
+
+def _entrypoint_wrapper_with_interpreter(
+    legacy_name: str,
+    interpreter: str | None,
+) -> bytes:
     path = PurePosixPath(legacy_name)
     if (
         path.is_absolute()
@@ -563,12 +751,36 @@ def _entrypoint_wrapper(legacy_name: str) -> bytes:
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
         raise RetentionMigrationError(f"unsafe legacy entrypoint path: {legacy_name}")
+    if interpreter is not None and interpreter not in {
+        "bash",
+        "node",
+        "perl",
+        "python3",
+        "ruby",
+        "sh",
+    }:
+        raise RetentionMigrationError(
+            f"unsupported legacy entrypoint interpreter: {interpreter}"
+        )
+    invocation = (
+        f'{interpreter} "$SCRIPT_DIR/{legacy_name}"'
+        if interpreter
+        else f'"$SCRIPT_DIR/{legacy_name}"'
+    )
     return (
         "#!/bin/sh\n"
         "set -eu\n"
         'SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
-        f'exec "$SCRIPT_DIR/{legacy_name}" "$@"\n'
+        f'exec {invocation} "$@"\n'
     ).encode("utf-8")
+
+
+def _supported_shebang_interpreter(content: bytes) -> str | None:
+    first_line = content.splitlines()[0].decode("utf-8", errors="replace")
+    for interpreter in ("python3", "bash", "node", "perl", "ruby", "sh"):
+        if re.search(rf"(?:^|[/\s]){interpreter}(?:\s|$)", first_line):
+            return interpreter
+    return None
 
 
 def _entrypoint_file_metadata(
@@ -606,6 +818,11 @@ def _entrypoint_file_metadata(
             content = path.read_bytes()
             item["sha256"] = hashlib.sha256(content).hexdigest()
             item["has_shebang"] = content.startswith(b"#!")
+            item["interpreter"] = (
+                _supported_shebang_interpreter(content)
+                if item["has_shebang"]
+                else None
+            )
         except OSError as exc:
             item["safe"] = False
             item["error"] = str(exc)
@@ -645,6 +862,24 @@ def _legacy_entrypoint_metadata(
     if candidates:
         return candidates
 
+    nested_recognized = sorted(
+        {
+            str(item["path"])
+            for item in candidate_files
+            if item.get("role") == "script"
+            and PurePosixPath(str(item["path"])).name.lower()
+            in _LEGACY_ENTRYPOINT_NAMES
+        }
+    )
+    if len(nested_recognized) == 1:
+        return [
+            _entrypoint_file_metadata(
+                root,
+                nested_recognized[0],
+                source="recognized-nested-name",
+            )
+        ]
+
     try:
         report = (root / "report.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -658,12 +893,29 @@ def _legacy_entrypoint_metadata(
             and _report_references_script(report, str(item["path"]))
         }
     )
+    if not referenced_paths:
+        script_paths = sorted(
+            {
+                str(item["path"])
+                for item in candidate_files
+                if item.get("role") == "script"
+            }
+        )
+        if len(script_paths) == 1 and _looks_like_reproduction_script(
+            script_paths[0]
+        ):
+            referenced_paths = script_paths
+            source = "unique-reproduction-script"
+        else:
+            source = "report-invocation"
+    else:
+        source = "report-invocation"
     for relative_path in referenced_paths:
         candidates.append(
             _entrypoint_file_metadata(
                 root,
                 relative_path,
-                source="report-invocation",
+                source=source,
             )
         )
     return candidates
@@ -701,6 +953,8 @@ def build_retention_entrypoint_repair_report(
 
     for output in migration["outputs"]:
         for artifact in output["artifacts"]:
+            if not artifact.get("migration_required", True):
+                continue
             blocker_types = {
                 str(blocker["type"]) for blocker in artifact["blockers"]
             }
@@ -761,7 +1015,9 @@ def build_retention_entrypoint_repair_report(
                             "recommended_fix": "replace it with a regular non-hardlinked file",
                         }
                     )
-                elif not candidate.get("executable"):
+                elif not candidate.get("executable") and not candidate.get(
+                    "interpreter"
+                ):
                     repair_blockers.append(
                         {
                             "type": "legacy_entrypoint_not_executable",
@@ -793,7 +1049,18 @@ def build_retention_entrypoint_repair_report(
                 )
 
             if len(legacy) == 1:
-                wrapper_size = len(_entrypoint_wrapper(legacy[0]["name"]))
+                interpreter = (
+                    str(legacy[0]["interpreter"])
+                    if not legacy[0].get("executable")
+                    and legacy[0].get("interpreter")
+                    else None
+                )
+                wrapper_size = len(
+                    _entrypoint_wrapper_with_interpreter(
+                        legacy[0]["name"],
+                        interpreter,
+                    )
+                )
                 if len(artifact["candidate_files"]) + 1 > MAX_RETAIN_FILES:
                     repair_blockers.append(
                         {"type": "wrapper_would_exceed_file_limit"}
@@ -846,10 +1113,15 @@ def build_retention_entrypoint_repair_report(
     }
 
 
-def _atomic_create_entrypoint(root: Path, legacy_name: str) -> None:
+def _atomic_create_entrypoint(
+    root: Path,
+    legacy_name: str,
+    *,
+    interpreter: str | None = None,
+) -> None:
     destination = root / "reproduce.sh"
     pending = root / f".reproduce.sh.pending-{uuid4().hex}"
-    payload = _entrypoint_wrapper(legacy_name)
+    payload = _entrypoint_wrapper_with_interpreter(legacy_name, interpreter)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -916,8 +1188,18 @@ def apply_retention_entrypoint_repairs(
                 f"canonical entrypoint appeared while planning repair: {root}"
             )
         legacy_name = str(current_legacy[0]["name"])
+        interpreter = (
+            str(current_legacy[0]["interpreter"])
+            if not current_legacy[0].get("executable")
+            and current_legacy[0].get("interpreter")
+            else None
+        )
         try:
-            _atomic_create_entrypoint(root, legacy_name)
+            _atomic_create_entrypoint(
+                root,
+                legacy_name,
+                interpreter=interpreter,
+            )
             current = _plan_artifact(root, kind=repair["kind"])
         except OSError as exc:
             raise RetentionMigrationError(
@@ -961,7 +1243,11 @@ def apply_retention_manifests(
     for output in initial["outputs"]:
         for artifact in output["artifacts"]:
             action = artifact["manifest_action"]
-            if not artifact["ready"] or action not in {"create", "repair"}:
+            if (
+                not artifact.get("migration_required", True)
+                or not artifact["ready"]
+                or action not in {"create", "repair"}
+            ):
                 continue
             root = Path(artifact["path"])
             current = _plan_artifact(root, kind=artifact["kind"])

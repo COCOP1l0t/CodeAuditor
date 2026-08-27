@@ -244,7 +244,8 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
         (disclosure / "email.txt").write_text("Subject: H-07\n", encoding="utf-8")
         (disclosure / "disclosure.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
         (disclosure / "temporary-build.bin").write_bytes(b"disposable")
-        (disclosure / "retain-manifest.json").write_text(
+        manifest_path = disclosure / "retain-manifest.json"
+        manifest_path.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
@@ -259,6 +260,7 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
             ),
             encoding="utf-8",
         )
+        manifest_path.chmod(0o600)
         return "done"
 
     monkeypatch.setattr(stage6, "DockerScratch", FakeScratch)

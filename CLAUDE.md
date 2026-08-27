@@ -6,7 +6,7 @@ Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target
 
 - **Language**: Python >=3.12
 - **Package manager**: pip (uses `pyproject.toml`, hatchling backend)
-- **Entry point**: `code-auditor` CLI → `code_auditor/__main__.py:main`
+- **Entry point**: `code-auditor` → Web UI via `code_auditor/__main__.py:main`
 - **Agent backends**: Claude via `claude-code-sdk`; Codex via local Codex app server SDK
 
 ## Running
@@ -15,26 +15,14 @@ Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target
 # Install (editable)
 pip install -e .
 
-# Run an audit
-code-auditor --target /path/to/project [options]
+# Start the Web UI (default mode)
+code-auditor
 
-# Required (unless --web or --repo-url)
-#   --target           Root directory of the project to audit
-#   --repo-url         Git URL cloned into ~/.code_auditor/repo/ and audited
+# Equivalent explicit form and common server options
+code-auditor --web --host 0.0.0.0 --port 8000
 
-# Common options
-#   --output-dir       Output directory (default: ~/.code_auditor/results/{repo}/audit-output-{commit})
-#   --wiki             Read-only LLM wiki knowledge base directory
-#   --max-parallel     Max concurrent agents (default: 1)
-#   --backend          Agent backend: claude | codex (default: claude)
-#   --model            Model override (Claude default: claude-sonnet-4-6; Codex default: gpt-5.4)
-#   --target-au-count  Target number of analysis units for stage 2 (default: -1 = no ceiling)
-#   --tui              Launch the interactive TUI dashboard
-#   --web              Launch the web UI (server settings: ~/.code_auditor/settings.json)
-#   --host             Web UI bind host (default: 127.0.0.1)
-#   --port             Web UI bind port (default: 8000)
-#   --db               Audit history SQLite DB (default: ~/.code_auditor/audits.db)
-#   --log-level        DEBUG|INFO|WARNING|ERROR (default: INFO)
+# Audit settings live in ~/.code_auditor/settings.json and the Web UI.
+# Historical retention/cleanup commands remain available via --help.
 ```
 
 ## Testing
@@ -43,7 +31,7 @@ code-auditor --target /path/to/project [options]
 pytest -q
 ```
 
-Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and validators only, no agent calls.
+Tests are under `code_auditor/tests/`; they do not make real agent calls.
 
 ## Architecture (7 stages)
 
@@ -66,7 +54,7 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 - **Model resolution**: The model id is resolved fresh on every agent call — explicit per-call model > local `~/.claude/settings.json` (`env.ANTHROPIC_MODEL`, PoC stages prefer `ANTHROPIC_DEFAULT_OPUS_MODEL`) > stored config value > built-in default (`config.resolve_agent_model` / `select_poc_model`). Models actually used accumulate in `config.models_used` and are persisted to the run's `models_used` column for the Web UI.
 - **Usage accounting**: Every agent invocation's token usage and dollar cost (Claude `ResultMessage`, Codex `tokenUsage` events) accumulate in `config.usage_stats` via `utils.record_agent_usage()` and are persisted to the run's `usage_stats` JSON column; shown in Web History and the run detail page.
 - **PoC worktree isolation**: Stage 5/6 agents run in a detached worktree (`{output}/.poc-worktree`, created by `repos.ensure_poc_worktree()`) so the shared repo mirror stays clean; web resume auto-stashes leftover mirror changes from older runs instead of failing on a dirty checkout
-- **Checkpoint/resume**: `.markers/` directory tracks completed sub-tasks; `--resume` skips them
+- **Checkpoint/resume**: `.markers/` tracks completed sub-tasks; Web resume reuses them
 - **Parallel agents**: `utils.run_parallel_limited()` uses `asyncio.Semaphore` + `gather`
 - **Output dir layout**: `{output}/stage{1-security-context,2-analysis-units,3-findings,4-vulnerabilities,5-pocs,6-disclosures}/`, `.markers/`
 - **Web settings boundary**: backend/model/log level, managed paths, and `max_concurrent_jobs` come only from `~/.code_auditor/settings.json`; browser requests cannot override them
@@ -80,7 +68,7 @@ Tests are in `code_auditor/tests/test_parsers_and_report.py` — parsers and val
 
 ```
 code_auditor/
-├── __main__.py          # CLI (argparse) → asyncio.run(run_audit)
+├── __main__.py          # Web server and maintenance-command entry point
 ├── config.py            # AuditConfig, AnalysisUnit, ValidationIssue dataclasses
 ├── disclosures.py       # Stable Disclosure identity + email metadata helpers
 ├── db.py                # SQLite audit history: AuditStore, schema, output-dir scanner,
@@ -95,10 +83,10 @@ code_auditor/
 ├── stages/              # stage0–stage6 (one file per stage)
 ├── parsing/             # stage2.py — extract structured data from agent output
 ├── validation/          # common.py + stage1–stage6 — validate agent output format
-├── web/                 # FastAPI web UI (--web): server.py endpoints, job.py multi-job
+├── web/                 # FastAPI Web UI: server.py endpoints, job.py multi-job
 │                        #   registry (per-job EventBus, same-repo mutex, concurrency cap),
-│                        #   progress.py EventBus/SSE + ContextVar log routing + duck-typed
-│                        #   tui reporter, static/ vanilla-JS page
+│                        #   progress.py EventBus/SSE + ContextVar log routing + progress
+│                        #   reporter, static/ vanilla-JS page
 └── tests/
 prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
 ```

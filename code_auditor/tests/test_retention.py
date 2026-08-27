@@ -64,6 +64,28 @@ def test_export_retained_artifacts_replaces_destination_with_manifest_only(
     assert not (destination / "build").exists()
 
 
+def test_export_retained_artifacts_compacts_source_in_place(tmp_path: Path) -> None:
+    artifact = tmp_path / "H-01"
+    _write_retained_tree(artifact)
+
+    manifest = export_retained_artifacts(
+        artifact,
+        artifact,
+        required_paths=("reproduce.sh", "report.md"),
+    )
+
+    assert manifest.entrypoint == "reproduce.sh"
+    assert sorted(path.name for path in artifact.iterdir()) == [
+        "report.md",
+        "reproduce.sh",
+        RETAIN_MANIFEST_FILENAME,
+    ]
+    assert load_retain_manifest(
+        artifact,
+        required_paths=("reproduce.sh", "report.md"),
+    ) == manifest
+
+
 @pytest.mark.parametrize(
     "bad_script",
     [

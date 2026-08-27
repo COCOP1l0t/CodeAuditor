@@ -27,7 +27,7 @@ Outputs are validated and checkpointed between stages. Stage 1's project-specifi
 ## Requirements
 
 - Python **3.12+**
-- Git and a working Docker Engine
+- Git; Docker Engine is required only for Docker sandbox modes
 - [Claude Code](https://docs.claude.com/en/docs/claude-code), or a Codex CLI with `codex app-server` support; select the backend in Web settings
 
 ## Installation
@@ -60,9 +60,9 @@ Web server options:
 | `--host` | Bind address; default `0.0.0.0` |
 | `--port` | Listen port; default `8000` |
 
-Audit parameters such as repository, Wiki, backend, model, parallelism, and output paths are managed in the Web UI and `~/.code_auditor/settings.json`. Run `code-auditor --help` for maintenance commands.
+Audit parameters such as repository, Wiki, backend, model, sandbox mode, parallelism, and output paths are managed in the Web UI and `~/.code_auditor/settings.json`. Run `code-auditor --help` for maintenance commands.
 
-Stage 5 and 6 use a disposable Docker sandbox by default. Build its image once before an audit reaches reproduction:
+Stage 5 and 6 can use a networked Docker sandbox, a network-isolated Docker sandbox, or a local detached worktree. The Web settings enable Docker choices only after the server passes its Docker, image, disk-space, and Agent runtime checks. Docker is the default; build its image once before an audit reaches reproduction:
 
 ```bash
 docker build -f docker/code-auditor-sandbox.Dockerfile \

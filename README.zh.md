@@ -27,7 +27,7 @@ CodeAuditor 已帮助多个常用开源项目发现 CVE，详见[已发现漏洞
 ## 环境要求
 
 - Python **3.12+**
-- Git 和可用的 Docker Engine
+- Git；仅 Docker 沙箱模式需要可用的 Docker Engine
 - [Claude Code](https://docs.claude.com/en/docs/claude-code)，或支持 `codex app-server` 的 Codex CLI；后端在 Web 设置中选择
 
 ## 安装
@@ -60,9 +60,9 @@ Web 服务选项：
 | `--host` | 绑定地址；默认 `0.0.0.0` |
 | `--port` | 监听端口；默认 `8000` |
 
-仓库、Wiki、后端、模型、并行度和输出路径等审计参数统一由 Web 界面和 `~/.code_auditor/settings.json` 管理。维护命令请查看 `code-auditor --help`。
+仓库、Wiki、后端、模型、沙箱模式、并行度和输出路径等审计参数统一由 Web 界面和 `~/.code_auditor/settings.json` 管理。维护命令请查看 `code-auditor --help`。
 
-阶段 5 和 6 默认使用临时 Docker 沙箱。审计进入复现阶段前，先构建一次镜像：
+阶段 5 和 6 可选择联网 Docker 沙箱、断网 Docker 沙箱或宿主机独立 worktree。Web 设置只有在服务端通过 Docker、镜像、磁盘空间和 Agent 运行时检查后，才会启用 Docker 选项。Docker 是默认模式；审计进入复现阶段前，先构建一次镜像：
 
 ```bash
 docker build -f docker/code-auditor-sandbox.Dockerfile \

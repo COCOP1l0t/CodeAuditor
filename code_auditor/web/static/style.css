@@ -1661,6 +1661,11 @@ th[aria-sort="descending"] .sort-button::after {
   margin-top: 1rem;
 }
 
+#s-custom-fields[hidden],
+#s-clear-key-label[hidden] {
+  display: none;
+}
+
 .settings-wide-field {
   grid-column: 1 / -1;
 }
@@ -1690,6 +1695,84 @@ th[aria-sort="descending"] .sort-button::after {
   width: 16px;
   height: 16px;
   margin: 0;
+}
+
+.settings-sandbox {
+  margin: 1rem 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-sandbox legend {
+  margin-bottom: 0.55rem;
+  color: var(--fg);
+  font-size: 0.85rem;
+  font-weight: 620;
+}
+
+.settings-radio-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.settings-radio-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  color: var(--fg);
+  background: var(--inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.settings-radio-option:has(input:checked) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(88, 214, 235, 0.12);
+}
+
+.settings-radio-option.is-unavailable {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.settings-radio-option input {
+  width: 16px;
+  height: 16px;
+  min-height: auto;
+  margin: 0.15rem 0 0;
+  padding: 0;
+}
+
+.settings-radio-option span,
+.settings-radio-option strong,
+.settings-radio-option small {
+  display: block;
+}
+
+.settings-radio-option small {
+  margin-top: 0.25rem;
+  color: var(--dim);
+  font-size: 0.77rem;
+  line-height: 1.35;
+}
+
+.settings-sandbox-status {
+  min-height: 1.25rem;
+  margin: 0.55rem 0 0;
+  color: var(--dim);
+  font-size: 0.8rem;
+}
+
+.settings-sandbox-status[data-state="ready"] {
+  color: var(--ok);
+}
+
+.settings-sandbox-status[data-state="unavailable"] {
+  color: var(--warn);
 }
 
 #trigger-graph-dialog {
@@ -2453,6 +2536,10 @@ body.terminal-resizing {
 
   .settings-wide-field {
     grid-column: auto;
+  }
+
+  .settings-radio-list {
+    grid-template-columns: 1fr;
   }
 
   #terminal-dock {

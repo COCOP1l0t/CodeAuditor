@@ -143,13 +143,33 @@ function agentBackendLabel(backend) {
   return backend === "codex" ? "Codex SDK" : "Claude Agent SDK";
 }
 
+function sandboxModeLabel(mode) {
+  if (mode === "docker-isolated") return "Docker sandbox · offline";
+  if (mode === "local-worktree") return "local worktree · no sandbox";
+  return "Docker sandbox · networked";
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "unknown";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let scaled = value;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${scaled.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
 function updateAgentSettingsSummary() {
   if (!agentSettings) return;
   const backend = agentSettings.backend || "claude";
   const provider = (agentSettings.providers || {})[backend] || {};
-  const summary = provider.mode === "custom"
+  const providerSummary = provider.mode === "custom"
     ? `${agentBackendLabel(backend)} · ${provider.model || "custom provider"}`
     : `${agentBackendLabel(backend)} · local CLI configuration`;
+  const summary = `${providerSummary} · ${sandboxModeLabel(agentSettings.sandbox_mode)}`;
   $("agent-settings-summary").textContent = summary;
   $("f-agent-summary").textContent = summary;
 }
@@ -181,7 +201,54 @@ function renderAgentSettingsForm() {
   $("s-api-key").placeholder = provider.api_key_configured
     ? "Stored key (leave blank to keep)"
     : "Enter API key";
+  const sandboxMode = agentSettings.sandbox_mode || "docker-networked";
+  for (const input of document.querySelectorAll('input[name="sandbox-mode"]')) {
+    input.checked = input.value === sandboxMode;
+  }
   updateAgentSettingsMode();
+  void loadSandboxCapability(backend);
+}
+
+let sandboxCapabilityRequest = 0;
+
+function setDockerSandboxOptionsAvailable(available) {
+  for (const mode of ["docker-networked", "docker-isolated"]) {
+    const input = document.querySelector(
+      `input[name="sandbox-mode"][value="${mode}"]`
+    );
+    const option = document.querySelector(`[data-sandbox-option="${mode}"]`);
+    input.disabled = !available;
+    option.classList.toggle("is-unavailable", !available);
+  }
+}
+
+async function loadSandboxCapability(backend) {
+  const request = ++sandboxCapabilityRequest;
+  setDockerSandboxOptionsAvailable(false);
+  $("s-sandbox-status").dataset.state = "checking";
+  $("s-sandbox-status").textContent =
+    "Checking Docker, image, scratch disk, and Agent runtime on this server…";
+  try {
+    const res = await fetch(
+      `/api/sandbox/capability?backend=${encodeURIComponent(backend)}`,
+      { cache: "no-store" }
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    if (request !== sandboxCapabilityRequest) return;
+    const docker = data.docker || {};
+    setDockerSandboxOptionsAvailable(docker.available === true);
+    $("s-sandbox-status").dataset.state = docker.available ? "ready" : "unavailable";
+    $("s-sandbox-status").textContent = docker.available
+      ? `${docker.reason} Free scratch space: ${formatBytes(docker.free_bytes || 0)}.`
+      : `Docker sandbox unavailable: ${docker.reason || "environment check failed"}`;
+  } catch (error) {
+    if (request !== sandboxCapabilityRequest) return;
+    setDockerSandboxOptionsAvailable(false);
+    $("s-sandbox-status").dataset.state = "unavailable";
+    $("s-sandbox-status").textContent =
+      `Docker sandbox check failed: ${error.message || error}`;
+  }
 }
 
 function updateAgentSettingsMode() {
@@ -228,6 +295,12 @@ $("settings-form").addEventListener("submit", async (event) => {
     model: $("s-model").value.trim(),
     clear_api_key: $("s-clear-key").checked,
   };
+  const sandboxMode = document.querySelector('input[name="sandbox-mode"]:checked');
+  if (!sandboxMode || sandboxMode.disabled) {
+    errorBox.textContent = "Select an available Stage 5/6 execution mode.";
+    return;
+  }
+  body.sandbox_mode = sandboxMode.value;
   const apiKey = $("s-api-key").value;
   if (apiKey) body.api_key = apiKey;
   saveButton.disabled = true;

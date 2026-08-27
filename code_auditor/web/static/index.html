@@ -53,17 +53,17 @@
   <header id="workspace-toolbar">
     <span id="agent-settings-summary" class="agent-settings-summary">Loading LLM backend…</span>
     <button type="button" id="btn-settings" class="btn workspace-settings-button"
-            aria-haspopup="dialog" aria-controls="settings-dialog" title="Configure LLM backend">
+            aria-haspopup="dialog" aria-controls="settings-dialog" title="Configure runtime settings">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
-      <span>LLM Settings</span>
+      <span>Settings</span>
     </button>
   </header>
   <main id="content-pane">
     <dialog id="settings-dialog" aria-labelledby="settings-title">
       <form id="settings-form">
-        <h2 id="settings-title">LLM backend settings</h2>
+        <h2 id="settings-title">Agent and sandbox settings</h2>
         <p class="dim settings-intro">
-          Choose an Agent SDK and use its local CLI configuration, or provide a compatible API endpoint. Active jobs switch on their next agent call; calls already in flight finish with their existing backend snapshot.
+          Choose an Agent SDK and use its local CLI configuration, or provide a compatible API endpoint. Active jobs switch on their next agent call; calls already in flight finish with their existing backend snapshot. Sandbox changes apply to newly started or resumed jobs.
         </p>
         <div class="form-grid settings-grid">
           <label>
@@ -104,6 +104,35 @@
             Remove the stored API key
           </label>
         </div>
+        <fieldset class="settings-sandbox">
+          <legend>Stage 5/6 execution</legend>
+          <div class="settings-radio-list">
+            <label class="settings-radio-option" data-sandbox-option="docker-networked">
+              <input type="radio" name="sandbox-mode" value="docker-networked" required />
+              <span>
+                <strong>Docker sandbox with network</strong>
+                <small>Disposable workspace with Docker bridge networking for build dependencies.</small>
+              </span>
+            </label>
+            <label class="settings-radio-option" data-sandbox-option="docker-isolated">
+              <input type="radio" name="sandbox-mode" value="docker-isolated" required />
+              <span>
+                <strong>Docker sandbox without network</strong>
+                <small>The same disposable workspace with container networking disabled.</small>
+              </span>
+            </label>
+            <label class="settings-radio-option" data-sandbox-option="local-worktree">
+              <input type="radio" name="sandbox-mode" value="local-worktree" required />
+              <span>
+                <strong>Local worktree</strong>
+                <small>Run on the server host in a detached Git worktree, without Docker isolation.</small>
+              </span>
+            </label>
+          </div>
+          <p id="s-sandbox-status" class="settings-sandbox-status" aria-live="polite">
+            Checking this server environment…
+          </p>
+        </fieldset>
         <p id="settings-error" class="error" role="alert"></p>
         <div class="button-row">
           <button type="submit" id="btn-settings-save" class="btn btn-start">Save settings</button>
@@ -149,7 +178,8 @@
           </label>
         </div>
         <p class="hint">
-          New jobs and subsequent calls in active jobs use <strong id="f-agent-summary">the selected LLM backend</strong>.
+          New jobs use <strong id="f-agent-summary">the selected Agent and sandbox settings</strong>.
+          Active jobs adopt backend/provider changes on later Agent calls, but keep their existing sandbox mode.
           Settings, DEBUG logging, output roots, and the Discovered registry are
           loaded from <code id="f-config-path">~/.code_auditor/settings.json</code>.
         </p>

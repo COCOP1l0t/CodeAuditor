@@ -11,9 +11,11 @@ from code_auditor.sandbox import (
     DOCKER_CWD_ENV,
     DOCKER_SPEC_ENV,
     DockerSandboxError,
+    DockerScratch,
     _locate_codex_vendor,
     _require_tmp_root,
     docker_cli_command,
+    inspect_docker_sandbox_environment,
 )
 from code_auditor.config import AuditConfig
 
@@ -28,6 +30,57 @@ def test_sandbox_root_must_be_a_dedicated_tmp_directory() -> None:
         _require_tmp_root("/tmp")
     with pytest.raises(DockerSandboxError, match="under /tmp"):
         _require_tmp_root("/var/tmp/code-auditor")
+
+
+def test_sandbox_capability_checks_runtime_storage_and_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from code_auditor import sandbox as sandbox_module
+
+    monkeypatch.setattr(DockerScratch, "_verify_runtime", lambda _self: None)
+    monkeypatch.setattr(sandbox_module, "_locate_claude_cli", lambda: Path("/cli"))
+    monkeypatch.setattr(
+        sandbox_module.shutil,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": 0})(),
+    )
+
+    capability = inspect_docker_sandbox_environment("claude")
+
+    assert capability.available is False
+    assert "at least" in capability.reason
+
+
+def test_sandbox_capability_reports_ready_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from code_auditor import sandbox as sandbox_module
+
+    free_bytes = 16 * 1024 * 1024 * 1024
+    monkeypatch.setattr(DockerScratch, "_verify_runtime", lambda _self: None)
+    monkeypatch.setattr(sandbox_module, "_locate_codex_vendor", lambda: Path("/vendor"))
+    monkeypatch.setattr(
+        sandbox_module.shutil,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": free_bytes})(),
+    )
+
+    capability = inspect_docker_sandbox_environment("codex")
+
+    assert capability.available is True
+    assert capability.free_bytes == free_bytes
+    assert capability.public()["image"] == "code-auditor-sandbox:latest"
+
+
+def test_sandbox_capability_reports_invalid_config_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODE_AUDITOR_SANDBOX_ROOT", "/var/tmp/code-auditor")
+
+    capability = inspect_docker_sandbox_environment("claude")
+
+    assert capability.available is False
+    assert "under /tmp" in capability.reason
 
 
 def test_codex_vendor_follows_codex_selected_from_path(

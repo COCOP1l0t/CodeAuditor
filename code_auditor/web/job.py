@@ -25,11 +25,15 @@ from uuid import uuid4
 from ..checkpoint import CheckpointManager
 from ..config import (
     DEFAULT_AGENT_TIMEOUT_SECONDS,
+    DEFAULT_SANDBOX_MODE,
     AgentBackend,
     AuditConfig,
     ProviderMode,
+    SandboxMode,
     local_claude_model,
     resolve_wiki_arg,
+    sandbox_mode_flags,
+    sandbox_mode_from_flags,
 )
 from ..db import RUN_CANCELLED, RUN_DONE, RUN_FAILED, AuditStore, compute_target_key
 from ..logger import get_logger
@@ -102,6 +106,7 @@ class AuditStartParams:
     log_level: str = "DEBUG"
     repos_dir: str = DEFAULT_REPOS_DIR
     results_dir: str = DEFAULT_RESULTS_DIR
+    sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE
 
 
 @dataclass
@@ -117,6 +122,7 @@ class ReproductionStartParams:
     output_dir: str | None = None
     reproductions_dir: str = DEFAULT_REPRODUCTIONS_DIR
     wikis_dir: str = DEFAULT_WIKIS_DIR
+    sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE
 
 
 def _safe_path_segment(value: str) -> str:
@@ -319,6 +325,14 @@ class AuditJob:
             "backend": self.config.backend if self.config else "",
             "model": self.config.model if self.config else None,
             "provider_mode": self.config.provider_mode if self.config else "",
+            "sandbox_mode": (
+                sandbox_mode_from_flags(
+                    self.config.sandbox_enabled,
+                    self.config.sandbox_network_enabled,
+                )
+                if self.config
+                else ""
+            ),
             "backends_used": list(self.config.backends_used) if self.config else [],
             "models_used": list(self.config.models_used) if self.config else [],
             "started_at": self.started_at,
@@ -452,6 +466,14 @@ class AuditJob:
             "backend": self.config.backend if self.config else "",
             "model": self.config.model if self.config else None,
             "provider_mode": self.config.provider_mode if self.config else "",
+            "sandbox_mode": (
+                sandbox_mode_from_flags(
+                    self.config.sandbox_enabled,
+                    self.config.sandbox_network_enabled,
+                )
+                if self.config
+                else ""
+            ),
             "backends_used": list(self.config.backends_used) if self.config else [],
             "models_used": list(self.config.models_used) if self.config else [],
             "usage_stats": dict(self.config.usage_stats) if self.config else {},
@@ -569,6 +591,9 @@ class AuditJob:
             params.output_dir
             or default_audit_output_dir(target, results_dir=params.results_dir)
         )
+        sandbox_enabled, sandbox_network_enabled = sandbox_mode_flags(
+            params.sandbox_mode
+        )
         return AuditConfig(
             target=target,
             output_dir=output_dir,
@@ -583,6 +608,8 @@ class AuditJob:
             provider_api_key=params.provider_api_key,
             target_au_count=params.target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+            sandbox_enabled=sandbox_enabled,
+            sandbox_network_enabled=sandbox_network_enabled,
             known_disclosures=tuple(
                 self.store.disclosure_dedupe_index() if self.store else ()
             ),
@@ -600,6 +627,9 @@ class AuditJob:
             params.output_dir
             or default_audit_output_dir(target, results_dir=params.results_dir)
         )
+        sandbox_enabled, sandbox_network_enabled = sandbox_mode_flags(
+            params.sandbox_mode
+        )
         return AuditConfig(
             target=target,
             output_dir=output_dir,
@@ -614,6 +644,8 @@ class AuditJob:
             provider_api_key=params.provider_api_key,
             target_au_count=params.target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+            sandbox_enabled=sandbox_enabled,
+            sandbox_network_enabled=sandbox_network_enabled,
             known_disclosures=tuple(
                 self.store.disclosure_dedupe_index() if self.store else ()
             ),
@@ -860,6 +892,9 @@ class AuditJob:
                 json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
+            sandbox_enabled, sandbox_network_enabled = sandbox_mode_flags(
+                params.sandbox_mode
+            )
             config = AuditConfig(
                 target=worktree,
                 output_dir=output_dir,
@@ -875,6 +910,8 @@ class AuditJob:
                 provider_base_url=params.provider_base_url,
                 provider_api_key=params.provider_api_key,
                 agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+                sandbox_enabled=sandbox_enabled,
+                sandbox_network_enabled=sandbox_network_enabled,
             )
             self._set_config(config)
             self.reporter.begin_stage(
@@ -1130,6 +1167,7 @@ class AuditJobManager:
         provider_base_url: str | None = None,
         provider_api_key: str | None = None,
         model: str | None = None,
+        sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE,
     ) -> AuditJob:
         """Start restoring a cancelled audit in its original output directory."""
         self._prune_finished_jobs()
@@ -1203,6 +1241,7 @@ class AuditJobManager:
                 target_au_count=target_au_count,
                 log_level=str(run.get("log_level") or "INFO"),
                 wiki=wiki_path,
+                sandbox_mode=sandbox_mode,
             )
             self._check_start_allowed(target, run_id=run_id)
             job = AuditJob(self, JOB_AUDIT)
@@ -1259,6 +1298,7 @@ class AuditJobManager:
             raise JobValidationError(
                 "The recorded Wiki is no longer available under the managed Wiki directory."
             )
+        sandbox_enabled, sandbox_network_enabled = sandbox_mode_flags(sandbox_mode)
         config = AuditConfig(
             target=target,
             output_dir=output_dir,
@@ -1276,6 +1316,8 @@ class AuditJobManager:
             provider_api_key=provider_api_key,
             target_au_count=target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+            sandbox_enabled=sandbox_enabled,
+            sandbox_network_enabled=sandbox_network_enabled,
             known_disclosures=tuple(self.store.disclosure_dedupe_index()),
         )
         # Carry forward the original session's accounting: finish_run writes
@@ -1324,6 +1366,7 @@ class AuditJobManager:
             log_level=config.log_level,
             repos_dir=repos_dir,
             results_dir=results_dir,
+            sandbox_mode=sandbox_mode,
         )
         self._check_start_allowed(target, run_id=run_id)
         job = AuditJob(self, JOB_AUDIT)

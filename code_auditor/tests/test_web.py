@@ -28,6 +28,7 @@ from code_auditor.db import (
 from code_auditor.process_tree import CURRENT_AUDIT_PROCESS_MARKER
 from code_auditor.web import create_app
 from code_auditor.web import job as job_module
+from code_auditor.web import server as server_module
 from code_auditor.web.job import (
     STATE_CANCELLED,
     STATE_DONE,
@@ -184,6 +185,31 @@ async def test_start_with_invalid_target_raises(tmp_path) -> None:
     manager = AuditJobManager()
     with pytest.raises(JobValidationError):
         await manager.start(AuditStartParams(target=str(tmp_path / "missing")))
+
+
+async def test_start_maps_local_worktree_mode_to_runtime_flags(
+    tmp_path, monkeypatch
+) -> None:
+    captured = []
+
+    async def fake_run_audit(config, reporter=None):
+        captured.append(config)
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    manager = AuditJobManager()
+
+    job = await manager.start(
+        AuditStartParams(
+            target=str(tmp_path),
+            results_dir=str(tmp_path / "results"),
+            sandbox_mode="local-worktree",
+        )
+    )
+    await job.task
+
+    assert captured[0].sandbox_enabled is False
+    assert captured[0].sandbox_network_enabled is False
+    assert job.status()["sandbox_mode"] == "local-worktree"
 
 
 async def test_start_conflict_while_running(tmp_path, monkeypatch) -> None:
@@ -775,6 +801,8 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     assert audited[0].resume is True
     assert audited[0].update_repo is False
     assert audited[0].backend == "codex"
+    assert audited[0].sandbox_enabled is True
+    assert audited[0].sandbox_network_enabled is True
     assert audited[0].provider_mode == "custom"
     assert audited[0].provider_base_url == "https://codex.example.test/v1"
     assert audited[0].provider_api_key == "secret-key"
@@ -1172,6 +1200,8 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
         assert len(vulnerabilities) == 1
         assert config.resume is False
         assert config.wiki_path == str(wiki)
+        assert config.sandbox_enabled is True
+        assert config.sandbox_network_enabled is False
         report = Path(config.output_dir) / "stage5-pocs" / "H-03" / "report.md"
         report.parent.mkdir(parents=True)
         report.write_text(
@@ -1191,6 +1221,7 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
             backend="codex",
             output_dir=str(reproduction_root),
             wikis_dir=str(tmp_path / "wikis"),
+            sandbox_mode="docker-isolated",
         )
     )
     await job.task
@@ -1212,7 +1243,9 @@ def _make_app(tmp_path):
     """create_app with an isolated history database."""
     return create_app(
         db_path=str(tmp_path / "history.db"),
-        web_settings=WebSettings.for_state_dir(str(tmp_path)),
+        web_settings=WebSettings.for_state_dir(
+            str(tmp_path), sandbox_mode="local-worktree"
+        ),
     )
 
 
@@ -1374,6 +1407,77 @@ def test_api_config_returns_defaults(tmp_path) -> None:
     assert "default_models" not in body
 
 
+def test_api_sandbox_capability_reports_server_check(tmp_path, monkeypatch) -> None:
+    capability = SimpleNamespace(
+        available=True,
+        reason="runtime ready",
+        public=lambda: {
+            "available": True,
+            "reason": "runtime ready",
+            "image": "sandbox:test",
+            "free_bytes": 12_345,
+            "minimum_free_bytes": 100,
+        },
+    )
+    monkeypatch.setattr(
+        server_module,
+        "inspect_docker_sandbox_environment",
+        lambda backend: capability if backend == "codex" else None,
+    )
+
+    response = TestClient(_make_app(tmp_path)).get(
+        "/api/sandbox/capability?backend=codex"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["docker"] == capability.public()
+    assert response.json()["local_worktree"]["available"] is True
+
+
+def test_api_rejects_unavailable_docker_sandbox_setting(tmp_path, monkeypatch) -> None:
+    capability = SimpleNamespace(available=False, reason="sandbox image missing")
+    monkeypatch.setattr(
+        server_module,
+        "inspect_docker_sandbox_environment",
+        lambda _backend: capability,
+    )
+    client = TestClient(_make_app(tmp_path))
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "backend": "claude",
+            "mode": "local",
+            "base_url": "",
+            "model": "",
+            "sandbox_mode": "docker-isolated",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "sandbox image missing" in response.json()["detail"]
+    assert client.get("/api/settings").json()["sandbox_mode"] == "local-worktree"
+
+
+def test_api_revalidates_docker_sandbox_before_start(tmp_path, monkeypatch) -> None:
+    repository = "github.com/user/repo"
+    _make_managed_repo(tmp_path, repository)
+    settings = WebSettings.for_state_dir(str(tmp_path))
+    app = create_app(db_path=str(tmp_path / "history.db"), web_settings=settings)
+    capability = SimpleNamespace(available=False, reason="Docker daemon stopped")
+    monkeypatch.setattr(
+        server_module,
+        "inspect_docker_sandbox_environment",
+        lambda _backend: capability,
+    )
+
+    response = TestClient(app).post("/api/audit", json={"repository": repository})
+
+    assert response.status_code == 400
+    assert "Docker daemon stopped" in response.json()["detail"]
+
+
 def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> None:
     app = _make_app(tmp_path)
     client = TestClient(app)
@@ -1382,6 +1486,7 @@ def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> N
     assert initial.status_code == 200
     assert initial.headers["cache-control"] == "no-store"
     assert initial.json()["backend"] == "claude"
+    assert initial.json()["sandbox_mode"] == "local-worktree"
     assert initial.json()["providers"]["codex"]["mode"] == "local"
 
     saved = client.put(
@@ -1392,6 +1497,7 @@ def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> N
             "base_url": "https://models.example.test/v1",
             "api_key": "secret-key",
             "model": "coder-model",
+            "sandbox_mode": "local-worktree",
         },
     )
 
@@ -1399,6 +1505,7 @@ def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> N
     assert saved.headers["cache-control"] == "no-store"
     body = saved.json()
     assert body["backend"] == "codex"
+    assert body["sandbox_mode"] == "local-worktree"
     assert body["providers"]["codex"]["api_key_configured"] is True
     assert body["active_jobs_updated"] == 0
     assert "secret-key" not in saved.text
@@ -1488,6 +1595,7 @@ def test_api_audit_snapshots_selected_provider_settings(tmp_path, monkeypatch) -
     assert params.provider_base_url == "https://claude.example.test"
     assert params.provider_api_key == "secret-key"
     assert params.model == "claude-compatible-model"
+    assert params.sandbox_mode == "local-worktree"
 
 
 def test_api_index_serves_html(tmp_path) -> None:
@@ -1504,6 +1612,7 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="f-repo-select"' in res.text
     assert 'id="f-git-url"' in res.text
     assert 'id="f-wiki-select"' in res.text
+    assert res.text.count('name="sandbox-mode"') == 3
     assert 'data-route="cves"' in res.text
     assert 'data-route="trash"' in res.text
     assert 'id="btn-cve-import"' in res.text
@@ -2537,6 +2646,7 @@ def test_api_audit_rejects_conflicting_or_hidden_configuration(tmp_path) -> None
         ("target", "/tmp/project"),
         ("backend", "codex"),
         ("model", "gpt-5.5"),
+        ("sandbox_mode", "local-worktree"),
         ("log_level", "INFO"),
         ("discovered", "/tmp/bugs.html"),
         ("output_dir", "/tmp/output"),
@@ -2576,6 +2686,7 @@ def test_api_reproduction_rejects_frontend_configuration_fields(tmp_path) -> Non
     for hidden_field, value in (
         ("backend", "codex"),
         ("model", "gpt-5.5"),
+        ("sandbox_mode", "local-worktree"),
         ("log_level", "INFO"),
         ("output_dir", "/tmp/output"),
     ):

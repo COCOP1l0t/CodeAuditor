@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from ..config import DEFAULT_BACKEND
+from ..config import DEFAULT_BACKEND, DEFAULT_SANDBOX_MODE, SandboxMode
 
 DEFAULT_STATE_DIR = os.path.join("~", ".code_auditor")
 DEFAULT_SETTINGS_PATH = os.path.join(DEFAULT_STATE_DIR, "settings.json")
@@ -23,6 +23,7 @@ _CONFIG_KEYS = {
     "repos_dir",
     "results_dir",
     "reproductions_dir",
+    "sandbox_mode",
     "providers",
 }
 _PROVIDER_KEYS = {"mode", "base_url", "api_key", "model"}
@@ -72,6 +73,7 @@ class WebSettings:
     repos_dir: str
     results_dir: str
     reproductions_dir: str
+    sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE
     claude_provider: ModelProviderSettings = field(
         default_factory=ModelProviderSettings, repr=False
     )
@@ -88,6 +90,7 @@ class WebSettings:
         log_level: str = "DEBUG",
         max_parallel: int = 1,
         max_concurrent_jobs: int = 4,
+        sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE,
     ) -> "WebSettings":
         """Build validated settings for an isolated state directory."""
         root = os.path.realpath(os.path.expanduser(state_dir))
@@ -101,6 +104,7 @@ class WebSettings:
                 "repos_dir": os.path.join(root, "repo"),
                 "results_dir": os.path.join(root, "results"),
                 "reproductions_dir": os.path.join(root, "reproductions"),
+                "sandbox_mode": sandbox_mode,
                 "providers": {"claude": {}, "codex": {}},
             },
         )
@@ -114,6 +118,7 @@ class WebSettings:
             "repos_dir": self.repos_dir,
             "results_dir": self.results_dir,
             "reproductions_dir": self.reproductions_dir,
+            "sandbox_mode": self.sandbox_mode,
             "providers": {
                 "claude": self.claude_provider.serialized(),
                 "codex": self.codex_provider.serialized(),
@@ -131,6 +136,7 @@ class WebSettings:
     def public_agent_settings(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
+            "sandbox_mode": self.sandbox_mode,
             "providers": {
                 "claude": self.claude_provider.public(),
                 "codex": self.codex_provider.public(),
@@ -207,12 +213,15 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
     # model is now resolved from ~/.claude/settings.json at agent call time.
     removed_model = raw.pop("model", None) is not None
     added_providers = "providers" not in raw
+    added_sandbox_mode = "sandbox_mode" not in raw
     unknown = sorted(set(raw) - _CONFIG_KEYS)
     if unknown:
         raise WebSettingsError(
             f"Unknown web settings: {', '.join(unknown)}"
         )
-    if (removed_legacy_paths or removed_model or added_providers) and not migrated_legacy_file:
+    if (
+        removed_legacy_paths or removed_model or added_providers or added_sandbox_mode
+    ) and not migrated_legacy_file:
         _write_settings_file(config_path, {**defaults, **raw})
     os.chmod(config_path, 0o600)
     return _validate_settings(config_path, {**defaults, **raw})
@@ -238,6 +247,16 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         raise WebSettingsError("max_concurrent_jobs must be an integer.")
     if not 1 <= max_concurrent_jobs <= 16:
         raise WebSettingsError("max_concurrent_jobs must be between 1 and 16.")
+    sandbox_mode = raw.get("sandbox_mode")
+    if sandbox_mode not in {
+        "docker-networked",
+        "docker-isolated",
+        "local-worktree",
+    }:
+        raise WebSettingsError(
+            "sandbox_mode must be 'docker-networked', 'docker-isolated', "
+            "or 'local-worktree'."
+        )
 
     managed_paths = {}
     for key in (
@@ -270,6 +289,7 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         repos_dir=managed_paths["repos_dir"],
         results_dir=managed_paths["results_dir"],
         reproductions_dir=managed_paths["reproductions_dir"],
+        sandbox_mode=sandbox_mode,
         claude_provider=validated_providers["claude"],
         codex_provider=validated_providers["codex"],
     )
@@ -282,6 +302,7 @@ def update_agent_settings(
     mode: str,
     base_url: str,
     model: str,
+    sandbox_mode: str | None = None,
     api_key: str | None = None,
     clear_api_key: bool = False,
 ) -> WebSettings:
@@ -296,9 +317,22 @@ def update_agent_settings(
         backend,
         {"mode": mode, "base_url": base_url, "api_key": key, "model": model},
     )
+    selected_sandbox_mode = settings.sandbox_mode
+    if sandbox_mode is not None:
+        if sandbox_mode not in {
+            "docker-networked",
+            "docker-isolated",
+            "local-worktree",
+        }:
+            raise WebSettingsError(
+                "sandbox_mode must be 'docker-networked', 'docker-isolated', "
+                "or 'local-worktree'."
+            )
+        selected_sandbox_mode = sandbox_mode
     updated = replace(
         settings,
         backend=backend,
+        sandbox_mode=selected_sandbox_mode,
         **{f"{backend}_provider": provider},
     )
     _write_settings_file(updated.config_path, updated.serialized())

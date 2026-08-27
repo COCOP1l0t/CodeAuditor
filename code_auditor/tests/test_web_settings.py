@@ -22,6 +22,7 @@ def test_load_web_settings_creates_secure_debug_defaults(tmp_path: Path) -> None
 
     assert config_path.is_file()
     assert settings.backend == "claude"
+    assert settings.sandbox_mode == "docker-networked"
     assert settings.log_level == "DEBUG"
     assert settings.repos_dir == str(state_dir / "repo")
     assert settings.results_dir == str(state_dir / "results")
@@ -68,6 +69,19 @@ def test_load_web_settings_removes_legacy_managed_paths(tmp_path: Path) -> None:
     assert "discovered_path" not in stored
 
 
+def test_load_web_settings_adds_default_sandbox_mode(tmp_path: Path) -> None:
+    config_path = tmp_path / "settings.json"
+    raw = WebSettings.for_state_dir(str(tmp_path)).serialized()
+    raw.pop("sandbox_mode")
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    settings = load_web_settings(str(config_path))
+
+    assert settings.sandbox_mode == "docker-networked"
+    stored = json.loads(config_path.read_text(encoding="utf-8"))
+    assert stored["sandbox_mode"] == "docker-networked"
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -75,6 +89,7 @@ def test_load_web_settings_removes_legacy_managed_paths(tmp_path: Path) -> None:
         {"log_level": "TRACE"},
         {"max_parallel": 0},
         {"results_dir": "/tmp/outside-managed-state"},
+        {"sandbox_mode": "host"},
         {"unknown_key": "value"},
     ],
 )
@@ -116,10 +131,12 @@ def test_update_agent_settings_persists_custom_provider_without_public_key(
         mode="custom",
         base_url="https://models.example.test/v1",
         model="secure-coder",
+        sandbox_mode="local-worktree",
         api_key="secret-token",
     )
 
     assert updated.backend == "codex"
+    assert updated.sandbox_mode == "local-worktree"
     assert updated.codex_provider.api_key == "secret-token"
     assert updated.public_agent_settings()["providers"]["codex"] == {
         "mode": "custom",

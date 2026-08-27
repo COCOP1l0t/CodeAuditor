@@ -8,6 +8,7 @@ from typing import Any, Callable, Literal
 
 AgentBackend = Literal["claude", "codex"]
 ProviderMode = Literal["local", "custom"]
+SandboxMode = Literal["docker-networked", "docker-isolated", "local-worktree"]
 
 DEFAULT_BACKEND: AgentBackend = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -15,11 +16,25 @@ DEFAULT_CLAUDE_POC_MODEL = "claude-opus-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 DEFAULT_CODEX_POC_MODEL = "gpt-5.5"
 DEFAULT_AGENT_TIMEOUT_SECONDS = 20 * 60
+DEFAULT_SANDBOX_MODE: SandboxMode = "docker-networked"
 DEFAULT_SANDBOX_IMAGE = "code-auditor-sandbox:latest"
 DEFAULT_SANDBOX_ROOT = "/tmp/code-auditor"
 DEFAULT_SANDBOX_MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
 DEFAULT_RETAIN_MAX_FILE_BYTES = 64 * 1024 * 1024
 DEFAULT_RETAIN_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+
+
+def sandbox_mode_flags(mode: SandboxMode) -> tuple[bool, bool]:
+    """Map a Web-facing sandbox mode to the two runtime switches."""
+    return mode != "local-worktree", mode == "docker-networked"
+
+
+def sandbox_mode_from_flags(enabled: bool, network_enabled: bool) -> SandboxMode:
+    """Return the Web-facing mode represented by the runtime switches."""
+    if not enabled:
+        return "local-worktree"
+    return "docker-networked" if network_enabled else "docker-isolated"
+
 
 # Default target analysis-unit count: -1 means "no ceiling — explore as many
 # analysis units as genuinely warrant deep analysis".
@@ -63,8 +78,9 @@ class AuditConfig:
     task_errors: list[str] = field(default_factory=list, repr=False)
     # Isolated worktree for Stage 5/6 PoC agents; set up by the orchestrator.
     poc_worktree: str | None = None
-    # Stage 5/6 run in a mandatory disposable Docker workspace by default.
-    # The only writable bind mount is a per-task directory below sandbox_root.
+    # Stage 5/6 use a disposable Docker workspace by default; Web settings may
+    # instead select a detached host worktree. The only writable Docker bind
+    # mount is a per-task directory below sandbox_root.
     sandbox_enabled: bool = True
     sandbox_root: str = field(
         default_factory=lambda: os.environ.get(

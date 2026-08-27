@@ -10,16 +10,14 @@ import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import uuid4
 
+from .config import AuditConfig, AgentBackend
 from .logger import get_logger
 from .process_tree import current_audit_subprocess_env
-
-if TYPE_CHECKING:
-    from .config import AuditConfig
 
 DOCKER_SPEC_ENV = "CODE_AUDITOR_DOCKER_SPEC"
 DOCKER_CWD_ENV = "CODE_AUDITOR_DOCKER_CWD"
@@ -50,7 +48,27 @@ _LEGACY_CODEX_PACKAGE_ROOT = Path("/usr/local/lib/node_modules/@openai/codex")
 
 
 class DockerSandboxError(RuntimeError):
-    """Raised when the mandatory Docker sandbox cannot be prepared."""
+    """Raised when the selected Docker sandbox cannot be prepared."""
+
+
+@dataclass(frozen=True)
+class DockerSandboxCapability:
+    """Read-only assessment of whether this server can launch a sandbox."""
+
+    available: bool
+    reason: str
+    image: str
+    free_bytes: int | None
+    minimum_free_bytes: int
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "reason": self.reason,
+            "image": self.image,
+            "free_bytes": self.free_bytes,
+            "minimum_free_bytes": self.minimum_free_bytes,
+        }
 
 
 def _safe_task_name(value: str) -> str:
@@ -209,14 +227,8 @@ class DockerScratch:
         self.min_free_bytes = config.sandbox_min_free_bytes
 
     async def prepare(self, target: str, commit: str) -> DockerScratch:
-        self._verify_runtime()
+        self.verify_environment()
         self.root_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        available = shutil.disk_usage(self.root_parent).free
-        if available < self.min_free_bytes:
-            raise DockerSandboxError(
-                f"sandbox requires at least {self.min_free_bytes} free bytes; "
-                f"only {available} are available on {self.root_parent}"
-            )
         root = Path(
             tempfile.mkdtemp(
                 prefix=f"{self.task_name}-",
@@ -269,6 +281,39 @@ class DockerScratch:
                 "`docker build -f docker/code-auditor-sandbox.Dockerfile "
                 "-t code-auditor-sandbox:latest docker`"
             ) from exc
+
+    def verify_environment(self) -> int:
+        """Check Docker, image, storage, and backend assets without writing."""
+        self._verify_runtime()
+
+        storage_path = self.root_parent
+        while not storage_path.exists() and storage_path != storage_path.parent:
+            storage_path = storage_path.parent
+        if not storage_path.is_dir():
+            raise DockerSandboxError(
+                f"sandbox storage parent is not a directory: {storage_path}"
+            )
+        access_path = self.root_parent if self.root_parent.exists() else storage_path
+        if self.root_parent.exists() and not self.root_parent.is_dir():
+            raise DockerSandboxError(
+                f"sandbox root is not a directory: {self.root_parent}"
+            )
+        if not os.access(access_path, os.W_OK | os.X_OK):
+            raise DockerSandboxError(f"sandbox storage is not writable: {access_path}")
+        available = shutil.disk_usage(storage_path).free
+        if available < self.min_free_bytes:
+            raise DockerSandboxError(
+                f"sandbox requires at least {self.min_free_bytes} free bytes; "
+                f"only {available} are available on {storage_path}"
+            )
+
+        if self.backend == "claude":
+            _locate_claude_cli()
+        elif self.backend == "codex":
+            _locate_codex_vendor()
+        else:
+            raise DockerSandboxError(f"unsupported sandbox backend: {self.backend}")
+        return available
 
     async def _prepare_source(self, target: str, commit: str) -> None:
         assert self.source_dir is not None
@@ -489,6 +534,34 @@ class DockerScratch:
             raise DockerSandboxError(
                 f"cannot remove sandbox container(s) {', '.join(ids)}: {exc}"
             ) from exc
+
+
+def inspect_docker_sandbox_environment(
+    backend: AgentBackend,
+) -> DockerSandboxCapability:
+    """Inspect the server environment used by a selected Agent backend."""
+    config = AuditConfig(target=".", output_dir=".", backend=backend)
+    try:
+        scratch = DockerScratch(config, "capability-check")
+        free_bytes = scratch.verify_environment()
+    except (DockerSandboxError, OSError) as exc:
+        return DockerSandboxCapability(
+            available=False,
+            reason=str(exc),
+            image=config.sandbox_image,
+            free_bytes=None,
+            minimum_free_bytes=config.sandbox_min_free_bytes,
+        )
+    return DockerSandboxCapability(
+        available=True,
+        reason=(
+            "Docker daemon, sandbox image, scratch storage, and "
+            f"{backend} runtime are ready."
+        ),
+        image=scratch.image,
+        free_bytes=free_bytes,
+        minimum_free_bytes=scratch.min_free_bytes,
+    )
 
 
 def _load_docker_spec(path: str) -> dict[str, Any]:

@@ -468,7 +468,7 @@ def _load_claude_sdk():  # type: ignore[no-untyped-def]
     except ImportError as exc:
         raise RuntimeError(
             "Claude backend requires the claude-agent-sdk package. "
-            "Install project dependencies before using --backend claude."
+            "Install project dependencies before selecting the Claude backend."
         ) from exc
 
     if not _claude_sdk_patched:

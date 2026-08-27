@@ -735,7 +735,7 @@ class AuditJob:
             # the event loop.
             await asyncio.to_thread(self._seed_analysis_units, config)
             logger.info("Starting audit of %s (web UI)", config.target)
-            await run_audit(config, tui=self.reporter)
+            await run_audit(config, reporter=self.reporter)
             self.error = summarize_task_errors(config.task_errors)
             self.state = STATE_FAILED if self.error else STATE_DONE
         except asyncio.CancelledError:

@@ -1,7 +1,7 @@
 """SQLite persistence for audit runs and their artifacts.
 
-Every audit (CLI, TUI, or web mode) is recorded in a local SQLite database
-(default ``~/.code_auditor/audits.db``, override with ``--db``). Run metadata
+Every Web audit is recorded in a local SQLite database
+(default ``~/.code_auditor/audits.db``). Run metadata
 comes from the :class:`~code_auditor.config.AuditConfig`; artifacts are parsed
 from the output directory layout produced by stages 3-6.
 
@@ -31,6 +31,7 @@ from .poc_artifacts import (
     load_trigger_graph,
 )
 from .repos import DEFAULT_REPOS_DIR, capture_repo_identity, list_cloned_repos
+from .retention import RetentionError, load_retain_manifest
 from .reproduction_status import REPRODUCED_STATUSES, read_reproduction_status
 from .utils import natural_sort_key
 
@@ -354,6 +355,58 @@ def _stage5_terminal_paths(
             continue
         return os.path.dirname(stage5_dir), poc_dir, report_file, vuln_id
     return None
+
+
+def _stage6_terminal_paths(
+    artifacts: list[dict[str, Any]],
+) -> tuple[str, str, str, str] | None:
+    """Resolve a retained Stage 6 reproducer to its disclosure directory."""
+    for artifact in artifacts:
+        if (
+            not isinstance(artifact, dict)
+            or artifact.get("label") != "Stage 6 Report"
+        ):
+            continue
+        path = artifact.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        report_file = os.path.realpath(os.path.expanduser(path))
+        disclosure_dir = os.path.dirname(report_file)
+        vuln_dir = os.path.dirname(disclosure_dir)
+        stage6_dir = os.path.dirname(vuln_dir)
+        vuln_id = os.path.basename(vuln_dir)
+        if (
+            os.path.basename(disclosure_dir) != "disclosure"
+            or os.path.basename(stage6_dir) != "stage6-disclosures"
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", vuln_id) is None
+            or not os.path.isfile(report_file)
+        ):
+            continue
+        relative_report = Path(report_file).relative_to(disclosure_dir).as_posix()
+        try:
+            manifest = load_retain_manifest(
+                disclosure_dir,
+                required_paths=[relative_report],
+            )
+        except RetentionError:
+            continue
+        entrypoint = os.path.realpath(
+            os.path.join(disclosure_dir, manifest.entrypoint)
+        )
+        if (
+            not entrypoint.startswith(disclosure_dir + os.sep)
+            or not os.path.isfile(entrypoint)
+        ):
+            continue
+        return os.path.dirname(stage6_dir), disclosure_dir, report_file, vuln_id
+    return None
+
+
+def _terminal_paths(
+    artifacts: list[dict[str, Any]],
+) -> tuple[str, str, str, str] | None:
+    """Prefer a portable Stage 6 reproducer, with legacy Stage 5 fallback."""
+    return _stage6_terminal_paths(artifacts) or _stage5_terminal_paths(artifacts)
 
 
 def _parse_finding(path: Path, output_dir: Path) -> dict[str, Any] | None:
@@ -1272,7 +1325,7 @@ class AuditStore:
         started_at: float | None = None,
         ended_at: float | None = None,
     ) -> int:
-        """One-shot persistence for CLI/TUI runs: create row + scan artifacts."""
+        """Create a completed run row and scan its filesystem artifacts."""
         run_id = self.create_run(config, status=status, started_at=started_at)
         identity = capture_repo_identity(config.target)
         if identity["commit"]:
@@ -1818,11 +1871,14 @@ class AuditStore:
                 """
                 SELECT v.run_id, v.vuln_id, v.title, v.dedupe_key,
                        r.repo_name, r.output_dir, p.status AS poc_status,
-                       p.report_path AS poc_report_path
+                       p.report_path AS poc_report_path,
+                       d.report_path AS disclosure_report_path
                 FROM vulnerabilities v
                 JOIN runs r ON r.id = v.run_id
                 JOIN pocs p
                   ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+                LEFT JOIN disclosures d
+                  ON d.run_id = v.run_id AND d.vuln_id = v.vuln_id
                 WHERE v.run_id = ? AND v.vuln_id = ?
                   AND p.status = 'reproduced'
                 """,
@@ -1832,16 +1888,30 @@ class AuditStore:
             return None
         candidate = dict(row)
         output_dir = os.path.realpath(candidate["output_dir"])
-        report_path = candidate.get("poc_report_path") or ""
-        report_file = os.path.realpath(os.path.join(output_dir, report_path))
-        poc_dir = os.path.dirname(report_file)
-        if (
-            not report_path
-            or not os.path.isfile(report_file)
-            or (poc_dir != output_dir and not poc_dir.startswith(output_dir + os.sep))
+
+        def registered_file(value: object) -> str | None:
+            if not isinstance(value, str) or not value or "\x00" in value:
+                return None
+            resolved = os.path.realpath(
+                value if os.path.isabs(value) else os.path.join(output_dir, value)
+            )
+            if not resolved.startswith(output_dir + os.sep):
+                return None
+            return resolved if os.path.isfile(resolved) else None
+
+        artifacts = []
+        for label, value in (
+            ("Stage 6 Report", candidate.get("disclosure_report_path")),
+            ("Stage 5 Report", candidate.get("poc_report_path")),
         ):
+            report_file = registered_file(value)
+            if report_file:
+                artifacts.append({"label": label, "path": report_file})
+        terminal_paths = _terminal_paths(artifacts)
+        if terminal_paths is None or terminal_paths[0] != output_dir:
             return None
-        candidate["poc_dir"] = poc_dir
+        candidate["poc_dir"] = terminal_paths[1]
+        candidate["poc_report_path"] = terminal_paths[2]
         return candidate
 
     def get_target_merged(self, target_key: str) -> dict | None:
@@ -2210,7 +2280,7 @@ class AuditStore:
                 artifacts = json.loads(row.pop("artifact_links") or "[]")
             except (json.JSONDecodeError, TypeError):
                 artifacts = []
-            terminal_paths = _stage5_terminal_paths(artifacts)
+            terminal_paths = _terminal_paths(artifacts)
             row["has_disclosure_report"] = _has_local_disclosure_report(artifacts)
             row["artifacts"] = [
                 {"index": index, "label": artifact.get("label") or "Artifact"}
@@ -2383,7 +2453,7 @@ class AuditStore:
             return None
         if not isinstance(artifacts, list):
             return None
-        terminal_paths = _stage5_terminal_paths(artifacts)
+        terminal_paths = _terminal_paths(artifacts)
         if terminal_paths is None:
             return None
         output_dir, poc_dir, report_file, vuln_id = terminal_paths

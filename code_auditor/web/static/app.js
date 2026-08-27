@@ -1,6 +1,6 @@
 "use strict";
 
-// ── Stage metadata (mirrors code_auditor/tui.py STAGE_INFO) ────────────────
+// ── Stage metadata ─────────────────────────────────────────────────────────
 const STAGE_INFO = {
   0: ["Init", "Git clone + output directory setup"],
   1: ["Context", "Security context research"],
@@ -57,7 +57,6 @@ let selectedProcessPid = null;
 let activeReproKey = null;
 let reproEventSource = null;
 let reproductionCandidates = [];
-let configuredGitUrl = "";
 let agentSettings = null;
 let managedResultsDir = "";
 let terminalToken = "";
@@ -124,7 +123,6 @@ async function loadConfig() {
     const res = await fetch("/api/config");
     const cfg = await res.json();
     const d = cfg.defaults || {};
-    configuredGitUrl = d.git_url || "";
     managedResultsDir = cfg.results_dir || "";
     terminalToken = cfg.terminal_token || "";
     terminalEnabled = cfg.terminal_enabled === true && terminalToken !== "";
@@ -281,11 +279,6 @@ async function loadRepos() {
     clone.value = "__clone__";
     clone.textContent = "Clone a new repository URL…";
     select.appendChild(clone);
-    if (configuredGitUrl) {
-      select.value = "__clone__";
-      $("f-git-url").value = configuredGitUrl;
-      updateRepositoryChoice();
-    }
   } catch {
     // repo list unavailable; the select simply stays empty
   }

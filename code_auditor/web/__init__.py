@@ -1,4 +1,4 @@
-"""Web UI for CodeAuditor (``code-auditor --web``)."""
+"""Web UI for CodeAuditor."""
 from __future__ import annotations
 
 from .server import create_app, run_web_server

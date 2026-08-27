@@ -198,7 +198,7 @@ def select_poc_model(config: AuditConfig) -> str:
 
 
 def resolve_wiki_arg(path: str | None) -> str | None:
-    """Resolve the --wiki CLI/web argument to an absolute path, or None.
+    """Resolve a Web-selected Wiki path to an absolute path, or None.
 
     Raises ValueError if the path does not exist or is not a directory.
     """

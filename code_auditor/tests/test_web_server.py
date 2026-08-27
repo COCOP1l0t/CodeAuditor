@@ -27,7 +27,7 @@ def test_run_web_server_logs_configured_bind_host(monkeypatch) -> None:
         lambda: SimpleNamespace(log_level="INFO"),
     )
     monkeypatch.setattr(server_module, "configure_logging", lambda level: None)
-    monkeypatch.setattr(server_module, "create_app", lambda defaults, web_settings: app)
+    monkeypatch.setattr(server_module, "create_app", lambda *, web_settings: app)
     monkeypatch.setattr(server_module.logger, "info", lambda *args: observed.setdefault("log", args))
     monkeypatch.setattr("uvicorn.Config", FakeConfig)
     monkeypatch.setattr("uvicorn.Server", FakeServer)

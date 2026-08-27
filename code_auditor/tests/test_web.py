@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -189,7 +190,7 @@ async def test_start_conflict_while_running(tmp_path, monkeypatch) -> None:
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         started.set()
         await release.wait()
 
@@ -215,7 +216,7 @@ async def test_start_preparation_does_not_block_event_loop(
     def blocking_seed(self, config):  # type: ignore[no-untyped-def]
         assert release.wait(timeout=1), "event loop was blocked by run preparation"
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         return None
 
     monkeypatch.setattr(AuditJob, "_seed_analysis_units", blocking_seed)
@@ -236,7 +237,7 @@ async def test_manager_hot_switches_active_run_config_params_and_history(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         started.set()
         await release.wait()
 
@@ -316,7 +317,7 @@ async def test_manager_hot_switch_appends_actual_backend_after_prior_and_persist
         await release_claude.wait()
         return "claude-result"
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         assert (
             await agent_module.run_agent("first", config, cwd=config.target)
             == "codex-result"
@@ -393,7 +394,7 @@ async def test_concurrent_jobs_on_different_targets(tmp_path, monkeypatch) -> No
     release = asyncio.Event()
     running = 0
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         nonlocal running
         running += 1
         if running == 2:
@@ -441,7 +442,7 @@ async def test_concurrent_jobs_on_different_targets(tmp_path, monkeypatch) -> No
 async def test_job_launch_sets_run_process_marker(tmp_path, monkeypatch) -> None:
     observed_markers: list[str | None] = []
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         observed_markers.append(CURRENT_AUDIT_PROCESS_MARKER.get())
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
@@ -455,7 +456,7 @@ async def test_job_launch_sets_run_process_marker(tmp_path, monkeypatch) -> None
 async def test_concurrent_job_limit_is_enforced(tmp_path, monkeypatch) -> None:
     release = asyncio.Event()
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         await release.wait()
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
@@ -480,7 +481,7 @@ async def test_concurrent_job_limit_is_enforced(tmp_path, monkeypatch) -> None:
 async def test_stop_cancels_running_job(tmp_path, monkeypatch) -> None:
     started = asyncio.Event()
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         started.set()
         await asyncio.sleep(3600)
 
@@ -550,7 +551,7 @@ async def test_resume_rejects_low_history_database_free_space(
 async def test_terminal_history_write_retries_after_disk_full(
     tmp_path, monkeypatch
 ) -> None:
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         config.task_errors.append("stage6: disk full")
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
@@ -594,7 +595,7 @@ async def test_shutdown_cancels_and_persists_running_audit(
 ) -> None:
     started = asyncio.Event()
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         started.set()
         await asyncio.sleep(3600)
 
@@ -718,7 +719,7 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     checkout_started = asyncio.Event()
     checkout_release = asyncio.Event()
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         audited.append(config)
 
     async def fake_checkout(target_path, commit, branch):
@@ -926,7 +927,7 @@ async def test_resume_cancelled_job_auto_stashes_dirty_checkout(
     async def fake_checkout(*args):
         pass
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         pass
 
     monkeypatch.setattr(
@@ -1116,7 +1117,7 @@ async def test_resume_git_command_times_out_and_kills_process_group(tmp_path) ->
 
 
 async def test_failed_job_records_error(tmp_path, monkeypatch) -> None:
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
@@ -1207,10 +1208,9 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 
 
-def _make_app(tmp_path, defaults: dict | None = None):
+def _make_app(tmp_path):
     """create_app with an isolated history database."""
     return create_app(
-        defaults,
         db_path=str(tmp_path / "history.db"),
         web_settings=WebSettings.for_state_dir(str(tmp_path)),
     )
@@ -1265,6 +1265,31 @@ def _make_output_dir(base) -> str:
     )
     (disclosure / "disclosure.zip").write_bytes(b"PK\x05\x06")
     return str(out)
+
+
+def _write_web_stage6_retention(output_dir: str) -> Path:
+    disclosure = (
+        Path(output_dir) / "stage6-disclosures" / "H-01" / "disclosure"
+    )
+    reproduce = disclosure / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nprintf 'reproduced\\n'\n", encoding="utf-8")
+    reproduce.chmod(0o700)
+    manifest = disclosure / "retain-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "entrypoint": "reproduce.sh",
+                "files": [
+                    {"path": "report.md", "role": "report"},
+                    {"path": "reproduce.sh", "role": "entrypoint"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest.chmod(0o600)
+    return disclosure
 
 
 def _write_web_stage5_evidence(output_dir: str) -> None:
@@ -1334,12 +1359,11 @@ def _wait_for_state(app, state: str, timeout: float = 5.0) -> dict:
 
 
 def test_api_config_returns_defaults(tmp_path) -> None:
-    app = _make_app(tmp_path, {"git_url": "https://github.com/user/repo.git"})
+    app = _make_app(tmp_path)
     client = TestClient(app)
     res = client.get("/api/config")
     assert res.status_code == 200
     body = res.json()
-    assert body["defaults"]["git_url"] == "https://github.com/user/repo.git"
     assert body["defaults"]["max_parallel"] == 1
     assert body["config_path"].endswith("settings.json")
     assert "discovered_path" not in body
@@ -1762,6 +1786,24 @@ def test_poc_terminal_websocket_starts_in_managed_stage5_directory(tmp_path) -> 
     assert b"__POC_TERMINAL_OK__" in output
 
 
+def test_poc_terminal_uses_retained_stage6_after_stage5_cleanup(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    out = _make_output_dir(tmp_path)
+    disclosure = _write_web_stage6_retention(out)
+    run_id = app.state.store.import_output_dir(out)
+    shutil.rmtree(Path(out) / "stage5-pocs" / "H-01")
+    client = TestClient(app)
+    token = client.get("/api/config").json()["terminal_token"]
+
+    with client.websocket_connect(
+        f"/ws/terminal/{run_id}/H-01?token={token}"
+    ) as websocket:
+        ready = websocket.receive_json()
+        assert ready["type"] == "ready"
+        assert ready["cwd"] == str(disclosure)
+        websocket.send_json({"type": "input", "data": "exit\n"})
+
+
 def test_slop_disclosure_terminal_starts_from_registered_stage5_artifact(
     tmp_path,
 ) -> None:
@@ -1962,14 +2004,14 @@ def test_api_serves_and_downloads_latest_agent_log(tmp_path) -> None:
 
 
 def test_api_full_job_lifecycle_and_results(tmp_path, monkeypatch) -> None:
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         # Simulate stage output artifacts.
         findings_dir = tmp_path / "out" / "stage3-findings"
         findings_dir.mkdir(parents=True, exist_ok=True)
         (findings_dir / "AU-1-F-1.json").write_text("{}", encoding="utf-8")
-        if tui:
-            tui.begin_stage(0, "setup")
-            tui.end_stage(0)
+        if reporter:
+            reporter.begin_stage(0, "setup")
+            reporter.end_stage(0)
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
     monkeypatch.setattr(
@@ -2097,7 +2139,7 @@ def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> No
     app.state.store.set_run_identity(run_id, identity)
     audited = []
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         audited.append(config)
 
     monkeypatch.setattr(job_module, "capture_repo_identity", lambda _path: identity)
@@ -2160,7 +2202,7 @@ def test_api_resumes_done_history_run_with_task_errors(tmp_path, monkeypatch) ->
     )
     audited = []
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         audited.append(config)
 
     monkeypatch.setattr(job_module, "capture_repo_identity", lambda _path: identity)
@@ -2209,7 +2251,7 @@ async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch)
     job.state = STATE_RUNNING
     job.job_key = "audit-test"
 
-    async def fake_run_audit(cfg, tui=None):
+    async def fake_run_audit(cfg, reporter=None):
         cfg.backends_used.extend(["claude", "codex"])
         cfg.models_used.append("model-x")
         cfg.usage_stats.update({"agent_calls": 2, "input_tokens": 900, "cost_usd": 0.03})
@@ -2430,7 +2472,7 @@ async def test_start_with_git_url_clones_then_audits(tmp_path, monkeypatch) -> N
 
     seen: dict[str, str] = {}
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         seen["target"] = config.target
 
     monkeypatch.setattr(job_module, "ensure_repo", fake_ensure_repo)
@@ -2565,7 +2607,7 @@ def test_api_start_with_git_url(tmp_path, monkeypatch) -> None:
     async def fake_ensure_repo(url, repos_dir):
         return str(cloned)
 
-    async def fake_run_audit(config, tui=None):
+    async def fake_run_audit(config, reporter=None):
         pass
 
     monkeypatch.setattr(job_module, "ensure_repo", fake_ensure_repo)

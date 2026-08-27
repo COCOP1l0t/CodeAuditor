@@ -5,12 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "code-auditor"
 version = "0.1.0"
-description = "Multi-stage code auditing agent application using Claude Code or Codex backends"
+description = "Web-based multi-stage code auditing agent application using Claude Code or Codex backends"
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.48",
     "codex-app-server-sdk @ https://codeload.github.com/openai/codex/tar.gz/6e838a19fa52f2c30442c5bd2913acd1e6fe4c9d#subdirectory=sdk/python",
-    "textual>=0.50",
     "rich>=13.0",
     "fastapi>=0.110",
     "uvicorn>=0.29",

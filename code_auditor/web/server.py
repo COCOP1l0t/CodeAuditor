@@ -467,16 +467,14 @@ def _cve_references(request: CveImportRequest) -> list[dict[str, str]]:
 
 
 def create_app(
-    defaults: dict | None = None,
     db_path: str | None = None,
     *,
     web_settings: WebSettings | None = None,
     config_path: str = DEFAULT_SETTINGS_PATH,
 ) -> FastAPI:
-    defaults = defaults or {}
     settings = web_settings or load_web_settings(config_path)
     store = AuditStore(
-        db_path or defaults.get("db_path") or DEFAULT_DB_PATH,
+        db_path or DEFAULT_DB_PATH,
         managed_results_dir=settings.results_dir,
     )
 
@@ -542,7 +540,6 @@ def create_app(
     async def get_config() -> dict:
         return {
             "defaults": {
-                "git_url": defaults.get("git_url") or "",
                 "max_parallel": settings.max_parallel,
             },
             "config_path": settings.config_path,
@@ -1213,14 +1210,13 @@ def _looks_like_output_dir(path: str) -> bool:
     return any(os.path.isdir(os.path.join(path, d)) for d in _OUTPUT_STAGE_DIRS)
 
 
-def run_web_server(host: str, port: int, defaults: dict | None = None) -> None:
-    """Blocking entry point for ``code-auditor --web``."""
+def run_web_server(host: str, port: int) -> None:
+    """Blocking entry point for the CodeAuditor Web application."""
     import uvicorn
 
-    defaults = defaults or {}
     settings = load_web_settings()
     configure_logging(settings.log_level)
-    app = create_app(defaults, web_settings=settings)
+    app = create_app(web_settings=settings)
 
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)

@@ -1,7 +1,7 @@
 """Event bus, log capture, and progress reporting for the CodeAuditor web UI.
 
-The web mode reuses the duck-typed ``tui`` parameter of ``run_audit``:
-``WebProgressReporter`` implements ``begin_stage`` / ``stage_progress`` /
+``WebProgressReporter`` implements the ``run_audit`` progress protocol with
+``begin_stage`` / ``stage_progress`` /
 ``end_stage`` and publishes events to a per-job ``EventBus``, which streams
 them to browsers over per-job SSE endpoints. Log records from the
 ``code_auditor`` logger are captured by a single process-wide
@@ -218,7 +218,7 @@ class StageState:
 
 
 class WebProgressReporter:
-    """Duck-typed ``tui`` argument for ``run_audit`` that publishes stage events."""
+    """Publish audit stage updates to Web clients."""
 
     def __init__(self, bus: EventBus) -> None:
         self._bus = bus

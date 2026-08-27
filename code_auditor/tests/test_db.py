@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import time
 from pathlib import Path
 
 import pytest
 
-from code_auditor import __main__ as main_module
 from code_auditor.config import AuditConfig
 from code_auditor.db import (
     DISCLOSURE_TRASH_RETENTION_SECONDS,
@@ -139,6 +139,29 @@ def _write_stage5_evidence(out: Path, vuln_id: str = "H-01") -> None:
         "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n",
         encoding="utf-8",
     )
+
+
+def _write_stage6_retention(out: Path, vuln_id: str = "H-01") -> Path:
+    disclosure = out / "stage6-disclosures" / vuln_id / "disclosure"
+    reproduce = disclosure / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nprintf 'reproduced\\n'\n", encoding="utf-8")
+    reproduce.chmod(0o700)
+    manifest = disclosure / "retain-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "entrypoint": "reproduce.sh",
+                "files": [
+                    {"path": "report.md", "role": "report"},
+                    {"path": "reproduce.sh", "role": "entrypoint"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest.chmod(0o600)
+    return disclosure
 
 
 # ── scan_output_dir ──────────────────────────────────────────────────────────
@@ -689,31 +712,6 @@ def test_get_run_unknown_returns_none(tmp_path) -> None:
     assert store.get_run(999) is None
 
 
-# ── CLI persistence hook ─────────────────────────────────────────────────────
-
-
-def test_persist_run_safely_writes_row(tmp_path) -> None:
-    out = _make_output_dir(tmp_path)
-    db_path = str(tmp_path / "history.db")
-    config = _make_config(tmp_path, out)
-
-    main_module._persist_run_safely(db_path, config, RUN_DONE, "", time.time())
-
-    store = AuditStore(db_path)
-    runs, total = store.list_runs()
-    assert total == 1
-    assert runs[0]["status"] == RUN_DONE
-    assert runs[0]["vulns_count"] == 1
-
-
-def test_persist_run_safely_swallows_errors(tmp_path) -> None:
-    config = AuditConfig(target=str(tmp_path), output_dir=str(tmp_path))
-    # Unwritable db path must not raise.
-    main_module._persist_run_safely(
-        str(tmp_path / "no-such-dir" / "sub" / "\0bad.db"), config, RUN_DONE, "", time.time()
-    )
-
-
 def test_list_runs_filter_by_target(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))
@@ -1065,6 +1063,29 @@ def test_record_run_populates_disclosure_catalogue_and_summary(tmp_path) -> None
     assert candidate is not None
     assert candidate["run_id"] == run_id
     assert candidate["poc_dir"].endswith("stage5-pocs/H-01")
+
+
+def test_retained_stage6_reproducer_survives_stage5_cleanup(tmp_path) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    disclosure = _write_stage6_retention(out)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+
+    shutil.rmtree(out / "stage5-pocs" / "H-01")
+
+    run_candidate = store.get_poc_terminal_candidate(run_id, "H-01")
+    assert run_candidate is not None
+    assert run_candidate["poc_dir"] == str(disclosure)
+    disclosed = store.list_disclosed()[0]
+    assert disclosed["terminal"]["vuln_id"] == "H-01"
+    disclosure_candidate = store.get_disclosed_terminal_candidate(
+        "qemu", disclosed["dedupe_key"]
+    )
+    assert disclosure_candidate is not None
+    assert disclosure_candidate["poc_dir"] == str(disclosure)
 
 
 def test_record_run_registers_stage5_evidence_for_disclosure(tmp_path) -> None:

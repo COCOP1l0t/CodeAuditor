@@ -586,6 +586,33 @@ def test_update_running_run_agent_settings_only_changes_active_run(tmp_path) -> 
     assert finished["model"] == "hot-model"
 
 
+def test_update_running_run_agent_history_only_changes_active_run(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(_make_config(tmp_path, out))
+
+    assert store.update_running_run_agent_history(
+        run_id,
+        backends_used=["codex", "claude"],
+        models_used=["model-a", "model-b"],
+    ) is True
+    running = store.get_run(run_id)
+    assert running is not None
+    assert json.loads(running["backends_used"]) == ["codex", "claude"]
+    assert json.loads(running["models_used"]) == ["model-a", "model-b"]
+
+    store.finish_run(run_id, RUN_DONE)
+    assert store.update_running_run_agent_history(
+        run_id,
+        backends_used=["claude"],
+        models_used=["late-model"],
+    ) is False
+    finished = store.get_run(run_id)
+    assert finished is not None
+    assert json.loads(finished["backends_used"]) == ["codex", "claude"]
+    assert json.loads(finished["models_used"]) == ["model-a", "model-b"]
+
+
 def test_resumed_run_duration_excludes_inactive_gap(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))

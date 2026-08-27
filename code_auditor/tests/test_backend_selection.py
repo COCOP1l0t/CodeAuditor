@@ -834,10 +834,12 @@ def test_run_agent_hot_switch_keeps_inflight_snapshot_and_switches_next_call(
 
 
 def test_sandbox_config_follows_owner_agent_settings(tmp_path: Path) -> None:
+    history_changes: list[str] = []
     owner = AuditConfig(
         target="/tmp/project",
         output_dir="/tmp/output",
         backend="codex",
+        agent_history_changed=lambda: history_changes.append("changed"),
     )
     scratch = object.__new__(DockerScratch)
     scratch.source_dir = tmp_path / "source"
@@ -848,6 +850,9 @@ def test_sandbox_config_follows_owner_agent_settings(tmp_path: Path) -> None:
     assert derived.target == str(scratch.source_dir)
     assert derived.output_dir == str(scratch.artifact_dir)
     assert derived.agent_settings_source is owner
+    assert derived.agent_history_changed is owner.agent_history_changed
+    assert derived.backends_used is owner.backends_used
+    assert derived.models_used is owner.models_used
 
 
 def test_sandbox_ensure_backend_rebuilds_metadata_and_rolls_back_on_failure(

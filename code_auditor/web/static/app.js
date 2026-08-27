@@ -739,8 +739,12 @@ function handleJobLifecycleEvent(ev) {
     return;
   }
   const runId = ev.run_id != null ? Number(ev.run_id) : null;
-  if (ev.backend_switched && runId !== null && detailRunId === runId) {
-    loadRunDetail(runId);
+  if (
+    (ev.backend_switched || ev.agent_history_updated) &&
+    runId !== null &&
+    detailRunId === runId
+  ) {
+    updateRunAgentHistoryMeta(runId, ev);
   }
   if (runId !== null && detailRunId === runId) {
     if (ev.status === "running") {
@@ -1522,6 +1526,21 @@ function backendsUsedDisplay(run) {
 function modelsUsedDisplay(run) {
   const models = parseJsonList(run.models_used);
   return models.length ? models.join(", ") : run.model || "";
+}
+
+function updateRunAgentHistoryMeta(runId, job) {
+  if (detailRunId !== Number(runId)) return;
+  const values = new Map([
+    ["Backends used", backendsUsedDisplay(job) || "—"],
+    ["Models used", modelsUsedDisplay(job) || "—"],
+  ]);
+  for (const keyNode of document.querySelectorAll("#run-meta .meta-key")) {
+    const value = values.get(keyNode.textContent);
+    const valueNode = keyNode.nextElementSibling;
+    if (value !== undefined && valueNode?.classList.contains("meta-val")) {
+      valueNode.textContent = value;
+    }
+  }
 }
 
 function fmtTokenCount(n) {

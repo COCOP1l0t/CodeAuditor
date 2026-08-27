@@ -1183,10 +1183,20 @@ async def run_agent(
         raise ValueError(f"Unsupported agent backend: {invocation_config.backend}")
 
     selected_model = resolve_agent_model(invocation_config, model)
+    history_changed = False
     if invocation_config.backend not in config.backends_used:
         config.backends_used.append(invocation_config.backend)
+        history_changed = True
     if selected_model not in config.models_used:
         config.models_used.append(selected_model)
+        history_changed = True
+    if history_changed and config.agent_history_changed is not None:
+        try:
+            config.agent_history_changed()
+        except Exception as exc:
+            # History reporting is observational and must never prevent the
+            # selected agent invocation from running.
+            logger.warning("Failed to publish live agent usage history: %s", exc)
     subagent_id = uuid4().hex[:8]
     started_at = time.monotonic()
     status = "failed"

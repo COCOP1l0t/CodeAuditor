@@ -1229,6 +1229,29 @@ class AuditStore:
             )
             return cursor.rowcount == 1
 
+    def update_running_run_agent_history(
+        self,
+        run_id: int,
+        *,
+        backends_used: list[str],
+        models_used: list[str],
+    ) -> bool:
+        """Persist actual agent usage while a run is still active."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE runs SET backends_used = ?, models_used = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    json.dumps(backends_used, ensure_ascii=False),
+                    json.dumps(models_used, ensure_ascii=False),
+                    run_id,
+                    RUN_RUNNING,
+                ),
+            )
+            return cursor.rowcount == 1
+
     def update_run_output_dir(self, run_id: int, output_dir: str) -> None:
         """Update the output directory of an existing run.
 

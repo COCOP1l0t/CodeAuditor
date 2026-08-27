@@ -15,6 +15,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -67,6 +68,8 @@ JOB_REPRODUCTION = "reproduction"
 DEFAULT_REPRODUCTIONS_DIR = os.path.join("~", ".code_auditor", "reproductions")
 DEFAULT_MAX_CONCURRENT_JOBS = 4
 FINISHED_JOB_RETENTION_SECONDS = 300.0
+HISTORY_PERSIST_RETRY_SECONDS = 5.0
+MIN_HISTORY_WRITE_FREE_BYTES = 64 * 1024 * 1024
 RESUME_GIT_TIMEOUT_SECONDS = 60.0
 SHUTDOWN_TASK_TIMEOUT_SECONDS = 15.0
 INTERRUPTED_AUDIT_ERROR = (
@@ -291,6 +294,16 @@ class AuditJob:
         self.target_path: str = ""
         self.reproduction_candidate: dict | None = None
         self.reproduction_reports: list[str] = []
+        self.history_persist_pending: bool = False
+        self._pending_run_finish: tuple[
+            str,
+            str,
+            float,
+            list[str] | None,
+            list[str] | None,
+            dict[str, float] | None,
+        ] | None = None
+        self._next_history_retry_at: float = 0.0
 
     # ── events ────────────────────────────────────────────────────────────
 
@@ -312,10 +325,42 @@ class AuditJob:
             "duration_seconds": self.duration_seconds,
             "active_started_at": self.active_started_at,
             "duration_known": self.duration_known,
+            "history_persist_pending": self.history_persist_pending,
             **extra,
         }
         self.bus.publish(event)
         self.manager.bus.publish(event)
+
+    def _set_config(self, config: AuditConfig) -> None:
+        """Attach Web-only runtime observers to the job's active config."""
+        self.config = config
+        config.agent_history_changed = self._agent_history_changed
+
+    def _agent_history_changed(self) -> None:
+        """Persist and publish a backend/model when its invocation starts."""
+        config = self.config
+        if config is None:
+            return
+        if self.store is not None and self.kind == JOB_AUDIT and self.run_id is not None:
+            try:
+                updated = self.store.update_running_run_agent_history(
+                    self.run_id,
+                    backends_used=list(config.backends_used),
+                    models_used=list(config.models_used),
+                )
+                if self.state == STATE_RUNNING and not updated:
+                    logger.warning(
+                        "Run #%d recorded agent usage in memory but its active "
+                        "history row was not updated.",
+                        self.run_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to update Run #%d live agent usage history: %s",
+                    self.run_id,
+                    exc,
+                )
+        self.publish_job_event(agent_history_updated=True)
 
     def _stop_duration_clock(self, ended_at: float) -> None:
         """Fold this active session into the job's accumulated duration once."""
@@ -329,6 +374,7 @@ class AuditJob:
     def reconcile(self) -> bool:
         """Release a busy state whose asyncio task has disappeared."""
         if self.state not in BUSY_STATES:
+            self._retry_pending_run_finish()
             return False
         if self.task is not None and not self.task.done():
             return False
@@ -350,6 +396,7 @@ class AuditJob:
         """Persist a resumable terminal state before the Web worker exits."""
         self.reconcile()
         if self.state not in BUSY_STATES or self.task is None:
+            self._retry_pending_run_finish(force=True)
             return
         self.error = INTERRUPTED_AUDIT_ERROR
         task = self.task
@@ -400,6 +447,7 @@ class AuditJob:
             "duration_seconds": self.duration_seconds,
             "active_started_at": self.active_started_at,
             "duration_known": self.duration_known,
+            "history_persist_pending": self.history_persist_pending,
             "run_id": self.run_id,
             "backend": self.config.backend if self.config else "",
             "model": self.config.model if self.config else None,
@@ -591,6 +639,57 @@ class AuditJob:
         except Exception as e:
             logger.warning("Failed to create history database run row: %s", e)
 
+    def _finish_run_history(self, config: AuditConfig | None) -> None:
+        """Persist a terminal audit result, retaining it for a later retry on failure."""
+        if self.store is None or self.run_id is None:
+            return
+        self._pending_run_finish = (
+            self.state,
+            self.error,
+            self.ended_at,
+            list(config.backends_used) if config else None,
+            list(config.models_used) if config else None,
+            dict(config.usage_stats) if config else None,
+        )
+        self._retry_pending_run_finish(force=True)
+
+    def _retry_pending_run_finish(self, *, force: bool = False) -> bool:
+        """Retry a terminal history write without losing the in-memory terminal state."""
+        pending = self._pending_run_finish
+        if pending is None or self.store is None or self.run_id is None:
+            return True
+        now = time.monotonic()
+        if not force and now < self._next_history_retry_at:
+            return False
+        status, error, ended_at, backends_used, models_used, usage_stats = pending
+        was_pending = self.history_persist_pending
+        try:
+            self.store.finish_run(
+                self.run_id,
+                status,
+                error,
+                ended_at,
+                backends_used=backends_used,
+                models_used=models_used,
+                usage_stats=usage_stats,
+            )
+        except Exception as exc:
+            self.history_persist_pending = True
+            self._next_history_retry_at = now + HISTORY_PERSIST_RETRY_SECONDS
+            logger.warning(
+                "Failed to update history database run row; retaining terminal "
+                "state for retry: %s",
+                exc,
+            )
+            return False
+        self._pending_run_finish = None
+        self.history_persist_pending = False
+        self._next_history_retry_at = 0.0
+        if was_pending:
+            logger.info("Recovered terminal history state for Run #%d.", self.run_id)
+            self.publish_job_event(history_persist_recovered=True)
+        return True
+
     def _seed_analysis_units(self, config: AuditConfig) -> None:
         """Reuse analysis units from a previous audit of the same repo+commit."""
         if self.store is None:
@@ -619,7 +718,7 @@ class AuditJob:
                 target = await ensure_repo(params.git_url, params.repos_dir)
                 prev_output_dir = config.output_dir if config else None
                 config = self._build_config(params, target, wiki_path)
-                self.config = config
+                self._set_config(config)
                 if (
                     self.store is not None
                     and self.run_id is not None
@@ -652,19 +751,7 @@ class AuditJob:
                 self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
             self._stop_duration_clock(self.ended_at)
-            if self.store is not None and self.run_id is not None:
-                try:
-                    self.store.finish_run(
-                        self.run_id,
-                        self.state,
-                        self.error,
-                        self.ended_at,
-                        backends_used=list(config.backends_used) if config else None,
-                        models_used=list(config.models_used) if config else None,
-                        usage_stats=dict(config.usage_stats) if config else None,
-                    )
-                except Exception as e:
-                    logger.warning("Failed to update history database run row: %s", e)
+            self._finish_run_history(config)
             self.publish_job_event()
 
     async def _restore_and_run_cancelled(
@@ -773,7 +860,7 @@ class AuditJob:
                 json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
-            self.config = AuditConfig(
+            config = AuditConfig(
                 target=worktree,
                 output_dir=output_dir,
                 wiki_path=_recorded_local_wiki(
@@ -789,6 +876,7 @@ class AuditJob:
                 provider_api_key=params.provider_api_key,
                 agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             )
+            self._set_config(config)
             self.reporter.begin_stage(
                 5, f"Retesting Run #{candidate['run_id']} {candidate['vuln_id']}"
             )
@@ -825,11 +913,12 @@ class AuditJob:
 
 
 async def _stash_resume_leftovers(target: str, run_id: int) -> None:
-    """Stash tracked leftover changes (e.g. from older PoC agents) before resume."""
+    """Stash tracked and untracked leftovers before resuming an older run."""
     output = await _run_resume_git_command(
         target,
         "stash",
         "push",
+        "--include-untracked",
         "-m",
         f"code-auditor auto-stash before resuming run #{run_id}",
     )
@@ -895,6 +984,7 @@ class AuditJobManager:
             job.reconcile()
             if (
                 job.state not in BUSY_STATES
+                and not job.history_persist_pending
                 and job.ended_at
                 and now - job.ended_at > FINISHED_JOB_RETENTION_SECONDS
             ):
@@ -917,6 +1007,27 @@ class AuditJobManager:
                     "A job is already running for this repository; concurrent "
                     "jobs must target different repositories."
                 )
+
+    def _check_history_write_headroom(self) -> None:
+        """Fail before creating a running row when SQLite has no safe write margin."""
+        if self.store is None:
+            return
+        db_path = getattr(self.store, "db_path", "")
+        if not db_path:
+            return
+        db_parent = os.path.dirname(db_path) or os.curdir
+        try:
+            available = shutil.disk_usage(db_parent).free
+        except OSError as exc:
+            raise JobValidationError(
+                f"Cannot verify free space for the history database: {exc}"
+            ) from exc
+        if available < MIN_HISTORY_WRITE_FREE_BYTES:
+            raise JobValidationError(
+                "Cannot start or resume an audit: the history database filesystem "
+                f"has only {available} free bytes; at least "
+                f"{MIN_HISTORY_WRITE_FREE_BYTES} are required to preserve terminal state."
+            )
 
     def _register(self, job: AuditJob) -> AuditJob:
         self._jobs[job.job_key] = job
@@ -991,8 +1102,9 @@ class AuditJobManager:
             config = job._build_config(params, target_path, wiki_path)
 
         self._check_start_allowed(target_path)
+        self._check_history_write_headroom()
         job.target_path = target_path
-        job.config = config
+        job._set_config(config)
         job.start_params = params
         job.state = STATE_RUNNING
         job._create_run_row(config)
@@ -1039,6 +1151,7 @@ class AuditJobManager:
             raise JobValidationError(
                 "This run was recorded from a dirty checkout and cannot be safely continued."
             )
+        self._check_history_write_headroom()
 
         recorded_backend = str(run.get("backend") or "")
         selected_backend = backend or recorded_backend
@@ -1106,7 +1219,7 @@ class AuditJobManager:
                     "The run is no longer resumable; refresh History and try again."
                 )
             job.target_path = target
-            job.config = config
+            job._set_config(config)
             job.start_params = clone_params
             job.state = STATE_RUNNING
             job.run_id = run_id
@@ -1217,7 +1330,7 @@ class AuditJobManager:
         job.duration_seconds = max(float(run.get("duration_seconds") or 0), 0.0)
         job.duration_known = bool(run.get("duration_known", True))
         job.target_path = target
-        job.config = config
+        job._set_config(config)
         job.start_params = params
         job.state = STATE_RESTORING
         job.run_id = run_id

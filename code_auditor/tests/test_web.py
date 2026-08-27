@@ -4,10 +4,12 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from starlette.testclient import TestClient
@@ -15,7 +17,13 @@ from starlette.websockets import WebSocketDisconnect
 
 from code_auditor import agent as agent_module
 from code_auditor.config import AuditConfig
-from code_auditor.db import RUN_CANCELLED, RUN_DONE, AuditStore, compute_target_key
+from code_auditor.db import (
+    RUN_CANCELLED,
+    RUN_DONE,
+    RUN_FAILED,
+    AuditStore,
+    compute_target_key,
+)
 from code_auditor.process_tree import CURRENT_AUDIT_PROCESS_MARKER
 from code_auditor.web import create_app
 from code_auditor.web import job as job_module
@@ -295,6 +303,8 @@ async def test_manager_hot_switch_appends_actual_backend_after_prior_and_persist
 ) -> None:
     codex_started = asyncio.Event()
     release_codex = asyncio.Event()
+    claude_started = asyncio.Event()
+    release_claude = asyncio.Event()
 
     async def fake_codex_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
         codex_started.set()
@@ -302,6 +312,8 @@ async def test_manager_hot_switch_appends_actual_backend_after_prior_and_persist
         return "codex-result"
 
     async def fake_claude_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+        claude_started.set()
+        await release_claude.wait()
         return "claude-result"
 
     async def fake_run_audit(config, tui=None):
@@ -343,11 +355,33 @@ async def test_manager_hot_switch_appends_actual_backend_after_prior_and_persist
     ) == [job.job_key]
     assert job.status()["backends_used"] == ["codex"]
     release_codex.set()
+    await asyncio.wait_for(claude_started.wait(), timeout=1)
+
+    assert job.state == STATE_RUNNING
+    assert job.status()["backends_used"] == ["codex", "claude"]
+    live_history_events = [
+        event
+        for event in job.bus.backlog()
+        if event.get("type") == "job" and event.get("agent_history_updated")
+    ]
+    assert [event["backends_used"] for event in live_history_events] == [
+        ["codex"],
+        ["codex", "claude"],
+    ]
+    assert job.run_id is not None
+    running_history = store.get_run(job.run_id)
+    assert running_history is not None
+    assert json.loads(running_history["backends_used"]) == ["codex", "claude"]
+    assert json.loads(running_history["models_used"]) == [
+        "codex-model",
+        "claude-model",
+    ]
+
+    release_claude.set()
     await job.task
 
     assert job.state == STATE_DONE
     assert job.status()["backends_used"] == ["codex", "claude"]
-    assert job.run_id is not None
     history = store.get_run(job.run_id)
     assert history is not None
     assert json.loads(history["backends_used"]) == ["codex", "claude"]
@@ -459,6 +493,100 @@ async def test_stop_cancels_running_job(tmp_path, monkeypatch) -> None:
     await job.task
     assert job.state == STATE_CANCELLED
     assert manager.stop(job.job_key) is None
+
+
+async def test_start_rejects_low_history_database_free_space(
+    tmp_path, monkeypatch
+) -> None:
+    store = AuditStore(str(tmp_path / "history.db"))
+    manager = AuditJobManager(store=store)
+    monkeypatch.setattr(
+        job_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            free=job_module.MIN_HISTORY_WRITE_FREE_BYTES - 1
+        ),
+    )
+
+    with pytest.raises(JobValidationError, match="preserve terminal state"):
+        await manager.start(
+            AuditStartParams(
+                target=str(tmp_path),
+                output_dir=str(tmp_path / "output"),
+            )
+        )
+
+    runs, total = store.list_runs()
+    assert runs == []
+    assert total == 0
+
+
+async def test_resume_rejects_low_history_database_free_space(
+    tmp_path, monkeypatch
+) -> None:
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(
+        AuditConfig(
+            target=str(tmp_path),
+            output_dir=str(tmp_path / "output"),
+        )
+    )
+    store.finish_run(run_id, RUN_CANCELLED, "stopped")
+    manager = AuditJobManager(store=store)
+    monkeypatch.setattr(
+        job_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=0),
+    )
+
+    with pytest.raises(JobValidationError, match="preserve terminal state"):
+        await manager.resume_cancelled(run_id)
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["status"] == RUN_CANCELLED
+
+
+async def test_terminal_history_write_retries_after_disk_full(
+    tmp_path, monkeypatch
+) -> None:
+    async def fake_run_audit(config, tui=None):
+        config.task_errors.append("stage6: disk full")
+
+    monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
+    store = AuditStore(str(tmp_path / "history.db"))
+    real_finish_run = store.finish_run
+    attempts = 0
+
+    def flaky_finish_run(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database or disk is full")
+        return real_finish_run(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finish_run", flaky_finish_run)
+    manager = AuditJobManager(store=store)
+    job = await manager.start(
+        AuditStartParams(
+            target=str(tmp_path),
+            output_dir=str(tmp_path / "output"),
+        )
+    )
+    await job.task
+
+    assert job.state == STATE_FAILED
+    assert job.history_persist_pending is True
+    assert store.get_run(job.run_id)["status"] == STATE_RUNNING
+
+    job._next_history_retry_at = 0.0
+    statuses = manager.list_jobs()
+
+    assert statuses[0]["history_persist_pending"] is False
+    run = store.get_run(job.run_id)
+    assert run is not None
+    assert run["status"] == RUN_FAILED
+    assert run["ended_at"] is not None
 
 
 async def test_shutdown_cancels_and_persists_running_audit(
@@ -819,8 +947,49 @@ async def test_resume_cancelled_job_auto_stashes_dirty_checkout(
     )
     await job.task
 
-    assert git_calls and git_calls[0][:2] == ("stash", "push")
+    assert git_calls and git_calls[0][:3] == (
+        "stash",
+        "push",
+        "--include-untracked",
+    )
     assert job.state == STATE_DONE
+
+
+async def test_stash_resume_leftovers_includes_untracked_files(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+    tracked = repo / "tracked.txt"
+    tracked.write_text("original\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-m", "initial")
+
+    tracked.write_text("modified\n", encoding="utf-8")
+    untracked = repo / ".audit_tmp_au8" / "modeling_probe.py"
+    untracked.parent.mkdir()
+    untracked.write_text("probe = True\n", encoding="utf-8")
+
+    await job_module._stash_resume_leftovers(str(repo), 23)
+
+    assert git("status", "--porcelain") == ""
+    assert git("stash", "list", "--format=%s").splitlines()[0] == (
+        "On main: code-auditor auto-stash before resuming run #23"
+    )
+    assert set(
+        git("stash", "show", "--include-untracked", "--name-only").splitlines()
+    ) == {"tracked.txt", ".audit_tmp_au8/modeling_probe.py"}
 
 
 async def test_checkout_recorded_revision_restores_commit_and_branch(tmp_path) -> None:
@@ -1401,7 +1570,9 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "connectDetailEvents" in script.text
     assert "active_jobs_updated" in script.text
     assert "backend_switched" in script.text
+    assert "agent_history_updated" in script.text
     assert "backendsUsedDisplay" in script.text
+    assert "updateRunAgentHistoryMeta" in script.text
     assert "Backends used" in res.text
     assert "/api/jobs/events" in script.text
     assert "/resume`" in script.text

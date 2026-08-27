@@ -238,11 +238,16 @@ async def _filter_semantic_duplicates(
         )
         for i, entry in enumerate(existing_entries)
     )
+    existing_keys = {
+        str(entry.get("dedupe_key") or "")
+        for entry in existing_entries
+        if entry.get("dedupe_key")
+    }
 
     filtered: list[_DisclosureCandidate] = []
     for candidate in candidates:
         label = _candidate_label(candidate)
-        prompt = load_prompt("stage6_dedupe.md", {
+        prompt = load_prompt("stage6_semantic_dedupe.md", {
             "candidate_title": candidate.title,
             "candidate_location": single_line(candidate.finding.get("location")),
             "candidate_cwe": ", ".join(display_list(candidate.finding.get("cwe_id") or candidate.finding.get("cwe"))),
@@ -272,7 +277,12 @@ async def _filter_semantic_duplicates(
             matched_key = str(parsed.get("matched_dedupe_key", ""))
             reason = str(parsed.get("reason", ""))
 
-            if decision == "duplicate" and matched_key:
+            if decision == "duplicate":
+                if matched_key not in existing_keys:
+                    raise ValueError(
+                        "duplicate decision referenced a dedupe key that was not "
+                        "present in the supplied Disclosure inventory"
+                    )
                 logger.info(
                     "Stage 6: Semantic dedupe filtered %s as duplicate of %s. Reason: %s",
                     label,
@@ -280,6 +290,10 @@ async def _filter_semantic_duplicates(
                     reason,
                 )
                 continue
+            if decision != "new":
+                raise ValueError(f"unsupported semantic dedupe decision: {decision!r}")
+            if matched_key:
+                raise ValueError("new decision must use an empty matched_dedupe_key")
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning(
                 "Stage 6: Could not parse semantic dedupe response for %s: %s. Treating as new.",
@@ -301,6 +315,36 @@ async def _filter_semantic_duplicates(
         len(candidates),
     )
     return filtered
+
+
+async def _select_disclosure_candidates(
+    stage5_reports: list[str],
+    config: AuditConfig,
+    repo_url: str,
+) -> list[_DisclosureCandidate]:
+    """Apply exact and semantic deduplication before disclosure generation."""
+    candidates = _filter_known_duplicates(
+        stage5_reports,
+        config,
+        repo_url,
+        config.known_disclosures,
+    )
+    if not candidates:
+        logger.info(
+            "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after database dedupe."
+        )
+        return []
+
+    candidates = await _filter_semantic_duplicates(
+        candidates,
+        config.known_disclosures,
+        config,
+    )
+    if not candidates:
+        logger.info(
+            "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after semantic dedupe."
+        )
+    return candidates
 
 
 def _filter_reproduced(stage5_reports: list[str]) -> list[str]:
@@ -472,27 +516,12 @@ async def run_stage6(
         return []
 
     repo_url = capture_repo_identity(config.target).get("repo_url", "")
-    candidates = _filter_known_duplicates(
+    candidates = await _select_disclosure_candidates(
         reproduced,
         config,
         repo_url,
-        config.known_disclosures,
     )
     if not candidates:
-        logger.info(
-            "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after database dedupe."
-        )
-        return []
-
-    candidates = await _filter_semantic_duplicates(
-        candidates,
-        config.known_disclosures,
-        config,
-    )
-    if not candidates:
-        logger.info(
-            "Stage 6: No new reproduced vulnerabilities to prepare disclosures for after semantic dedupe."
-        )
         return []
 
     logger.info("Stage 6: Preparing disclosures for %d reproduced vulnerabilities.", len(candidates))

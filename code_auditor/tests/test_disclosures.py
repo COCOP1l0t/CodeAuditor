@@ -323,6 +323,58 @@ def test_semantic_dedupe_uses_database_metadata(tmp_path: Path, monkeypatch) -> 
 
 
 @pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "decision": "duplicate",
+            "matched_dedupe_key": "sha256:" + "b" * 64,
+            "reason": "hallucinated inventory key",
+        },
+        {
+            "decision": "unknown",
+            "matched_dedupe_key": "",
+            "reason": "unsupported decision",
+        },
+        {
+            "decision": "new",
+            "matched_dedupe_key": "sha256:" + "a" * 64,
+            "reason": "new must not reference an existing entry",
+        },
+    ],
+)
+def test_semantic_dedupe_fails_open_for_invalid_agent_decision(
+    tmp_path: Path,
+    monkeypatch,
+    response: dict[str, str],
+) -> None:
+    config, _checkpoint, _target, output_dir = _stage6_config(tmp_path)
+    finding = _finding()
+    _write_stage4(output_dir, "H-01", finding)
+    report = _write_stage5(output_dir, "H-01")
+    candidate = stage6._load_candidate(str(report), config, "")
+    existing = (
+        {
+            "dedupe_key": "sha256:" + "a" * 64,
+            "title": "Existing database row",
+            "location": finding["location"],
+            "trigger": finding["trigger"],
+            "summary": finding["summary"],
+        },
+    )
+
+    async def fake_run_agent(*_args: object, **_kwargs: object) -> str:
+        return json.dumps(response)
+
+    monkeypatch.setattr(stage6, "run_agent", fake_run_agent)
+
+    result = asyncio.run(
+        stage6._filter_semantic_duplicates([candidate], existing, config)
+    )
+
+    assert result == [candidate]
+
+
+@pytest.mark.parametrize(
     ("content", "expected"),
     [
         ("Subject: Buffer overflow in parser\n\nBody\n", "Buffer overflow in parser"),

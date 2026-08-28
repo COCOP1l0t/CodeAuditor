@@ -61,6 +61,7 @@ let agentSettings = null;
 let managedResultsDir = "";
 let terminalToken = "";
 let terminalEnabled = false;
+let dashboardSummaryAvailable = false;
 let terminalSequence = 0;
 const terminalSessions = new Map();
 let cveImportCandidates = [];
@@ -126,6 +127,7 @@ async function loadConfig() {
     managedResultsDir = cfg.results_dir || "";
     terminalToken = cfg.terminal_token || "";
     terminalEnabled = cfg.terminal_enabled === true && terminalToken !== "";
+    dashboardSummaryAvailable = cfg.capabilities?.dashboard_summary === true;
     if (managedResultsDir) {
       $("import-output-dir").placeholder =
         `${managedResultsDir}/project/audit-output-commit`;
@@ -172,6 +174,7 @@ function updateAgentSettingsSummary() {
   const summary = `${providerSummary} · ${sandboxModeLabel(agentSettings.sandbox_mode)}`;
   $("agent-settings-summary").textContent = summary;
   $("f-agent-summary").textContent = summary;
+  renderDashboardRuntime();
 }
 
 async function loadAgentSettings() {
@@ -334,6 +337,209 @@ $("settings-form").addEventListener("submit", async (event) => {
     saveButton.disabled = false;
   }
 });
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
+let dashboardLoadSequence = 0;
+
+function dashboardAgentLabel() {
+  if (!agentSettings) return "Unavailable";
+  const backend = agentSettings.backend || "claude";
+  const provider = (agentSettings.providers || {})[backend] || {};
+  if (provider.mode === "custom") {
+    return `${agentBackendLabel(backend)} · ${provider.model || "custom provider"}`;
+  }
+  return `${agentBackendLabel(backend)} · local CLI`;
+}
+
+function renderDashboardRuntime() {
+  $("dashboard-agent").textContent = dashboardAgentLabel();
+  $("dashboard-sandbox").textContent = sandboxModeLabel(
+    agentSettings?.sandbox_mode || "docker-networked"
+  );
+}
+
+function dashboardStatusLabel(status) {
+  return {
+    done: "Complete",
+    running: "Running",
+    failed: "Failed",
+    cancelled: "Cancelled",
+    imported: "Imported",
+    unreviewed: "Unreviewed",
+    reported: "Reported",
+    confirmed: "Confirmed",
+    rejected: "Rejected",
+    duplicated: "Duplicated",
+    triage: "Triage",
+    bug: "Bug",
+    slop: "Slop",
+  }[status] || status;
+}
+
+function renderDashboardStatusList(containerId, counts, preferredOrder) {
+  const container = $(containerId);
+  const keys = [
+    ...preferredOrder,
+    ...Object.keys(counts || {}).filter((key) => !preferredOrder.includes(key)),
+  ];
+  const visible = keys.filter((key) => Number(counts?.[key] || 0) > 0);
+  const total = visible.reduce((sum, key) => sum + Number(counts[key] || 0), 0);
+  if (!visible.length) {
+    container.innerHTML = `<p class="dim">No records available yet.</p>`;
+    return;
+  }
+  container.innerHTML = visible
+    .map((status) => {
+      const count = Number(counts[status] || 0);
+      const width = Math.max(2, (count / total) * 100);
+      return (
+        `<div class="dashboard-status-row" data-status="${escapeHtml(status)}">` +
+        `<span class="dashboard-status-label">${escapeHtml(dashboardStatusLabel(status))}</span>` +
+        `<span class="dashboard-status-track" aria-hidden="true">` +
+        `<span class="dashboard-status-fill" style="width:${width.toFixed(1)}%"></span></span>` +
+        `<strong class="dashboard-status-count">${escapeHtml(count)}</strong></div>`
+      );
+    })
+    .join("");
+}
+
+function renderDashboardRecentRuns(runs) {
+  const container = $("dashboard-recent-runs");
+  if (!runs.length) {
+    container.innerHTML = `<p class="dim">No audit runs recorded yet.</p>`;
+    return;
+  }
+  container.innerHTML = runs
+    .map((run) => {
+      const commit = run.commit ? String(run.commit).slice(0, 7) : "no commit";
+      const reproduced = Number(run.reproduced_vulns_count || 0);
+      return (
+        `<a class="dashboard-recent-run" href="#/run/${escapeHtml(run.id)}">` +
+        `<span class="dashboard-run-identity">` +
+        `<span class="dashboard-run-name">${escapeHtml(repoDisplay(run))}</span>` +
+        `<span class="dashboard-run-meta">Run #${escapeHtml(run.id)} · ${escapeHtml(commit)}</span>` +
+        `</span>` +
+        `<span class="badge badge-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>` +
+        `<span class="dashboard-run-result"><strong>${escapeHtml(reproduced)}</strong> reproduced</span>` +
+        `<span class="dashboard-run-time">${escapeHtml(fmtTime(run.started_at || run.created_at))}</span>` +
+        `</a>`
+      );
+    })
+    .join("");
+}
+
+function updateDashboardActiveJobs(jobs = busyJobs()) {
+  const active = jobs.filter((job) => BUSY_JOB_STATES.has(job.state));
+  $("dashboard-active").textContent = String(active.length);
+  const audits = active.filter((job) => job.kind !== "reproduction").length;
+  const reproductions = active.length - audits;
+  $("dashboard-active-detail").textContent = active.length
+    ? `${audits} audit${audits === 1 ? "" : "s"} · ${reproductions} reproduction${reproductions === 1 ? "" : "s"}`
+    : "No jobs running";
+}
+
+async function loadDashboardCompatibilityData() {
+  const paths = [
+    "/api/history?limit=500",
+    "/api/jobs",
+    "/api/disclosures",
+    "/api/cves",
+    "/api/disclosures/trash",
+    "/api/repos",
+  ];
+  const responses = await Promise.all(
+    paths.map((path) => fetch(path, { cache: "no-store" }))
+  );
+  const failed = responses.find((response) => !response.ok);
+  if (failed) throw new Error(`HTTP ${failed.status}`);
+  const [history, jobs, disclosures, cves, trash, repositories] =
+    await Promise.all(responses.map((response) => response.json()));
+  const runCounts = {};
+  let reproduced = 0;
+  for (const run of history.runs || []) {
+    const status = run.status || "unknown";
+    runCounts[status] = Number(runCounts[status] || 0) + 1;
+    reproduced += Number(run.reproduced_vulns_count || 0);
+  }
+  const disclosureCounts = disclosures.counts || {};
+  return {
+    runs: {
+      total: history.total || 0,
+      counts: runCounts,
+      reproduced,
+    },
+    recent_runs: (history.runs || []).slice(0, 6),
+    jobs: jobs.jobs || [],
+    disclosures: {
+      total: Object.values(disclosureCounts).reduce(
+        (sum, count) => sum + Number(count || 0),
+        0
+      ),
+      counts: disclosureCounts,
+    },
+    cves: { total: cves.total || 0 },
+    trash: { total: trash.total || 0 },
+    repositories: { total: (repositories.repos || []).length },
+  };
+}
+
+async function fetchDashboardData() {
+  if (!dashboardSummaryAvailable) return loadDashboardCompatibilityData();
+  const res = await fetch("/api/dashboard", { cache: "no-store" });
+  if (res.ok) return res.json();
+  if (res.status === 404) return loadDashboardCompatibilityData();
+  const error = await res.json().catch(() => ({}));
+  throw new Error(error.detail || `HTTP ${res.status}`);
+}
+
+async function loadDashboard() {
+  const sequence = ++dashboardLoadSequence;
+  $("dashboard-error").textContent = "";
+  try {
+    const data = await fetchDashboardData();
+    if (sequence !== dashboardLoadSequence) return;
+
+    const runs = data.runs || {};
+    const runCounts = runs.counts || {};
+    const disclosures = data.disclosures || {};
+    const disclosureCounts = disclosures.counts || {};
+    $("dashboard-audits").textContent = String(runs.total || 0);
+    const attention = Number(runCounts.failed || 0) + Number(runCounts.cancelled || 0);
+    $("dashboard-audits-detail").textContent =
+      `${Number(runCounts.done || 0)} complete · ${attention} need attention`;
+    $("dashboard-reproduced").textContent = String(runs.reproduced || 0);
+    $("dashboard-disclosures").textContent = String(disclosures.total || 0);
+    $("dashboard-disclosures-detail").textContent =
+      `${Number(disclosureCounts.reported || 0)} reported · ` +
+      `${Number(disclosureCounts.confirmed || 0)} confirmed`;
+    $("dashboard-cves").textContent = String(data.cves?.total || 0);
+    $("dashboard-repositories").textContent = String(data.repositories?.total || 0);
+    $("dashboard-trash").textContent = String(data.trash?.total || 0);
+    updateDashboardActiveJobs(data.jobs || []);
+    renderDashboardRecentRuns(data.recent_runs || []);
+    renderDashboardStatusList(
+      "dashboard-run-health",
+      runCounts,
+      ["done", "running", "failed", "cancelled", "imported"]
+    );
+    renderDashboardStatusList(
+      "dashboard-disclosure-status",
+      disclosureCounts,
+      ["unreviewed", "triage", "reported", "confirmed", "bug", "duplicated", "rejected", "slop"]
+    );
+    renderDashboardRuntime();
+    $("dashboard-updated").textContent =
+      `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  } catch (error) {
+    if (sequence !== dashboardLoadSequence) return;
+    $("dashboard-updated").textContent = "Dashboard unavailable";
+    $("dashboard-error").textContent = `Failed to load dashboard: ${error.message || error}`;
+    $("dashboard-recent-runs").innerHTML = `<p class="dim">Recent runs unavailable.</p>`;
+  }
+}
+
+$("dashboard-new-audit").addEventListener("click", () => $("btn-new-audit").click());
+$("dashboard-settings").addEventListener("click", () => $("btn-settings").click());
 
 // ── Cloned repositories ─────────────────────────────────────────────────────
 async function loadRepos() {
@@ -714,6 +920,7 @@ function applyJobStatus(status) {
   activeJobs.set(String(status.job_key), status);
   renderJobList();
   updateResumeButtons();
+  updateDashboardActiveJobs();
 }
 
 function jobDisplayLabel(job) {
@@ -799,6 +1006,8 @@ function handleJobLifecycleEvent(ev) {
   renderJobList();
   updateResumeButtons();
   updateReproductionStartAvailability();
+  updateDashboardActiveJobs();
+  if (terminal && !$("view-dashboard").hidden) loadDashboard();
   if (!$("view-history").hidden) loadHistory();
   if (ev.kind === "reproduction") {
     if (terminal && key === activeReproKey) finishReproductionJob(ev);
@@ -3721,6 +3930,7 @@ function route() {
   const runMatch = hash.match(/^#\/run\/(\d+)$/);
   const targetMatch = hash.match(/^#\/target\/(.+)$/);
   const views = {
+    dashboard: $("view-dashboard"),
     history: $("view-history"),
     reproduction: $("view-reproduction"),
     detail: $("view-run-detail"),
@@ -3788,14 +3998,18 @@ function route() {
       if (t.dataset.route === "cves") t.classList.add("tab-active");
     });
     loadCves();
-  } else {
-    // "#/" and anything unknown lands on History; audits are created from
-    // the New Audit dialog and inspected from History rows.
+  } else if (hash.startsWith("#/history")) {
     views.history.hidden = false;
     tabs.forEach((t) => {
       if (t.dataset.route === "history") t.classList.add("tab-active");
     });
     loadHistory();
+  } else {
+    views.dashboard.hidden = false;
+    tabs.forEach((t) => {
+      if (t.dataset.route === "dashboard") t.classList.add("tab-active");
+    });
+    loadDashboard();
   }
 }
 

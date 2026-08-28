@@ -544,6 +544,7 @@ def create_app(
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
         elif request.url.path in {
+            "/api/dashboard",
             "/api/settings",
             "/api/sandbox/capability",
         } or re.fullmatch(r"/api/audit/\d+/processes", request.url.path):
@@ -567,6 +568,7 @@ def create_app(
             "wikis_dir": settings.wikis_dir,
             "results_dir": settings.results_dir,
             "max_concurrent_jobs": settings.max_concurrent_jobs,
+            "capabilities": {"dashboard_summary": True},
             "terminal_enabled": True,
             "terminal_token": app.state.terminal_token,
         }
@@ -574,6 +576,23 @@ def create_app(
     @app.get("/api/settings")
     async def get_agent_settings() -> dict:
         return settings.public_agent_settings()
+
+    @app.get("/api/dashboard")
+    def get_dashboard() -> dict:
+        """Compact operational summary for the Web landing page."""
+        recent_runs, _total = store.list_runs(limit=6)
+        return {
+            **store.dashboard_summary(),
+            "recent_runs": recent_runs,
+            "jobs": manager.list_jobs(),
+            "repositories": {
+                "total": len(list_cloned_repos(settings.repos_dir)),
+            },
+            "runtime": {
+                "backend": settings.backend,
+                "sandbox_mode": settings.sandbox_mode,
+            },
+        }
 
     @app.get("/api/sandbox/capability")
     async def get_sandbox_capability(

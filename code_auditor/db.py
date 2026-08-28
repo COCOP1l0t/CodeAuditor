@@ -1742,6 +1742,61 @@ class AuditStore:
             ).fetchall()
         return [dict(row) for row in rows], total
 
+    def dashboard_summary(self) -> dict[str, Any]:
+        """Return compact aggregate counts for the Web dashboard."""
+        reproduced_statuses = sorted(REPRODUCED_STATUSES)
+        status_placeholders = ",".join("?" * len(reproduced_statuses))
+        with self._connect() as conn:
+            run_counts = {
+                str(row["status"]): int(row["total"])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) AS total FROM runs GROUP BY status"
+                ).fetchall()
+            }
+            reproduced = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM vulnerabilities v
+                    JOIN pocs p
+                      ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+                    WHERE p.status IN ({status_placeholders})
+                    """,
+                    reproduced_statuses,
+                ).fetchone()[0]
+            )
+            disclosure_counts = {
+                str(row["review_status"] or "unreviewed"): int(row["total"])
+                for row in conn.execute(
+                    """
+                    SELECT review_status, COUNT(*) AS total
+                    FROM disclosed_bugs
+                    WHERE deleted_at IS NULL
+                    GROUP BY review_status
+                    """
+                ).fetchall()
+            }
+            trash_total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM disclosed_bugs WHERE deleted_at IS NOT NULL"
+                ).fetchone()[0]
+            )
+            cve_total = int(conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0])
+
+        return {
+            "runs": {
+                "total": sum(run_counts.values()),
+                "counts": run_counts,
+                "reproduced": reproduced,
+            },
+            "disclosures": {
+                "total": sum(disclosure_counts.values()),
+                "counts": disclosure_counts,
+            },
+            "cves": {"total": cve_total},
+            "trash": {"total": trash_total},
+        }
+
     def get_run(self, run_id: int) -> dict | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()

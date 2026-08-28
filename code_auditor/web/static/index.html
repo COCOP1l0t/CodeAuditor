@@ -17,28 +17,32 @@
       <span class="logo-text">CodeAuditor</span>
     </div>
     <nav id="tabs">
-      <button type="button" class="tab" id="btn-new-audit">
+      <a href="#/" class="tab" data-route="dashboard" aria-label="Dashboard" title="Dashboard">
+        <svg viewBox="0 0 24 24"><path d="M3 11 12 4l9 7"/><path d="M5 10v10h14V10"/><path d="M9 20v-6h6v6"/></svg>
+        <span>Dashboard</span>
+      </a>
+      <button type="button" class="tab" id="btn-new-audit" aria-label="New Audit" title="New Audit">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
         <span>New Audit</span>
       </button>
-      <a href="#/history" class="tab" data-route="history">
+      <a href="#/history" class="tab" data-route="history" aria-label="History" title="History">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         <span>History</span>
       </a>
-      <a href="#/reproduction" class="tab" data-route="reproduction">
+      <a href="#/reproduction" class="tab" data-route="reproduction" aria-label="Reproduction" title="Reproduction">
         <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/></svg>
         <span>Reproduction</span>
       </a>
-      <a href="#/disclosures" class="tab" data-route="disclosures">
+      <a href="#/disclosures" class="tab" data-route="disclosures" aria-label="Disclosures" title="Disclosures">
         <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         <span>Disclosures</span>
       </a>
-      <a href="#/trash" class="tab" data-route="trash">
+      <a href="#/trash" class="tab" data-route="trash" aria-label="Recycle Bin" title="Recycle Bin">
         <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M8 6V4h8v2M19 6l-1 15H6L5 6"/><line x1="10" y1="10" x2="10" y2="17"/><line x1="14" y1="10" x2="14" y2="17"/></svg>
         <span>Recycle Bin</span>
         <span id="trash-nav-count" class="nav-count" hidden></span>
       </a>
-      <a href="#/cves" class="tab" data-route="cves">
+      <a href="#/cves" class="tab" data-route="cves" aria-label="CVEs" title="CVEs">
         <svg viewBox="0 0 24 24"><path d="M8 3h8l5 5v8l-5 5H8l-5-5V8z"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
         <span>CVEs</span>
       </a>
@@ -192,6 +196,116 @@
       </form>
     </section>
     </dialog>
+
+    <div id="view-dashboard" hidden>
+      <section class="dashboard-hero" aria-labelledby="dashboard-title">
+        <img class="dashboard-hero-icon" src="/static/code-auditor-8bit.png"
+             alt="Pixel-art shield inspecting a software bug" />
+        <div class="dashboard-hero-copy">
+          <h1 id="dashboard-title">CodeAuditor</h1>
+          <p>Automated source-code security auditing, reproduction, and disclosure tracking.</p>
+        </div>
+        <div class="dashboard-hero-actions">
+          <button type="button" id="dashboard-new-audit" class="btn btn-start">Start new audit</button>
+          <a class="btn" href="#/history">View audit history</a>
+        </div>
+      </section>
+
+      <section class="dashboard" aria-labelledby="dashboard-overview-title">
+        <header class="dashboard-heading">
+          <div>
+            <h2 id="dashboard-overview-title">Overview</h2>
+            <p>Current audit activity and local security evidence.</p>
+          </div>
+          <span id="dashboard-updated" class="dashboard-updated">Loading dashboard…</span>
+        </header>
+
+        <div class="dashboard-metrics" aria-label="Audit totals">
+          <a class="dashboard-metric" href="#/history">
+            <span class="dashboard-metric-label">Audit runs</span>
+            <strong id="dashboard-audits">—</strong>
+            <small id="dashboard-audits-detail">Recorded history</small>
+          </a>
+          <div class="dashboard-metric">
+            <span class="dashboard-metric-label">Active jobs</span>
+            <strong id="dashboard-active">—</strong>
+            <small id="dashboard-active-detail">Audit and reproduction jobs</small>
+          </div>
+          <a class="dashboard-metric" href="#/reproduction">
+            <span class="dashboard-metric-label">Reproduced</span>
+            <strong id="dashboard-reproduced">—</strong>
+            <small>Validated vulnerabilities</small>
+          </a>
+          <a class="dashboard-metric" href="#/disclosures">
+            <span class="dashboard-metric-label">Disclosures</span>
+            <strong id="dashboard-disclosures">—</strong>
+            <small id="dashboard-disclosures-detail">Local review records</small>
+          </a>
+          <a class="dashboard-metric" href="#/cves">
+            <span class="dashboard-metric-label">CVEs</span>
+            <strong id="dashboard-cves">—</strong>
+            <small>Linked public records</small>
+          </a>
+        </div>
+
+        <div class="dashboard-panels">
+          <section class="panel dashboard-panel dashboard-recent-panel">
+            <header class="dashboard-panel-heading">
+              <div>
+                <h2>Recent audits</h2>
+                <p>The latest recorded runs and their reproduced results.</p>
+              </div>
+              <a href="#/history">All history</a>
+            </header>
+            <div id="dashboard-recent-runs" class="dashboard-recent-runs">
+              <p class="dim">Loading recent runs…</p>
+            </div>
+          </section>
+
+          <section class="panel dashboard-panel">
+            <header class="dashboard-panel-heading">
+              <div>
+                <h2>Run health</h2>
+                <p>Status distribution across recorded audits.</p>
+              </div>
+            </header>
+            <div id="dashboard-run-health" class="dashboard-status-list">
+              <p class="dim">Loading run health…</p>
+            </div>
+          </section>
+
+          <section class="panel dashboard-panel">
+            <header class="dashboard-panel-heading">
+              <div>
+                <h2>Disclosure review</h2>
+                <p>Human review state for generated disclosure packages.</p>
+              </div>
+              <a href="#/disclosures">Open registry</a>
+            </header>
+            <div id="dashboard-disclosure-status" class="dashboard-status-list">
+              <p class="dim">Loading review status…</p>
+            </div>
+          </section>
+
+          <section class="panel dashboard-panel">
+            <header class="dashboard-panel-heading">
+              <div>
+                <h2>Runtime</h2>
+                <p>The environment selected for newly started jobs.</p>
+              </div>
+              <button type="button" id="dashboard-settings" class="dashboard-text-button">Configure</button>
+            </header>
+            <dl class="dashboard-runtime-list">
+              <div><dt>Agent</dt><dd id="dashboard-agent">—</dd></div>
+              <div><dt>Sandbox</dt><dd id="dashboard-sandbox">—</dd></div>
+              <div><dt>Repositories</dt><dd id="dashboard-repositories">—</dd></div>
+              <div><dt>Recycle bin</dt><dd id="dashboard-trash">—</dd></div>
+            </dl>
+          </section>
+        </div>
+        <p id="dashboard-error" class="dashboard-error" role="alert"></p>
+      </section>
+    </div><!-- /view-dashboard -->
 
     <div id="view-run-detail" hidden>      <section class="panel">
         <div class="history-run-header">

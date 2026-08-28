@@ -1403,8 +1403,38 @@ def test_api_config_returns_defaults(tmp_path) -> None:
     assert body["wikis_dir"] == str(tmp_path / "wiki")
     assert body["terminal_enabled"] is True
     assert len(body["terminal_token"]) >= 32
+    assert body["capabilities"]["dashboard_summary"] is True
     assert "backends" not in body
     assert "default_models" not in body
+
+
+def test_api_dashboard_returns_compact_operational_summary(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    output_dir = _make_output_dir(tmp_path)
+    run_id = app.state.store.import_output_dir(output_dir)
+    _make_managed_repo(tmp_path, "github.com/user/dashboard-repo")
+
+    response = TestClient(app).get("/api/dashboard")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["runs"] == {
+        "total": 1,
+        "counts": {"imported": 1},
+        "reproduced": 1,
+    }
+    assert body["recent_runs"][0]["id"] == run_id
+    assert body["recent_runs"][0]["reproduced_vulns_count"] == 1
+    assert body["disclosures"]["total"] == 1
+    assert body["cves"]["total"] == 0
+    assert body["trash"]["total"] == 0
+    assert body["repositories"]["total"] == 1
+    assert body["jobs"] == []
+    assert body["runtime"] == {
+        "backend": "claude",
+        "sandbox_mode": "local-worktree",
+    }
 
 
 def test_api_sandbox_capability_reports_server_check(tmp_path, monkeypatch) -> None:
@@ -1606,6 +1636,9 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "CodeAuditor" in res.text
     assert '<link rel="icon" href="/static/icon.svg" type="image/svg+xml" />' in res.text
     assert '<img class="logo-mark" src="/static/icon.svg"' in res.text
+    assert 'data-route="dashboard"' in res.text
+    assert 'id="view-dashboard"' in res.text
+    assert 'src="/static/code-auditor-8bit.png"' in res.text
     assert 'id="r-target-select"' in res.text
     assert 'id="r-commit-select"' in res.text
     assert 'id="r-bug-select"' in res.text
@@ -1723,6 +1756,10 @@ def test_api_index_serves_html(tmp_path) -> None:
 
     icon = client.get("/static/icon.svg")
     assert icon.status_code == 200
+    dashboard_icon = client.get("/static/code-auditor-8bit.png")
+    assert dashboard_icon.status_code == 200
+    assert dashboard_icon.headers["content-type"] == "image/png"
+    assert dashboard_icon.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert icon.headers["content-type"].startswith("image/svg+xml")
     assert "CodeAuditor" in icon.text
 

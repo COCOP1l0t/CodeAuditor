@@ -4,6 +4,8 @@
 
 # CodeAuditor
 
+![CodeAuditor Web 仪表盘](docs/assets/dashboard.png)
+
 CodeAuditor 是一个多阶段智能代码审计流水线，支持 [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) 和 [Codex App Server Python SDK](https://github.com/openai/codex/blob/main/sdk/python/README.md)。它会研究目标项目、发现并评估安全缺陷、复现已确认的漏洞，并生成可用于披露的报告。
 
 CodeAuditor 已帮助多个常用开源项目发现 CVE，详见[已发现漏洞](#已发现漏洞)。
@@ -61,12 +63,6 @@ Web 服务选项：
 docker build -f docker/code-auditor-sandbox.Dockerfile \
   -t code-auditor-sandbox:latest docker
 ```
-
-## Web 界面
-
-通过 Web 界面可以启动和监控审计、查看历史与披露、检查 PoC 结果及重新复现。报告和 PoC 产物保留在结果目录中，审计元数据存入 SQLite。
-
-默认的 `0.0.0.0` 会在所有网络接口上暴露 Web 界面；不需要远程访问时，请使用 `--host 127.0.0.1` 限制为本机访问。Web 界面可以启动智能体，并为已复现的 PoC 提供交互式 Shell；设置文件也可能包含 API Key。
 
 ## Wiki 知识库
 

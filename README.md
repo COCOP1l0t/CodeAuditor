@@ -4,6 +4,8 @@
 
 # CodeAuditor
 
+![CodeAuditor Web dashboard](docs/assets/dashboard.png)
+
 CodeAuditor is a multi-stage, agentic code-auditing pipeline powered by the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) or the [Codex App Server Python SDK](https://github.com/openai/codex/blob/main/sdk/python/README.md). It researches a target project, finds and evaluates security bugs, reproduces confirmed vulnerabilities, and prepares disclosure-ready reports.
 
 It has helped discover CVEs in widely used open-source projects; see [Vulnerabilities found](#vulnerabilities-found).
@@ -61,12 +63,6 @@ Stage 5 and 6 can use a networked Docker sandbox, a network-isolated Docker sand
 docker build -f docker/code-auditor-sandbox.Dockerfile \
   -t code-auditor-sandbox:latest docker
 ```
-
-## Web UI
-
-Use the Web UI to start and monitor audits, review history and disclosures, inspect PoC results, and rerun reproductions. Report and PoC artifacts remain under the results directory, while audit metadata is stored in SQLite.
-
-The default `0.0.0.0` bind exposes the UI on every network interface. Use `--host 127.0.0.1` when remote access is not required. The UI can start agents and provide interactive shells for reproduced PoCs, and its settings file may contain API keys.
 
 ## Wiki knowledge base
 

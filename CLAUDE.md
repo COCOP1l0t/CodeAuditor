@@ -18,8 +18,8 @@ pip install -e .
 # Start the Web UI (default mode)
 code-auditor
 
-# Equivalent explicit form and common server options
-code-auditor --web --host 0.0.0.0 --port 8000
+# Common server options
+code-auditor --host 0.0.0.0 --port 8000
 
 # Audit settings live in ~/.code_auditor/settings.json and the Web UI.
 # Historical retention/cleanup commands remain available via --help.

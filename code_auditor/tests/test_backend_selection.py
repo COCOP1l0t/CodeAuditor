@@ -29,21 +29,18 @@ from code_auditor.sandbox import DockerScratch
 def test_cli_defaults_to_web_server() -> None:
     args = _build_parser().parse_args([])
 
-    assert args.web is False
     assert args.host == "0.0.0.0"
     assert args.port == 8000
 
 
-def test_cli_accepts_explicit_web_server_options() -> None:
+def test_cli_accepts_web_server_options() -> None:
     args = _build_parser().parse_args([
-        "--web",
         "--host",
         "127.0.0.1",
         "--port",
         "9000",
     ])
 
-    assert args.web is True
     assert args.host == "127.0.0.1"
     assert args.port == 9000
 
@@ -58,6 +55,7 @@ def test_cli_rejects_removed_discovered_option() -> None:
 @pytest.mark.parametrize(
     "removed_args",
     [
+        ["--web"],
         ["--tui"],
         ["--target", "/tmp/project"],
         ["--output-dir", "/tmp/output"],
@@ -123,7 +121,7 @@ def test_main_starts_web_by_default(
     }
 
 
-def test_main_forwards_explicit_web_options(
+def test_main_forwards_web_server_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -134,7 +132,6 @@ def test_main_forwards_explicit_web_options(
     monkeypatch.setattr("code_auditor.web.run_web_server", fake_run_web_server)
     monkeypatch.setattr(sys, "argv", [
         "code-auditor",
-        "--web",
         "--host",
         "127.0.0.1",
         "--port",

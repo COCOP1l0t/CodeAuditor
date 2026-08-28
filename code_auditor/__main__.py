@@ -15,13 +15,11 @@ from .utils import render_json_report
 _MAINTENANCE_COMMANDS = (
     (
         "reviewed_cleanup_dry_run",
-        "--reviewed-cleanup-dry-run",
         build_reviewed_cleanup_report,
         ReviewedCleanupError,
     ),
     (
         "reviewed_cleanup_apply",
-        "--reviewed-cleanup-apply",
         apply_reviewed_cleanup,
         ReviewedCleanupError,
     ),
@@ -32,11 +30,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="code-auditor",
         description="Web-based multi-stage code auditing agent application",
-    )
-    parser.add_argument(
-        "--web",
-        action="store_true",
-        help="Launch the Web UI (the default when no maintenance command is selected)",
     )
     parser.add_argument(
         "--host",
@@ -89,15 +82,12 @@ def _run_web(args: argparse.Namespace) -> None:
 
 def _run_maintenance_command(
     args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
 ) -> bool | None:
     """Dispatch the selected read/write maintenance mode, if any."""
-    for attribute, flag, handler, error_type in _MAINTENANCE_COMMANDS:
+    for attribute, handler, error_type in _MAINTENANCE_COMMANDS:
         results_root = getattr(args, attribute)
         if results_root is None:
             continue
-        if args.web:
-            parser.error(f"{flag} cannot be combined with the Web UI")
         try:
             report = handler(results_root, db_path=DEFAULT_DB_PATH)
         except error_type as exc:
@@ -112,7 +102,7 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    maintenance_succeeded = _run_maintenance_command(args, parser)
+    maintenance_succeeded = _run_maintenance_command(args)
     if maintenance_succeeded is not None:
         if not maintenance_succeeded:
             sys.exit(1)

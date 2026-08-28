@@ -46,17 +46,10 @@ Start the Web UI and open `http://127.0.0.1:8000`:
 code-auditor
 ```
 
-`--web` remains an explicit, compatible spelling:
-
-```bash
-code-auditor --web --host 0.0.0.0 --port 8000
-```
-
 Web server options:
 
 | Flag | Description |
 |------|-------------|
-| `--web` | Explicitly start the Web UI; optional because Web is the default |
 | `--host` | Bind address; default `0.0.0.0` |
 | `--port` | Listen port; default `8000` |
 

@@ -1486,6 +1486,26 @@ tr.run-row:hover {
   cursor: not-allowed;
 }
 
+.folder-picker-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.folder-picker-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.folder-picker-row .btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+#f-local-directory-label[hidden] {
+  display: none;
+}
+
 .history-action {
   width: 1%;
   white-space: nowrap;

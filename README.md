@@ -55,7 +55,7 @@ Web server options:
 | `--host` | Bind address; default `0.0.0.0` |
 | `--port` | Listen port; default `8000` |
 
-Audit parameters such as repository, Wiki, backend, model, sandbox mode, parallelism, and output paths are managed in the Web UI and `~/.code_auditor/settings.json`. Run `code-auditor --help` for maintenance commands.
+Audit parameters such as repository, Wiki, backend, model, sandbox mode, parallelism, and output paths are managed in the Web UI and `~/.code_auditor/settings.json`. In **New Audit**, the target can be a managed checkout, a remote Git URL, or a local code folder selected with the native folder picker. Local folders are audited in place without running `git pull`. Run `code-auditor --help` for maintenance commands.
 
 Stage 5 and 6 can use a networked Docker sandbox, a network-isolated Docker sandbox, or a local detached worktree. The Web settings enable Docker choices only after the server passes its Docker, image, disk-space, and Agent runtime checks. Docker is the default; build its image once before an audit reaches reproduction:
 

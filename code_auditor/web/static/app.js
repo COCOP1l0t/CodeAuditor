@@ -554,6 +554,10 @@ async function loadRepos() {
       opt.textContent = repo.name;
       select.appendChild(opt);
     }
+    const local = document.createElement("option");
+    local.value = "__local__";
+    local.textContent = "Choose a local code folder…";
+    select.appendChild(local);
     const clone = document.createElement("option");
     clone.value = "__clone__";
     clone.textContent = "Clone a new repository URL…";
@@ -562,6 +566,8 @@ async function loadRepos() {
     // repo list unavailable; the select simply stays empty
   }
 }
+
+let localDirectoryToken = "";
 
 async function loadWikis() {
   const select = $("f-wiki-select");
@@ -584,11 +590,17 @@ async function loadWikis() {
 async function updateRepositoryChoice() {
   const repository = $("f-repo-select").value;
   const cloning = repository === "__clone__";
+  const choosingLocal = repository === "__local__";
   const gitUrlInput = $("f-git-url");
   gitUrlInput.disabled = !cloning;
   gitUrlInput.required = cloning;
   if (!cloning) gitUrlInput.value = "";
-  if (!repository || cloning) {
+  $("f-local-directory-label").hidden = !choosingLocal;
+  if (!choosingLocal) {
+    localDirectoryToken = "";
+    $("f-local-directory-path").value = "";
+  }
+  if (!repository || cloning || choosingLocal) {
     $("repo-runs").hidden = true;
     return;
   }
@@ -596,6 +608,33 @@ async function updateRepositoryChoice() {
 }
 
 $("f-repo-select").addEventListener("change", updateRepositoryChoice);
+
+$("btn-choose-local-directory").addEventListener("click", async () => {
+  const button = $("btn-choose-local-directory");
+  const originalLabel = button.textContent;
+  formError.textContent = "";
+  button.disabled = true;
+  button.textContent = "Choosing…";
+  try {
+    const res = await fetch("/api/local-directories/select", {
+      method: "POST",
+      headers: { "X-CodeAuditor-Token": terminalToken },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      formError.textContent = data.detail || `Folder picker failed (HTTP ${res.status})`;
+      return;
+    }
+    if (data.cancelled) return;
+    localDirectoryToken = data.token || "";
+    $("f-local-directory-path").value = data.path || "";
+  } catch (error) {
+    formError.textContent = `Folder picker failed: ${error}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
+});
 
 // ── New Audit dialog ────────────────────────────────────────────────────────
 const newAuditDialog = $("new-audit-dialog");
@@ -643,7 +682,7 @@ form.addEventListener("submit", async (e) => {
   const repository = $("f-repo-select").value;
   const gitUrl = $("f-git-url").value.trim();
   if (!repository) {
-    formError.textContent = "Select an existing repository or clone a new one.";
+    formError.textContent = "Select a managed repository, local folder, or remote Git URL.";
     return;
   }
   if (repository === "__clone__") {
@@ -652,6 +691,12 @@ form.addEventListener("submit", async (e) => {
       return;
     }
     body.git_url = gitUrl;
+  } else if (repository === "__local__") {
+    if (!localDirectoryToken) {
+      formError.textContent = "Choose a local code folder first.";
+      return;
+    }
+    body.local_directory = localDirectoryToken;
   } else {
     body.repository = repository;
   }

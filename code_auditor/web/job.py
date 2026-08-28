@@ -94,6 +94,7 @@ class JobValidationError(Exception):
 class AuditStartParams:
     target: str | None = None
     git_url: str | None = None
+    update_repo: bool = True
     output_dir: str | None = None
     wiki: str | None = None
     max_parallel: int = 1
@@ -600,6 +601,7 @@ class AuditJob:
             wiki_path=wiki_path,
             max_parallel=params.max_parallel,
             resume=True,
+            update_repo=params.update_repo,
             log_level=params.log_level,
             backend=params.backend,  # type: ignore[arg-type]
             model=self._resolve_model(params),
@@ -636,6 +638,7 @@ class AuditJob:
             wiki_path=wiki_path,
             max_parallel=params.max_parallel,
             resume=True,
+            update_repo=params.update_repo,
             log_level=params.log_level,
             backend=params.backend,  # type: ignore[arg-type]
             model=self._resolve_model(params),

@@ -70,7 +70,7 @@ async def run_setup(config: AuditConfig) -> None:
         await asyncio.to_thread(_git_pull, config.target)
     elif _is_git_repo(config.target):
         logger.info(
-            "Resuming pinned source checkout; skipping git pull for %s.",
+            "Git update disabled; auditing the existing checkout at %s.",
             config.target,
         )
 

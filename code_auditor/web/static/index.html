@@ -148,7 +148,7 @@
     <section class="panel" id="config-panel">
       <h2 id="new-audit-title">New Audit</h2>
       <p class="warning">
-        <strong>Repository update:</strong> Stage 0 runs <code>git pull</code> on the target repository before auditing.
+        <strong>Repository update:</strong> Managed and cloned Git targets run <code>git pull</code> before auditing. Local folders are always audited in place without a Git update.
       </p>
       <form id="audit-form">
         <div class="form-grid">
@@ -156,9 +156,10 @@
             Target repository
             <select id="f-repo-select">
               <option value="">— select a repository —</option>
+              <option value="__local__">Choose a local code folder…</option>
               <option value="__clone__">Clone a new repository URL…</option>
             </select>
-            <span class="hint">Choose a managed checkout or clone a new one.</span>
+            <span class="hint">Choose a managed checkout, a local folder, or clone a remote repository.</span>
           </label>
           <label id="f-git-url-label">
             Git repository URL
@@ -167,6 +168,15 @@
                    pattern="(https://[^ ]+|git@[^ ]+:[^ ]+)"
                    placeholder="https://github.com/user/repo.git" />
             <span class="hint">HTTPS or git@host:path SSH URLs only. Available after choosing "Clone a new repository URL…".</span>
+          </label>
+          <label id="f-local-directory-label" hidden>
+            Local code folder
+            <span class="folder-picker-row">
+              <input type="text" id="f-local-directory-path" readonly
+                     placeholder="No folder selected" />
+              <button type="button" id="btn-choose-local-directory" class="btn">Choose folder…</button>
+            </span>
+            <span class="hint">The selected folder is audited in place; source files are not copied into the managed repository directory.</span>
           </label>
           <label>
             Max parallel agents

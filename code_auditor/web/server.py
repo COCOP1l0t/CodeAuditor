@@ -7,13 +7,14 @@ import json
 import os
 import re
 import secrets
+import time
 from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -36,6 +37,12 @@ from .job import (
     JobConflictError,
     JobValidationError,
     ReproductionStartParams,
+)
+from .local_directories import (
+    LocalDirectoryPickerError,
+    LocalDirectoryPickerUnavailable,
+    choose_local_directory,
+    validate_local_audit_target,
 )
 from .progress import install_web_log_handler
 from .settings import (
@@ -60,6 +67,8 @@ _AGENT_LOG_PATTERNS = (
 )
 
 _REPOSITORY_NAME_PATTERN = r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+_LOCAL_DIRECTORY_TOKEN_PATTERN = r"^[A-Za-z0-9_-]{20,128}$"
+_LOCAL_DIRECTORY_TOKEN_TTL_SECONDS = 10 * 60
 _VULN_ID_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"
 _DEDUPE_KEY_PATTERN = r"^sha256:[0-9a-f]{64}$"
 DisclosureStatus = Literal[
@@ -83,6 +92,12 @@ class AuditStartRequest(StrictRequest):
         default=None, min_length=1, max_length=512, pattern=_REPOSITORY_NAME_PATTERN
     )
     git_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    local_directory: str | None = Field(
+        default=None,
+        min_length=20,
+        max_length=128,
+        pattern=_LOCAL_DIRECTORY_TOKEN_PATTERN,
+    )
     wiki: str | None = Field(
         default=None, min_length=1, max_length=512, pattern=_REPOSITORY_NAME_PATTERN
     )
@@ -516,6 +531,7 @@ def create_app(
     )
     app.state.manager = manager
     app.state.terminal_token = secrets.token_urlsafe(32)
+    app.state.local_directory_selections = {}
     app.state.active_terminals = 0
     # One process-wide log handler routes records to the owning job's bus.
     install_web_log_handler(manager.bus_for_job)
@@ -647,10 +663,21 @@ def create_app(
 
     @app.post("/api/audit", status_code=202)
     async def start_audit(request: AuditStartRequest) -> dict:
-        if bool(request.repository) == bool(request.git_url):
+        target_choices = sum(
+            bool(value)
+            for value in (
+                request.repository,
+                request.git_url,
+                request.local_directory,
+            )
+        )
+        if target_choices != 1:
             raise HTTPException(
                 status_code=400,
-                detail="Select exactly one existing repository or Git repository URL.",
+                detail=(
+                    "Select exactly one managed repository, Git repository URL, "
+                    "or local code folder."
+                ),
             )
         target = None
         git_url = None
@@ -663,6 +690,19 @@ def create_app(
             target = _resolve_managed_repository(
                 request.repository, settings.repos_dir
             )
+        elif request.local_directory:
+            selection = app.state.local_directory_selections.pop(
+                request.local_directory, None
+            )
+            if selection is None or selection[1] < time.monotonic():
+                raise HTTPException(
+                    status_code=400,
+                    detail="The local folder selection is missing or expired; choose it again.",
+                )
+            try:
+                target = validate_local_audit_target(selection[0])
+            except LocalDirectoryPickerError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         else:
             try:
                 git_url = validate_remote_repo_url(request.git_url or "")
@@ -675,6 +715,7 @@ def create_app(
                 AuditStartParams(
                     target=target,
                     git_url=git_url,
+                    update_repo=not bool(request.local_directory),
                     wiki=wiki_path,
                     max_parallel=request.max_parallel,
                     backend=settings.backend,
@@ -1007,6 +1048,41 @@ def create_app(
                 for repo in list_cloned_repos(settings.repos_dir)
             ],
         }
+
+    @app.post("/api/local-directories/select")
+    async def select_local_directory(
+        selection_token: str = Header(
+            default="", max_length=128, alias="X-CodeAuditor-Token"
+        ),
+    ) -> dict:
+        """Open a native chooser and issue a short-lived opaque target token."""
+        if not hmac.compare_digest(selection_token, app.state.terminal_token):
+            raise HTTPException(
+                status_code=403,
+                detail="Local folder selection authorization failed.",
+            )
+        try:
+            selected = await asyncio.to_thread(choose_local_directory)
+            if selected is not None:
+                selected = validate_local_audit_target(selected)
+        except LocalDirectoryPickerUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except LocalDirectoryPickerError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if selected is None:
+            return {"cancelled": True}
+
+        now = time.monotonic()
+        selections = app.state.local_directory_selections
+        for token, (_path, expires_at) in list(selections.items()):
+            if expires_at < now:
+                selections.pop(token, None)
+        token = secrets.token_urlsafe(32)
+        selections[token] = (
+            selected,
+            now + _LOCAL_DIRECTORY_TOKEN_TTL_SECONDS,
+        )
+        return {"cancelled": False, "path": selected, "token": token}
 
     @app.get("/api/wikis")
     def list_wikis() -> dict:

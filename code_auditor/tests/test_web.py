@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -1644,6 +1645,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="r-bug-select"' in res.text
     assert 'id="f-repo-select"' in res.text
     assert 'id="f-git-url"' in res.text
+    assert 'id="f-local-directory-path"' in res.text
+    assert 'id="btn-choose-local-directory"' in res.text
     assert 'id="f-wiki-select"' in res.text
     assert res.text.count('name="sandbox-mode"') == 3
     assert 'data-route="cves"' in res.text
@@ -2055,6 +2058,70 @@ def test_api_rejects_custom_target_and_unknown_repository(tmp_path) -> None:
     res = client.post("/api/audit", json={"repository": "github.com/no/such"})
     assert res.status_code == 400
     assert "managed repository" in res.json()["detail"].lower()
+
+
+def test_api_selects_and_starts_audit_for_local_directory(
+    tmp_path, monkeypatch
+) -> None:
+    target = tmp_path / "local-project"
+    target.mkdir()
+    app = _make_app(tmp_path)
+    captured = {}
+
+    monkeypatch.setattr(
+        server_module, "choose_local_directory", lambda: str(target)
+    )
+
+    class FakeJob:
+        @staticmethod
+        def status():
+            return {"state": "starting", "run_id": 7}
+
+    async def fake_start(params):
+        captured["params"] = params
+        return FakeJob()
+
+    monkeypatch.setattr(app.state.manager, "start", fake_start)
+    client = TestClient(app)
+    picker_headers = {"X-CodeAuditor-Token": app.state.terminal_token}
+
+    selection = client.post("/api/local-directories/select", headers=picker_headers)
+    assert selection.status_code == 200
+    assert selection.json()["path"] == str(target.resolve())
+    token = selection.json()["token"]
+
+    response = client.post("/api/audit", json={"local_directory": token})
+    assert response.status_code == 202
+    assert captured["params"].target == str(target.resolve())
+    assert captured["params"].git_url is None
+    assert captured["params"].update_repo is False
+
+    reused = client.post("/api/audit", json={"local_directory": token})
+    assert reused.status_code == 400
+    assert "missing or expired" in reused.json()["detail"]
+
+
+def test_api_local_directory_picker_handles_cancel_and_rejects_root(
+    tmp_path, monkeypatch
+) -> None:
+    app = _make_app(tmp_path)
+    client = TestClient(app)
+    picker_headers = {"X-CodeAuditor-Token": app.state.terminal_token}
+
+    unauthorized = client.post("/api/local-directories/select")
+    assert unauthorized.status_code == 403
+
+    monkeypatch.setattr(server_module, "choose_local_directory", lambda: None)
+    cancelled = client.post(
+        "/api/local-directories/select", headers=picker_headers
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json() == {"cancelled": True}
+
+    monkeypatch.setattr(server_module, "choose_local_directory", lambda: os.sep)
+    rejected = client.post("/api/local-directories/select", headers=picker_headers)
+    assert rejected.status_code == 400
+    assert "filesystem root" in rejected.json()["detail"]
 
 
 def test_api_job_endpoints_404_for_unknown_run(tmp_path) -> None:
@@ -2676,6 +2743,12 @@ def test_api_audit_rejects_conflicting_or_hidden_configuration(tmp_path) -> None
             "repository": repository,
             "git_url": "https://github.com/user/repo.git",
         },
+    )
+    assert res.status_code == 400
+
+    res = client.post(
+        "/api/audit",
+        json={"repository": repository, "local_directory": "a" * 32},
     )
     assert res.status_code == 400
 

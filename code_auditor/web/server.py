@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import date
@@ -14,8 +15,8 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -39,6 +40,15 @@ from .job import (
     JobConflictError,
     JobValidationError,
     ReproductionStartParams,
+)
+from .auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_TTL_SECONDS,
+    hash_password,
+    new_session_token,
+    normalize_username,
+    session_token_digest,
+    verify_password,
 )
 from .local_directories import (
     LocalDirectoryPickerError,
@@ -91,6 +101,17 @@ RunKind = Literal["audit", "maintenance"]
 
 class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class AuthCredentialsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(
+        min_length=3,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$",
+    )
+    password: str = Field(min_length=12, max_length=512)
 
 
 class AuditStartRequest(StrictRequest):
@@ -542,6 +563,67 @@ def create_app(
     # One process-wide log handler routes records to the owning job's bus.
     install_web_log_handler(manager.bus_for_job)
 
+    _AUTH_PUBLIC_PATHS = {
+        "/api/auth/status",
+        "/api/auth/setup",
+        "/api/auth/register",
+        "/api/auth/login",
+        "/api/auth/logout",
+    }
+
+    def _session_user(request) -> dict[str, object] | None:
+        token = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if not token:
+            return None
+        return store.get_auth_user_by_session(session_token_digest(token))
+
+    def _session_cookie(response: Response, token: str) -> None:
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            token,
+            max_age=SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            path="/",
+        )
+
+    def _clear_session_cookie(response: Response) -> None:
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+
+    def _issue_session(user: dict[str, object]) -> str:
+        token = new_session_token()
+        now = time.time()
+        store.create_auth_session(
+            int(user["id"]),
+            session_token_digest(token),
+            created_at=now,
+            expires_at=now + SESSION_TTL_SECONDS,
+        )
+        return token
+
+    @app.middleware("http")
+    async def require_authentication(request, call_next):
+        """Require a session after first-run setup has created an account.
+
+        Existing installations remain usable until setup is completed; this
+        compatibility mode lets an operator reach ``/api/auth/setup`` without
+        a migration-time lockout.  Once any account exists, every API except
+        the explicit auth endpoints requires a valid session cookie.
+        """
+        path = request.url.path
+        if path.startswith("/api/") and path not in _AUTH_PUBLIC_PATHS:
+            if store.auth_user_count() > 0:
+                user = _session_user(request)
+                if user is None:
+                    return JSONResponse(
+                        {"detail": "Authentication required."},
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Session"},
+                    )
+                request.state.user = user
+        return await call_next(request)
+
     def jobs_snapshot() -> list[dict]:
         """Combine Web-owned jobs with externally owned maintenance runs."""
         jobs = [
@@ -619,7 +701,7 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
-        elif request.url.path in {
+        elif request.url.path.startswith("/api/auth/") or request.url.path in {
             "/api/dashboard",
             "/api/settings",
             "/api/sandbox/capability",
@@ -632,6 +714,89 @@ def create_app(
         return FileResponse(STATIC_DIR / "index.html")
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/api/auth/status")
+    def auth_status(request: Request) -> dict[str, object]:
+        user = _session_user(request)
+        return {
+            "setup_required": store.auth_user_count() == 0,
+            "authenticated": user is not None,
+            "user": user,
+        }
+
+    @app.post("/api/auth/setup", status_code=201)
+    def auth_setup(
+        credentials: AuthCredentialsRequest, response: Response
+    ) -> dict[str, object]:
+        if store.auth_user_count() > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Administrator setup has already been completed.",
+            )
+        username = normalize_username(credentials.username)
+        try:
+            user = store.create_initial_auth_admin(
+                username, hash_password(credentials.password)
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Administrator setup has already been completed.",
+            ) from exc
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409, detail="That username is already registered."
+            ) from exc
+        # A pre-setup /api/config response may have exposed the old process
+        # token. Rotate it as soon as authentication is initialized.
+        app.state.terminal_token = secrets.token_urlsafe(32)
+        _session_cookie(response, _issue_session(user))
+        return {"user": user, "setup_required": False}
+
+    @app.post("/api/auth/register", status_code=201)
+    def auth_register(credentials: AuthCredentialsRequest) -> dict[str, object]:
+        if store.auth_user_count() == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Complete administrator setup before registering users.",
+            )
+        username = normalize_username(credentials.username)
+        try:
+            user = store.create_auth_user(
+                username, hash_password(credentials.password), role="user"
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409, detail="That username is already registered."
+            ) from exc
+        return {"user": user}
+
+    @app.post("/api/auth/login")
+    def auth_login(
+        credentials: AuthCredentialsRequest, response: Response
+    ) -> dict[str, object]:
+        username = normalize_username(credentials.username)
+        record = store.get_auth_user_by_username(username)
+        if (
+            record is None
+            or not bool(record.get("is_active"))
+            or not verify_password(credentials.password, str(record["password_hash"]))
+        ):
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
+        user = {key: value for key, value in record.items() if key != "password_hash"}
+        store.mark_auth_login(int(user["id"]))
+        user = store.get_auth_user_by_username(username) or record
+        user.pop("password_hash", None)
+        _session_cookie(response, _issue_session(user))
+        return {"user": AuditStore._public_user(user)}
+
+    @app.post("/api/auth/logout")
+    def auth_logout(request: Request, response: Response) -> dict[str, bool]:
+        token = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if token:
+            store.revoke_auth_session(session_token_digest(token))
+        _clear_session_cookie(response)
+        return {"logged_out": True}
 
     @app.get("/api/config")
     async def get_config() -> dict:

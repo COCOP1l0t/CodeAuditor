@@ -57,6 +57,30 @@ Web server options:
 
 Audit parameters such as repository, Wiki, backend, model, sandbox mode, parallelism, and output paths are managed in the Web UI and `~/.code_auditor/settings.json`. In **New Audit**, the target can be a managed checkout, a remote Git URL, or a local code folder selected with the native folder picker. Local folders are audited in place without running `git pull`. Run `code-auditor --help` for maintenance commands.
 
+### Web authentication
+
+On first deployment, create the administrator through the authentication API. Once an account exists, every `/api/*` endpoint except the authentication endpoints requires a valid session cookie. Passwords are stored with scrypt and sessions last seven days by default.
+
+```bash
+# First run: create the administrator and receive a session
+curl -i -c cookies.txt -X POST http://127.0.0.1:8000/api/auth/setup \\
+  -H 'content-type: application/json' \\
+  -d '{"username":"admin","password":"change-this-password"}'
+
+# Register a regular user
+curl -i -b cookies.txt -X POST http://127.0.0.1:8000/api/auth/register \\
+  -H 'content-type: application/json' \\
+  -d '{"username":"reviewer","password":"another-strong-password"}'
+
+# Login and logout
+curl -i -c cookies.txt -X POST http://127.0.0.1:8000/api/auth/login \\
+  -H 'content-type: application/json' \\
+  -d '{"username":"admin","password":"change-this-password"}'
+curl -i -b cookies.txt -X POST http://127.0.0.1:8000/api/auth/logout
+```
+
+Use `GET /api/auth/status` to check whether first-run setup is required and which user owns the current session. After setup, another setup attempt returns `409` and cannot replace the administrator.
+
 Stage 5 and 6 can use a networked Docker sandbox, a network-isolated Docker sandbox, or a local detached worktree. The Web settings enable Docker choices only after the server passes its Docker, image, disk-space, and Agent runtime checks. Docker is the default; build its image once before an audit reaches reproduction:
 
 ```bash

@@ -211,6 +211,26 @@ CREATE TABLE IF NOT EXISTS analysis_units (
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_units_run ON analysis_units(run_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_units_target_key ON analysis_units(target_key);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user')),
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    last_login_at REAL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_digest TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    revoked_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_digest);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 """
 
 _OUTPUT_DIR_DATE_RE = re.compile(r"audit-output-(\d{4})(\d{2})(\d{2})")
@@ -751,6 +771,153 @@ class AuditStore:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 30000")
         return conn
+
+    # ── Web authentication ────────────────────────────────────────────────
+
+    def auth_user_count(self) -> int:
+        """Return the number of accounts, used to gate first-run setup."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+        return int(row["count"] if row else 0)
+
+    @staticmethod
+    def _public_user(row: sqlite3.Row | dict) -> dict[str, object]:
+        return {
+            "id": int(row["id"]),
+            "username": str(row["username"]),
+            "role": str(row["role"]),
+            "is_active": bool(row["is_active"]),
+            "created_at": float(row["created_at"]),
+            "last_login_at": (
+                float(row["last_login_at"])
+                if row["last_login_at"] is not None
+                else None
+            ),
+        }
+
+    def create_auth_user(
+        self, username: str, password_hash: str, *, role: str = "user"
+    ) -> dict[str, object]:
+        now = time.time()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO users(username, password_hash, role, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (username, password_hash, role, now),
+            )
+            row = conn.execute(
+                "SELECT id, username, role, is_active, created_at, last_login_at "
+                "FROM users WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        if row is None:  # pragma: no cover - SQLite guarantees the row exists
+            raise RuntimeError("created user could not be loaded")
+        return self._public_user(row)
+
+    def create_initial_auth_admin(
+        self, username: str, password_hash: str
+    ) -> dict[str, object]:
+        """Atomically create the one allowed first-run administrator."""
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
+                raise ValueError("administrator setup has already been completed")
+            cursor = conn.execute(
+                """
+                INSERT INTO users(username, password_hash, role, created_at)
+                VALUES (?, ?, 'admin', ?)
+                """,
+                (username, password_hash, now),
+            )
+            row = conn.execute(
+                "SELECT id, username, role, is_active, created_at, last_login_at "
+                "FROM users WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        if row is None:  # pragma: no cover - SQLite guarantees the row exists
+            raise RuntimeError("created administrator could not be loaded")
+        return self._public_user(row)
+
+    def get_auth_user_by_username(self, username: str) -> dict[str, object] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, username, password_hash, role, is_active,
+                       created_at, last_login_at
+                FROM users WHERE username = ? COLLATE NOCASE
+                """,
+                (username,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def mark_auth_login(self, user_id: int, now: float | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET last_login_at = ? WHERE id = ?",
+                (time.time() if now is None else now, user_id),
+            )
+
+    def create_auth_session(
+        self,
+        user_id: int,
+        token_digest: str,
+        *,
+        created_at: float,
+        expires_at: float,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions(
+                    user_id, token_digest, created_at, expires_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, token_digest, created_at, expires_at, created_at),
+            )
+
+    def get_auth_user_by_session(
+        self, token_digest: str, *, now: float | None = None
+    ) -> dict[str, object] | None:
+        current = time.time() if now is None else now
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT u.id, u.username, u.role, u.is_active,
+                       u.created_at, u.last_login_at
+                FROM sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.token_digest = ?
+                  AND s.revoked_at IS NULL
+                  AND s.expires_at > ?
+                  AND u.is_active = 1
+                """,
+                (token_digest, current),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "UPDATE sessions SET last_seen_at = ? WHERE token_digest = ?",
+                    (current, token_digest),
+                )
+        return self._public_user(row) if row is not None else None
+
+    def revoke_auth_session(self, token_digest: str, *, now: float | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET revoked_at = ? "
+                "WHERE token_digest = ? AND revoked_at IS NULL",
+                (time.time() if now is None else now, token_digest),
+            )
+
+    def purge_expired_auth_sessions(self, *, now: float | None = None) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions WHERE expires_at <= ? OR revoked_at IS NOT NULL",
+                (time.time() if now is None else now,),
+            )
+        return int(cursor.rowcount)
 
     def _init_schema(self) -> None:
         with self._connect() as conn:

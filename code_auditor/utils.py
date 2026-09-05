@@ -30,19 +30,34 @@ def extract_json_object(text: str) -> str | None:
     if start == -1:
         return None
 
-    depth = 0
-    for index, char in enumerate(stripped[start:], start=start):
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = stripped[start : index + 1]
-                try:
-                    json.loads(candidate)
-                    return candidate
-                except (json.JSONDecodeError, ValueError):
-                    continue
+    candidate_start = start
+    while candidate_start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, char in enumerate(stripped[candidate_start:], start=candidate_start):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = stripped[candidate_start : index + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except (json.JSONDecodeError, ValueError):
+                        break
+        candidate_start = stripped.find("{", candidate_start + 1)
     return None
 
 

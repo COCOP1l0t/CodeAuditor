@@ -4,11 +4,19 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
+from code_auditor.web.auth import hash_password, verify_password
 from code_auditor.web import create_app
 from code_auditor.web.settings import WebSettings
 
 
 PASSWORD = "correct horse battery staple"
+
+
+def test_verify_password_rejects_unbounded_scrypt_parameters() -> None:
+    encoded = hash_password(PASSWORD)
+    parts = encoded.split("$")
+    parts[1] = str(2**30)
+    assert verify_password(PASSWORD, "$".join(parts)) is False
 
 
 def _client(tmp_path: Path) -> TestClient:

@@ -417,3 +417,8 @@ def test_extract_json_object(text: str, decision: str) -> None:
 
 def test_extract_json_object_rejects_invalid_text() -> None:
     assert extract_json_object("no json here") is None
+
+
+def test_extract_json_object_ignores_braces_inside_strings() -> None:
+    text = 'Agent commentary: {"message":"literal } brace", "ok": true} trailing'
+    assert extract_json_object(text) == '{"message":"literal } brace", "ok": true}'

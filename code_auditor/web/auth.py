@@ -21,6 +21,17 @@ SESSION_TOKEN_BYTES = 32
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 SESSION_COOKIE_NAME = "codeauditor_session"
 
+# Password records are application-generated. Keep verification bounded when
+# reading a tampered or legacy record so its encoded cost cannot exhaust the
+# Web process before the record is rejected.
+MIN_SCRYPT_N = 2**10
+MAX_SCRYPT_N = 2**20
+MAX_SCRYPT_R = 32
+MAX_SCRYPT_P = 16
+MAX_SCRYPT_MEMORY_COST = 2**20  # n * r, approximately 128 MiB in hashlib.scrypt
+MIN_PASSWORD_DKLEN = 16
+MAX_PASSWORD_DKLEN = 128
+
 
 def normalize_username(username: str) -> str:
     """Normalize a login name while retaining its user-visible spelling rules."""
@@ -60,6 +71,17 @@ def verify_password(password: str, encoded: str) -> bool:
         p = int(p_text)
         salt = base64.urlsafe_b64decode(salt_text.encode("ascii"))
         expected = base64.urlsafe_b64decode(digest_text.encode("ascii"))
+        if (
+            n < MIN_SCRYPT_N
+            or n > MAX_SCRYPT_N
+            or n & (n - 1)
+            or not 1 <= r <= MAX_SCRYPT_R
+            or not 1 <= p <= MAX_SCRYPT_P
+            or n * r > MAX_SCRYPT_MEMORY_COST
+            or not 8 <= len(salt) <= 64
+            or not MIN_PASSWORD_DKLEN <= len(expected) <= MAX_PASSWORD_DKLEN
+        ):
+            return False
         actual = hashlib.scrypt(
             password.encode("utf-8"),
             salt=salt,
@@ -68,7 +90,7 @@ def verify_password(password: str, encoded: str) -> bool:
             p=p,
             dklen=len(expected),
         )
-    except (TypeError, ValueError, UnicodeError):
+    except (TypeError, ValueError, UnicodeError, OverflowError):
         return False
     return hmac.compare_digest(actual, expected)
 

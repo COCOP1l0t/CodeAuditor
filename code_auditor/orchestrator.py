@@ -4,11 +4,11 @@ import os
 from typing import Protocol
 
 from .checkpoint import CheckpointManager
-from .config import AnalysisUnit, AuditConfig
+from .config import AuditConfig
 from .logger import get_logger
 from .repos import ensure_poc_worktree
 from .stages.stage0 import run_setup
-from .stages.stage1 import Stage1Output, run_stage1
+from .stages.stage1 import run_stage1
 from .stages.stage2 import run_stage2
 from .stages.stage3 import run_stage3
 from .stages.stage4 import run_stage4
@@ -51,7 +51,6 @@ async def run_audit(
         reporter.end_stage(0)
 
     # Stage 1: security context research
-    stage1_out: Stage1Output | None = None
     if reporter:
         reporter.begin_stage(1, "Researching security context")
     stage1_out = await run_stage1(config, checkpoint)
@@ -70,7 +69,6 @@ async def run_audit(
     )
 
     # Stage 2: decompose project into analysis units
-    analysis_units: list[AnalysisUnit] = []
     if reporter:
         reporter.begin_stage(2, "Decomposing codebase")
     analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
@@ -83,7 +81,6 @@ async def run_audit(
         raise RuntimeError("Stage 2 produced no analysis units.")
 
     # Stage 3: bug discovery per AU
-    bug_files: list[str] = []
     total_aus = len(analysis_units)
     if reporter:
         reporter.begin_stage(3, f"Discovering bugs across {total_aus} AUs")
@@ -98,7 +95,6 @@ async def run_audit(
         reporter.end_stage(3)
 
     # Stage 4: evaluate findings
-    vuln_files: list[str] = []
     if reporter:
         reporter.begin_stage(4, f"Evaluating {len(bug_files)} findings")
     vuln_files = await run_stage4(bug_files, config, checkpoint, vuln_criteria_path)
@@ -108,7 +104,6 @@ async def run_audit(
         reporter.end_stage(4)
 
     # Stage 5: PoC reproduction per verified vulnerability
-    stage5_reports: list[str] = []
     if reporter:
         reporter.begin_stage(5, f"Reproducing {len(vuln_files)} vulnerabilities")
     if vuln_files and not config.sandbox_enabled and config.poc_worktree is None:

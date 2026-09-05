@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .db import DEFAULT_DB_PATH
+from .db import AuditStore, DEFAULT_DB_PATH
 from .repos import DEFAULT_RESULTS_DIR
 from .review_cleanup import (
     ReviewedCleanupError,
@@ -13,6 +13,16 @@ from .review_cleanup import (
 from .utils import render_json_report
 
 _MAINTENANCE_COMMANDS = (
+    (
+        "maintenance_status_dry_run",
+        lambda _root, db_path=DEFAULT_DB_PATH: AuditStore(db_path).repair_maintenance_statuses(),
+        ValueError,
+    ),
+    (
+        "maintenance_status_apply",
+        lambda _root, db_path=DEFAULT_DB_PATH: AuditStore(db_path).repair_maintenance_statuses(apply=True),
+        ValueError,
+    ),
     (
         "reviewed_cleanup_dry_run",
         build_reviewed_cleanup_report,
@@ -43,6 +53,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Web UI bind port (default: 8000)",
     )
     cleanup_group = parser.add_mutually_exclusive_group()
+    cleanup_group.add_argument(
+        "--maintenance-status-dry-run",
+        nargs="?",
+        const="",
+        metavar="IGNORED",
+        help="report stale PoC-backfill statuses without changing history",
+    )
+    cleanup_group.add_argument(
+        "--maintenance-status-apply",
+        nargs="?",
+        const="",
+        metavar="IGNORED",
+        help="repair stale PoC-backfill statuses in history",
+    )
     cleanup_group.add_argument(
         "--reviewed-cleanup-dry-run",
         nargs="?",

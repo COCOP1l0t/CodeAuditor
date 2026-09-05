@@ -245,3 +245,34 @@ def test_scratch_control_files_are_outside_agent_writable_tree(
 
     assert not root.exists()
     assert not control.exists()
+
+
+def test_container_cleanup_retries_async_docker_removal_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from code_auditor import sandbox as sandbox_module
+
+    scratch = object.__new__(DockerScratch)
+    scratch.docker_bin = "docker"
+    scratch.scratch_id = "scratch-id"
+    calls: list[list[str]] = []
+
+    def fake_checked(command: list[str], *, timeout: int = 30) -> str:
+        del timeout
+        calls.append(command)
+        if command[1:3] == ["ps", "-aq"]:
+            return "container-id"
+        if len(calls) == 2:
+            raise DockerSandboxError(
+                "sandbox command failed: docker rm -f container-id: "
+                "removal of container container-id is already in progress"
+            )
+        return ""
+
+    monkeypatch.setattr(sandbox_module, "_run_checked", fake_checked)
+    monkeypatch.setattr(sandbox_module.time, "sleep", lambda _seconds: None)
+
+    scratch._remove_containers()
+
+    assert sum(command[1:3] == ["ps", "-aq"] for command in calls) == 2
+    assert sum(command[1:3] == ["rm", "-f"] for command in calls) == 2

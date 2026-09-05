@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -511,29 +512,44 @@ class DockerScratch:
         self.control_dir = None
 
     def _remove_containers(self) -> None:
-        try:
-            ids = _run_checked(
-                [
-                    self.docker_bin,
-                    "ps",
-                    "-aq",
-                    "--filter",
-                    f"label=code_auditor.scratch_id={self.scratch_id}",
-                ],
-                timeout=15,
-            ).split()
-        except DockerSandboxError as exc:
-            raise DockerSandboxError(
-                f"cannot verify sandbox container cleanup: {exc}"
-            ) from exc
-        if not ids:
-            return
-        try:
-            _run_checked([self.docker_bin, "rm", "-f", *ids], timeout=30)
-        except DockerSandboxError as exc:
-            raise DockerSandboxError(
-                f"cannot remove sandbox container(s) {', '.join(ids)}: {exc}"
-            ) from exc
+        # Docker removes ``--rm`` containers asynchronously. A second cleanup
+        # racing that removal can report "already in progress" even though the
+        # container is about to disappear. Re-scan and retry a few times so a
+        # harmless teardown race cannot turn an otherwise successful PoC into
+        # a maintenance ``done ⚠`` result.
+        last_error: DockerSandboxError | None = None
+        for attempt in range(3):
+            try:
+                ids = _run_checked(
+                    [
+                        self.docker_bin,
+                        "ps",
+                        "-aq",
+                        "--filter",
+                        f"label=code_auditor.scratch_id={self.scratch_id}",
+                    ],
+                    timeout=15,
+                ).split()
+            except DockerSandboxError as exc:
+                raise DockerSandboxError(
+                    f"cannot verify sandbox container cleanup: {exc}"
+                ) from exc
+            if not ids:
+                return
+            try:
+                _run_checked([self.docker_bin, "rm", "-f", *ids], timeout=30)
+                return
+            except DockerSandboxError as exc:
+                last_error = exc
+                message = str(exc).casefold()
+                if "already in progress" not in message and "no such container" not in message:
+                    break
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+        assert last_error is not None
+        raise DockerSandboxError(
+            f"cannot remove sandbox container(s) {', '.join(ids)}: {last_error}"
+        ) from last_error
 
 
 def inspect_docker_sandbox_environment(

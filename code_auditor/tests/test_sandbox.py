@@ -171,7 +171,14 @@ def test_docker_wrapper_builds_a_confined_command(
     assert f"type=bind,src={scratch},dst={scratch}" in command
     assert f"type=bind,src={readonly},dst={readonly},readonly" in command
     assert "OPENAI_API_KEY" in command
-    assert "PATH" not in command
+    assert any(
+        value.startswith("PATH=") and str(scratch / "home" / "go" / "bin") in value
+        for value in command
+    )
+    assert any(
+        value == f"GOBIN={scratch / 'home' / 'go' / 'bin'}"
+        for value in command
+    )
     assert DOCKER_SPEC_ENV not in command
     assert DOCKER_CWD_ENV not in command
     assert command[-1] == "--version"
@@ -245,6 +252,47 @@ def test_scratch_control_files_are_outside_agent_writable_tree(
 
     assert not root.exists()
     assert not control.exists()
+
+
+def test_scratch_cleanup_removes_readonly_module_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    vendor = tmp_path / "codex-vendor"
+    (vendor / "bin").mkdir(parents=True)
+    binary = vendor / "bin" / "codex"
+    binary.write_text("binary", encoding="utf-8")
+    binary.chmod(0o700)
+
+    from code_auditor import sandbox as sandbox_module
+
+    monkeypatch.setattr(sandbox_module, "_locate_codex_vendor", lambda: vendor)
+    monkeypatch.setattr(sandbox_module.DockerScratch, "_verify_runtime", lambda _self: None)
+    monkeypatch.setattr(sandbox_module.DockerScratch, "_remove_containers", lambda _self: None)
+    config = AuditConfig(
+        target=str(target),
+        output_dir=str(tmp_path / "output"),
+        backend="codex",
+        sandbox_root=str(tmp_path / "scratch-root"),
+        sandbox_min_free_bytes=0,
+    )
+    scratch = sandbox_module.DockerScratch(config, "stage5-H-03")
+
+    asyncio.run(scratch.prepare(str(target), ""))
+    assert scratch.root is not None
+    root = scratch.root
+    toolchain = scratch.root / "cache" / "go-mod" / "golang.org" / "toolchain@go1.26.8"
+    toolchain.mkdir(parents=True)
+    (toolchain / "bin").mkdir()
+    (toolchain / "bin" / "go").write_text("toolchain", encoding="utf-8")
+    (toolchain / "bin").chmod(0o555)
+    toolchain.chmod(0o555)
+
+    asyncio.run(scratch.close())
+
+    assert not root.exists()
 
 
 def test_container_cleanup_retries_async_docker_removal_race(

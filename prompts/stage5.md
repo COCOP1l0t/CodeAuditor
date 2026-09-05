@@ -18,6 +18,13 @@ All PoC artifacts (scripts, build outputs, evidence, report) must be written und
 
 `__POC_DIR__`
 
+`__POC_DIR__` is the only artifact directory guaranteed to be writable. Do not
+create sibling paths under `/tmp/code-auditor`, write to the host, or use a
+hard-coded scratch path. The sandbox exposes `CODE_AUDITOR_ARTIFACT_DIR` and
+`CODE_AUDITOR_SCRATCH_ROOT` for disposable workspace discovery. Keep every
+generated file under `__POC_DIR__` (or a temporary path under the scratch root),
+and never retain an artifact outside `__POC_DIR__`.
+
 Start by reading the vulnerability JSON file to understand the finding details, then proceed to designing the reproduction strategy.
 
 ## Wiki Knowledge Base
@@ -96,6 +103,26 @@ If any risk exists, note it in the report and proceed cautiously. Use resource l
    absolute scratch paths in the final artifacts. Build trees, downloaded toolchains,
    caches, virtual environments, package directories, and generated binaries are
    temporary and will be deleted after this task.
+
+For Go controller projects that use controller-runtime envtest, do not install
+`setup-envtest@latest`: the latest tool may require a newer Go toolchain than the
+project declares and can trigger an unnecessary automatic toolchain download.
+Read the exact `sigs.k8s.io/controller-runtime` version from `go.mod`, install
+the matching tool into the sandbox `GOBIN`, and use it to provision envtest
+assets. For example:
+
+```sh
+controller_runtime_version="$(go list -m -f '{{.Version}}' sigs.k8s.io/controller-runtime)"
+go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${controller_runtime_version}"
+assets_dir="$(setup-envtest use -p path)"
+test -n "${assets_dir}" && test -x "${assets_dir}/etcd"
+mkdir -p bin/k8s
+ln -sfn "${assets_dir}" "bin/k8s/$(basename "${assets_dir}")"
+```
+
+If the project's tests look for `bin/k8s`, create that directory and a symlink
+to the returned assets directory inside the disposable checkout. Do not copy
+the assets into retained artifacts.
 
 ### Step 3: Develop and Run the PoC
 

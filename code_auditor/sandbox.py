@@ -505,8 +505,10 @@ class DockerScratch:
         else:
             resolved_control = None
         if resolved.exists():
+            _make_tree_removable(resolved)
             shutil.rmtree(resolved, ignore_errors=False)
         if resolved_control is not None and resolved_control.exists():
+            _make_tree_removable(resolved_control)
             shutil.rmtree(resolved_control, ignore_errors=False)
         self.root = None
         self.control_dir = None
@@ -603,6 +605,27 @@ def _container_name(spec: dict[str, Any], tool: str) -> str:
     return f"code-auditor-{str(spec['scratch_id'])[:10]}-{marker[:10]}-{tool}-{nonce}"
 
 
+def _make_tree_removable(root: Path) -> None:
+    """Restore directory write/execute bits before deleting a scratch tree.
+
+    Go's module cache deliberately removes write bits from extracted module
+    directories.  The scratch tree is disposable and bounded by ``root``;
+    restoring only directory owner bits lets ``shutil.rmtree`` unlink those
+    files without making any files outside the scratch writable.
+    """
+    if not root.exists():
+        return
+    for current, directories, _files in os.walk(root, topdown=False, followlinks=False):
+        paths = [Path(current), *(Path(current) / name for name in directories)]
+        for path in paths:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                os.chmod(path, stat.S_IMODE(info.st_mode) | stat.S_IRWXU)
+
+
 def docker_cli_command(tool: str, argv: list[str], environ: dict[str, str]) -> list[str]:
     """Build the Docker CLI command used by an SDK wrapper."""
     spec_path = environ.get(DOCKER_SPEC_ENV, "")
@@ -657,7 +680,17 @@ def docker_cli_command(tool: str, argv: list[str], environ: dict[str, str]) -> l
     runtime_env = {
         "HOME": str(spec["home"]),
         "USER": "code-auditor",
+        # Keep tools installed by a PoC inside the disposable scratch tree and
+        # make them immediately invokable.  The host PATH is intentionally not
+        # forwarded into the container.
+        "GOBIN": str(scratch / "home" / "go" / "bin"),
+        "PATH": (
+            f"{scratch / 'home' / 'go' / 'bin'}:/usr/local/sbin:/usr/local/bin:"
+            "/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
         "TMPDIR": str(scratch / "tmp"),
+        "CODE_AUDITOR_SCRATCH_ROOT": str(scratch),
+        "CODE_AUDITOR_ARTIFACT_DIR": str(scratch / "artifacts"),
         "XDG_CACHE_HOME": str(scratch / "cache" / "xdg"),
         "CARGO_HOME": str(scratch / "cache" / "cargo-home"),
         "CARGO_TARGET_DIR": str(scratch / "cache" / "cargo-target"),

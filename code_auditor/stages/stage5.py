@@ -138,6 +138,7 @@ async def _run_reproduce(
     log_file = os.path.join(poc_dir, "agent.log")
     resolved_report: str | None = None
     reproduced = False
+    task_error: BaseException | None = None
     try:
         await run_agent(
             prompt,
@@ -255,9 +256,24 @@ async def _run_reproduce(
             )
             resolved_report = os.path.join(persistent_destination, "report.md")
 
+    except BaseException as exc:
+        # Keep the actual PoC/agent failure as the task result.  Cleanup is
+        # best-effort and must not replace it with a teardown error.
+        task_error = exc
+        raise
+
     finally:
         if sandbox is not None:
-            await sandbox.close()
+            try:
+                await sandbox.close()
+            except Exception:
+                if task_error is None:
+                    raise
+                logger.exception(
+                    "Stage 5: failed to clean up scratch workspace for %s; "
+                    "preserving the original task error.",
+                    vuln_id,
+                )
 
     checkpoint.mark_complete(key)
     if _is_fp_report(resolved_report):

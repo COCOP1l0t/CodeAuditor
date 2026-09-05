@@ -460,3 +460,55 @@ def test_run_stage5_repairs_invalid_retain_manifest_once(
         "trigger-graph.json",
     ]
     assert checkpoint.is_complete("stage5:H-10")
+
+
+def test_stage5_preserves_agent_error_when_scratch_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, checkpoint, output_dir = _stage5_config(tmp_path)
+    config.sandbox_enabled = True
+    vuln = _write_vuln_file(output_dir, "H-11")
+    scratch_root = tmp_path / "fake-scratch"
+
+    class FakeScratch:
+        def __init__(self, owner: AuditConfig, _task_name: str) -> None:
+            self.source_dir = scratch_root / "source"
+            self.artifact_dir = scratch_root / "artifacts"
+            self.input_dir = scratch_root / "inputs"
+
+        async def prepare(self, _target: str, _commit: str):  # type: ignore[no-untyped-def]
+            self.source_dir.mkdir(parents=True)
+            self.artifact_dir.mkdir(parents=True)
+            self.input_dir.mkdir(parents=True)
+            return self
+
+        def audit_config(self, owner: AuditConfig) -> AuditConfig:
+            return replace(
+                owner,
+                target=str(self.source_dir),
+                output_dir=str(self.artifact_dir),
+                poc_worktree=str(self.source_dir),
+            )
+
+        def copy_input(self, source: str, name: str) -> Path:
+            destination = self.input_dir / name
+            shutil.copyfile(source, destination)
+            return destination
+
+        async def close(self) -> None:
+            raise RuntimeError("cleanup failed")
+
+    async def failing_agent(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("agent failed")
+
+    monkeypatch.setattr(stage5, "DockerScratch", FakeScratch)
+    monkeypatch.setattr(stage5, "capture_repo_identity", lambda _target: {"commit": ""})
+    monkeypatch.setattr(stage5, "run_agent", failing_agent)
+
+    reports = asyncio.run(stage5.run_stage5([str(vuln)], config, checkpoint))
+
+    assert reports == []
+    assert len(config.task_errors) == 1
+    assert "agent failed" in config.task_errors[0]
+    assert "cleanup failed" not in config.task_errors[0]

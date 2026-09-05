@@ -10,6 +10,7 @@ TRIGGER_GRAPH_FILENAME = "trigger-graph.json"
 ASAN_REPORT_FILENAME = "asan-report.txt"
 TRIGGER_GRAPH_SCHEMA_VERSION = 1
 MAX_TRIGGER_GRAPH_BYTES = 2 * 1024 * 1024
+MAX_ASAN_REPORT_BYTES = 8 * 1024 * 1024
 MAX_TRIGGER_GRAPH_NODES = 128
 MAX_TRIGGER_GRAPH_EDGES = 256
 
@@ -246,3 +247,30 @@ def load_trigger_graph(
         data, expected_finding_id=expected_finding_id
     )
     return (data if not errors and isinstance(data, dict) else None), errors
+
+
+def load_asan_report(path: str) -> tuple[str | None, list[str]]:
+    """Read one bounded, complete AddressSanitizer evidence report."""
+    report_path = Path(path)
+    try:
+        size = report_path.stat().st_size
+        if size <= 0:
+            return None, [f"{ASAN_REPORT_FILENAME} must not be empty"]
+        if size > MAX_ASAN_REPORT_BYTES:
+            return None, [
+                f"ASan report exceeds {MAX_ASAN_REPORT_BYTES} bytes"
+            ]
+        report = report_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, [f"missing {ASAN_REPORT_FILENAME}"]
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, [f"cannot read {ASAN_REPORT_FILENAME}: {exc}"]
+
+    errors: list[str] = []
+    if "ERROR: AddressSanitizer:" not in report:
+        errors.append("ASan report must contain an AddressSanitizer ERROR record")
+    if re.search(r"(?m)^\s*#0\s+", report) is None:
+        errors.append("ASan report must contain a captured faulting stack")
+    if "SUMMARY: AddressSanitizer:" not in report:
+        errors.append("ASan report must contain the final AddressSanitizer SUMMARY")
+    return (report if not errors else None), errors

@@ -28,6 +28,7 @@ from .logger import get_logger
 from .poc_artifacts import (
     ASAN_REPORT_FILENAME,
     TRIGGER_GRAPH_FILENAME,
+    load_asan_report,
     load_trigger_graph,
 )
 from .repos import DEFAULT_REPOS_DIR, capture_repo_identity, list_cloned_repos
@@ -42,6 +43,22 @@ RUN_DONE = "done"
 RUN_FAILED = "failed"
 RUN_CANCELLED = "cancelled"
 RUN_IMPORTED = "imported"
+RUN_SUPERSEDED = "superseded"
+RUN_KIND_AUDIT = "audit"
+RUN_KIND_MAINTENANCE = "maintenance"
+RUN_KINDS = frozenset({RUN_KIND_AUDIT, RUN_KIND_MAINTENANCE})
+RUN_STATUSES = frozenset(
+    {
+        RUN_RUNNING,
+        RUN_DONE,
+        RUN_FAILED,
+        RUN_CANCELLED,
+        RUN_IMPORTED,
+        RUN_SUPERSEDED,
+    }
+)
+_POC_BACKFILL_OUTPUT_SUFFIX = "-poc-backfill"
+_POC_BACKFILL_OUTPUT_LIKE = f"%{_POC_BACKFILL_OUTPUT_SUFFIX}"
 DISCLOSURE_REVIEW_STATUSES = {
     "unreviewed",
     "reported",
@@ -67,6 +84,7 @@ CREATE TABLE IF NOT EXISTS runs (
     target_au_count INTEGER,
     log_level TEXT,
     status TEXT NOT NULL,
+    run_kind TEXT NOT NULL DEFAULT 'audit',
     error TEXT DEFAULT '',
     started_at REAL,
     ended_at REAL,
@@ -135,6 +153,8 @@ CREATE TABLE IF NOT EXISTS disclosures (
     report_path TEXT,
     email_path TEXT,
     zip_path TEXT,
+    trigger_graph_path TEXT,
+    asan_report_path TEXT,
     UNIQUE(run_id, vuln_id)
 );
 CREATE INDEX IF NOT EXISTS idx_disclosures_run ON disclosures(run_id);
@@ -247,6 +267,11 @@ _RUN_EXTRA_COLUMNS = {
     "duration_seconds": '"duration_seconds" REAL NOT NULL DEFAULT 0',
     "active_started_at": '"active_started_at" REAL',
     "duration_known": '"duration_known" INTEGER NOT NULL DEFAULT 1',
+    "run_kind": '"run_kind" TEXT NOT NULL DEFAULT \'audit\'',
+    # A terminal maintenance run may carry a non-fatal cleanup note. Keep it
+    # separate from ``error`` so the History badge does not report a completed
+    # batch as ``done ⚠`` while retaining the diagnostic for the detail view.
+    "warning": '"warning" TEXT DEFAULT \'\'',
 }
 
 _DISCLOSED_BUGS_V2_SCHEMA = """
@@ -357,6 +382,33 @@ def _stage5_terminal_paths(
     return None
 
 
+def _registered_stage5_report(
+    output_dir: str, report_value: object
+) -> str | None:
+    """Resolve a reproduced PoC report only when it is still on disk."""
+    if not output_dir:
+        return None
+    if not isinstance(report_value, str) or not report_value or "\x00" in report_value:
+        return None
+    root = os.path.realpath(os.path.expanduser(output_dir))
+    if not root:
+        return None
+    resolved = os.path.realpath(
+        report_value if os.path.isabs(report_value) else os.path.join(root, report_value)
+    )
+    if not resolved.startswith(root + os.sep) or not os.path.isfile(resolved):
+        return None
+    report = Path(resolved)
+    if (
+        report.name != "report.md"
+        or report.parent.parent.name != "stage5-pocs"
+        or report.parent.name.endswith("_fp")
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", report.parent.name) is None
+    ):
+        return None
+    return resolved
+
+
 def _stage6_terminal_paths(
     artifacts: list[dict[str, Any]],
 ) -> tuple[str, str, str, str] | None:
@@ -407,6 +459,51 @@ def _terminal_paths(
 ) -> tuple[str, str, str, str] | None:
     """Prefer a portable Stage 6 reproducer, with legacy Stage 5 fallback."""
     return _stage6_terminal_paths(artifacts) or _stage5_terminal_paths(artifacts)
+
+
+def _retained_stage6_evidence(
+    disclosure_dir: Path,
+    vuln_id: str,
+) -> tuple[str, str]:
+    """Return only manifest-retained, validated Stage 6 runtime evidence."""
+    try:
+        manifest = load_retain_manifest(disclosure_dir)
+    except RetentionError:
+        return "", ""
+
+    evidence_paths = {
+        retained.path for retained in manifest.files if retained.role == "evidence"
+    }
+
+    trigger_graph_path = ""
+    if TRIGGER_GRAPH_FILENAME in evidence_paths:
+        graph = disclosure_dir / TRIGGER_GRAPH_FILENAME
+        _, graph_errors = load_trigger_graph(
+            str(graph), expected_finding_id=vuln_id
+        )
+        if graph_errors:
+            logger.warning(
+                "Ignoring invalid retained Stage 6 trigger graph %s: %s",
+                graph,
+                "; ".join(graph_errors),
+            )
+        else:
+            trigger_graph_path = str(graph)
+
+    asan_report_path = ""
+    if ASAN_REPORT_FILENAME in evidence_paths:
+        asan = disclosure_dir / ASAN_REPORT_FILENAME
+        _, asan_errors = load_asan_report(str(asan))
+        if asan_errors:
+            logger.warning(
+                "Ignoring invalid retained Stage 6 ASan report %s: %s",
+                asan,
+                "; ".join(asan_errors),
+            )
+        else:
+            asan_report_path = str(asan)
+
+    return trigger_graph_path, asan_report_path
 
 
 def _parse_finding(path: Path, output_dir: Path) -> dict[str, Any] | None:
@@ -521,6 +618,12 @@ def scan_output_dir(
                 vuln_id = vuln_id[: -len("_fp")]
             scanned_vuln_ids.add(vuln_id)
             status = read_reproduction_status(str(report)) or "unknown"
+            # The directory suffix is the stage contract for a failed or
+            # otherwise non-actionable reproduction.  Normalize stale agent
+            # prose (for example, ``partially-reproduced``) so maintenance
+            # backfills do not retry the same failed candidate indefinitely.
+            if report.parent.name.endswith("_fp"):
+                status = "false-positive"
             trigger_graph = report.parent / TRIGGER_GRAPH_FILENAME
             trigger_graph_path = ""
             if trigger_graph.is_file():
@@ -536,17 +639,24 @@ def scan_output_dir(
                 else:
                     trigger_graph_path = str(trigger_graph.relative_to(base))
             asan_report = report.parent / ASAN_REPORT_FILENAME
+            asan_report_path = ""
+            if asan_report.is_file():
+                _, asan_errors = load_asan_report(str(asan_report))
+                if asan_errors:
+                    logger.warning(
+                        "Ignoring invalid Stage 5 ASan report %s: %s",
+                        asan_report,
+                        "; ".join(asan_errors),
+                    )
+                else:
+                    asan_report_path = str(asan_report.relative_to(base))
             result["pocs"].append(
                 {
                     "vuln_id": vuln_id,
                     "status": status,
                     "report_path": str(report.relative_to(base)),
                     "trigger_graph_path": trigger_graph_path,
-                    "asan_report_path": (
-                        str(asan_report.relative_to(base))
-                        if asan_report.is_file()
-                        else ""
-                    ),
+                    "asan_report_path": asan_report_path,
                 }
             )
         # PoC tasks whose agent died before writing a report (e.g. API quota
@@ -584,12 +694,21 @@ def scan_output_dir(
                 p = disclosure / name
                 return str(p.relative_to(base)) if p.is_file() else ""
 
+            trigger_graph_path, asan_report_path = _retained_stage6_evidence(
+                disclosure, entry.name
+            )
+
+            def _evidence_rel(path: str) -> str:
+                return str(Path(path).relative_to(base)) if path else ""
+
             result["disclosures"].append(
                 {
                     "vuln_id": entry.name,
                     "report_path": _rel("report.md"),
                     "email_path": _rel("email.txt"),
                     "zip_path": _rel("disclosure.zip"),
+                    "trigger_graph_path": _evidence_rel(trigger_graph_path),
+                    "asan_report_path": _evidence_rel(asan_report_path),
                 }
             )
 
@@ -615,6 +734,12 @@ class AuditStore:
         self._init_schema()
         self._backfill_identities()
         self._backfill_vulnerability_dedupe_keys()
+        try:
+            self.backfill_retained_stage6_evidence()
+        except Exception as exc:
+            # Evidence discovery is a compatibility backfill and must not
+            # prevent the history database from opening.
+            logger.warning("Stage 6 evidence backfill failed: %s", exc)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -640,6 +765,19 @@ class AuditStore:
             for column, ddl in _RUN_EXTRA_COLUMNS.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
+            # The PoC recovery command predates explicit run kinds. Reapply
+            # this stable classification on every open so an older backfill
+            # process sharing a newly migrated database cannot create an
+            # audit-looking maintenance row.
+            conn.execute(
+                "UPDATE runs SET run_kind = ? "
+                "WHERE output_dir LIKE ? AND run_kind != ?",
+                (
+                    RUN_KIND_MAINTENANCE,
+                    _POC_BACKFILL_OUTPUT_LIKE,
+                    RUN_KIND_MAINTENANCE,
+                ),
+            )
             # Preserve the original backend for pre-history rows. New runs
             # append only when an agent invocation actually starts, matching
             # models_used semantics.
@@ -688,6 +826,18 @@ class AuditStore:
                 conn.execute("ALTER TABLE pocs ADD COLUMN trigger_graph_path TEXT")
             if "asan_report_path" not in poc_existing:
                 conn.execute("ALTER TABLE pocs ADD COLUMN asan_report_path TEXT")
+            disclosure_existing = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(disclosures)").fetchall()
+            }
+            if "trigger_graph_path" not in disclosure_existing:
+                conn.execute(
+                    "ALTER TABLE disclosures ADD COLUMN trigger_graph_path TEXT"
+                )
+            if "asan_report_path" not in disclosure_existing:
+                conn.execute(
+                    "ALTER TABLE disclosures ADD COLUMN asan_report_path TEXT"
+                )
             if "discovered_path" in existing:
                 conn.execute("ALTER TABLE runs DROP COLUMN discovered_path")
             disclosed_existing = {
@@ -1022,6 +1172,173 @@ class AuditStore:
             # A compatibility migration must never prevent opening the history DB.
             pass
 
+    def backfill_retained_stage6_evidence(self) -> dict[str, int]:
+        """Register validated runtime evidence already retained by Stage 6.
+
+        The backfill deliberately ignores report prose and ZIP contents.  Only
+        exact root-level evidence files listed with the ``evidence`` role in a
+        valid retention manifest can be registered.
+        """
+        with self._connect() as conn:
+            registered_stage6_dirs = {
+                os.path.join(
+                    os.path.realpath(os.path.expanduser(str(row["output_dir"]))),
+                    "stage6-disclosures",
+                )
+                for row in conn.execute(
+                    "SELECT output_dir FROM runs "
+                    "WHERE output_dir IS NOT NULL AND output_dir != ''"
+                ).fetchall()
+            }
+            disclosure_rows = conn.execute(
+                """
+                SELECT d.id, d.vuln_id, d.report_path, r.output_dir
+                FROM disclosures d JOIN runs r ON r.id = d.run_id
+                WHERE d.report_path IS NOT NULL AND d.report_path != ''
+                """
+            ).fetchall()
+            catalogue_rows = conn.execute(
+                """
+                SELECT id, artifact_links FROM disclosed_bugs
+                WHERE deleted_at IS NULL
+                """
+            ).fetchall()
+
+            cache: dict[str, tuple[str, str]] = {}
+
+            def evidence_for(disclosure_dir: str) -> tuple[str, str]:
+                resolved = os.path.realpath(disclosure_dir)
+                if resolved not in cache:
+                    cache[resolved] = _retained_stage6_evidence(
+                        Path(resolved), os.path.basename(os.path.dirname(resolved))
+                    )
+                return cache[resolved]
+
+            updated_disclosure_rows = 0
+            for row in disclosure_rows:
+                output_dir = os.path.realpath(
+                    os.path.expanduser(str(row["output_dir"] or ""))
+                )
+                report_value = str(row["report_path"] or "")
+                report_path = os.path.realpath(
+                    report_value
+                    if os.path.isabs(report_value)
+                    else os.path.join(output_dir, report_value)
+                )
+                disclosure_dir = os.path.dirname(report_path)
+                expected_dir = os.path.join(
+                    output_dir,
+                    "stage6-disclosures",
+                    str(row["vuln_id"]),
+                    "disclosure",
+                )
+                if disclosure_dir != expected_dir or not os.path.isfile(report_path):
+                    continue
+                graph_path, asan_path = evidence_for(disclosure_dir)
+
+                def stored_path(path: str) -> str:
+                    return os.path.relpath(path, output_dir) if path else ""
+
+                cursor = conn.execute(
+                    """
+                    UPDATE disclosures
+                    SET trigger_graph_path = ?, asan_report_path = ?
+                    WHERE id = ? AND (
+                        COALESCE(trigger_graph_path, '') != ? OR
+                        COALESCE(asan_report_path, '') != ?
+                    )
+                    """,
+                    (
+                        stored_path(graph_path),
+                        stored_path(asan_path),
+                        row["id"],
+                        stored_path(graph_path),
+                        stored_path(asan_path),
+                    ),
+                )
+                updated_disclosure_rows += cursor.rowcount
+
+            registered_graphs = 0
+            registered_asan_reports = 0
+            updated_catalogue_rows = 0
+            for row in catalogue_rows:
+                try:
+                    artifacts = json.loads(row["artifact_links"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(artifacts, list):
+                    continue
+
+                disclosure_dirs = self._stage6_disclosure_dirs(
+                    row["artifact_links"] or "[]", registered_stage6_dirs
+                )
+                evidence: list[tuple[str, str]] = []
+                for disclosure_dir in sorted(disclosure_dirs):
+                    graph_path, asan_path = evidence_for(disclosure_dir)
+                    if graph_path:
+                        evidence.append(("Stage 5 Trigger Graph", graph_path))
+                    if asan_path:
+                        evidence.append(("Stage 5 ASan Report", asan_path))
+
+                valid_stage6_paths = {path for _label, path in evidence}
+                retained_artifacts: list[dict[str, Any]] = []
+                for artifact in artifacts:
+                    if not isinstance(artifact, dict):
+                        retained_artifacts.append(artifact)
+                        continue
+                    label = artifact.get("label")
+                    path = artifact.get("path")
+                    if (
+                        label
+                        in {"Stage 5 Trigger Graph", "Stage 5 ASan Report"}
+                        and isinstance(path, str)
+                        and any(
+                            self._path_is_within(
+                                os.path.realpath(os.path.expanduser(path)),
+                                disclosure_dir,
+                            )
+                            for disclosure_dir in disclosure_dirs
+                        )
+                        and os.path.realpath(os.path.expanduser(path))
+                        not in valid_stage6_paths
+                    ):
+                        continue
+                    retained_artifacts.append(artifact)
+
+                known_paths = {
+                    os.path.realpath(os.path.expanduser(str(artifact.get("path"))))
+                    for artifact in retained_artifacts
+                    if isinstance(artifact, dict) and artifact.get("path")
+                }
+                for label, path in evidence:
+                    if path in known_paths:
+                        continue
+                    retained_artifacts.append({"label": label, "path": path})
+                    known_paths.add(path)
+                    if label == "Stage 5 Trigger Graph":
+                        registered_graphs += 1
+                    else:
+                        registered_asan_reports += 1
+
+                if retained_artifacts != artifacts:
+                    conn.execute(
+                        "UPDATE disclosed_bugs SET artifact_links = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (
+                            json.dumps(retained_artifacts, ensure_ascii=False),
+                            time.time(),
+                            row["id"],
+                        ),
+                    )
+                    updated_catalogue_rows += 1
+
+        return {
+            "disclosure_rows": updated_disclosure_rows,
+            "catalogue_rows": updated_catalogue_rows,
+            "trigger_graphs": registered_graphs,
+            "asan_reports": registered_asan_reports,
+        }
+
     def set_run_identity(self, run_id: int, identity: dict) -> None:
         """Store the repo identity (repo name, commit, submodule commits)."""
         target_key = compute_target_key(identity)
@@ -1055,7 +1372,11 @@ class AuditStore:
         config: AuditConfig,
         status: str = RUN_RUNNING,
         started_at: float | None = None,
+        *,
+        run_kind: str = RUN_KIND_AUDIT,
     ) -> int:
+        if run_kind not in RUN_KINDS:
+            raise ValueError(f"Unsupported run kind: {run_kind}")
         active_started_at = started_at if status == RUN_RUNNING else None
         duration_known = 0 if status == RUN_IMPORTED else 1
         with self._connect() as conn:
@@ -1064,9 +1385,9 @@ class AuditStore:
                 INSERT INTO runs (
                     target, output_dir, wiki_path,
                     backend, model, max_parallel, target_au_count, log_level,
-                    status, started_at, active_started_at, duration_known, created_at,
-                    backends_used
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, run_kind, started_at, active_started_at,
+                    duration_known, created_at, backends_used
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     config.target,
@@ -1078,6 +1399,7 @@ class AuditStore:
                     config.target_au_count,
                     config.log_level,
                     status,
+                    run_kind,
                     started_at,
                     active_started_at,
                     duration_known,
@@ -1096,6 +1418,7 @@ class AuditStore:
         backends_used: list[str] | None = None,
         models_used: list[str] | None = None,
         usage_stats: dict[str, float] | None = None,
+        warning: str | None = None,
     ) -> None:
         finished_at = time.time() if ended_at is None else ended_at
         with self._connect() as conn:
@@ -1138,8 +1461,201 @@ class AuditStore:
                     "UPDATE runs SET usage_stats = ? WHERE id = ?",
                     (json.dumps(usage_stats, ensure_ascii=False), run_id),
                 )
+            if warning is not None:
+                conn.execute(
+                    "UPDATE runs SET warning = ? WHERE id = ?",
+                    (warning, run_id),
+                )
         if row and row["output_dir"]:
             self.persist_artifacts(run_id, row["output_dir"])
+
+    @staticmethod
+    def _maintenance_report_path(output_dir: str, value: object) -> str | None:
+        """Resolve a Stage 5 report for either a reproduced or FP outcome."""
+        if not isinstance(value, str) or not value or "\x00" in value:
+            return None
+        root = os.path.realpath(os.path.expanduser(output_dir or ""))
+        if not root:
+            return None
+        resolved = os.path.realpath(
+            value if os.path.isabs(value) else os.path.join(root, value)
+        )
+        if not resolved.startswith(root + os.sep) or not os.path.isfile(resolved):
+            return None
+        report = Path(resolved)
+        poc_dir = report.parent
+        if (
+            report.name != "report.md"
+            or poc_dir.parent.name != "stage5-pocs"
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}(?:_fp)?", poc_dir.name)
+        ):
+            return None
+        return resolved
+
+    def repair_maintenance_statuses(self, *, apply: bool = False) -> dict[str, Any]:
+        """Reconcile stale PoC-backfill lifecycle rows using later evidence.
+
+        A maintenance row is only marked ``superseded`` when a later clean
+        maintenance run at the same repository commit has a registered Stage 5
+        outcome for every vulnerability in the old row. This preserves failed
+        attempts as history while removing them from the actionable failure
+        queue. A completed run whose sole error is the Docker "removal already
+        in progress" race is normalized to ``done`` with a separate warning
+        after its affected PoC report is confirmed on disk.
+
+        The default is a read-only plan. ``apply=True`` performs one atomic
+        update and returns the same plan with ``applied`` set to true.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, target, output_dir, status, error, warning, target_key,
+                       "commit"
+                FROM runs
+                WHERE run_kind = ? OR output_dir LIKE ?
+                ORDER BY id
+                """,
+                (RUN_KIND_MAINTENANCE, _POC_BACKFILL_OUTPUT_LIKE),
+            ).fetchall()
+
+            run_data: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                run_id = int(row["id"])
+                vuln_ids = {
+                    str(item[0])
+                    for item in conn.execute(
+                        "SELECT vuln_id FROM vulnerabilities WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchall()
+                    if item[0]
+                }
+                poc_rows = conn.execute(
+                    "SELECT vuln_id, report_path FROM pocs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+                run_data[run_id] = {
+                    "row": row,
+                    "vuln_ids": vuln_ids,
+                    "pocs": {
+                        str(item["vuln_id"]): item["report_path"]
+                        for item in poc_rows
+                    },
+                }
+
+            clean_later: dict[int, list[tuple[int, set[str]]]] = {}
+            for run_id, data in run_data.items():
+                row = data["row"]
+                if row["status"] not in {
+                    RUN_FAILED,
+                    RUN_DONE,
+                    RUN_SUPERSEDED,
+                }:
+                    continue
+                identity = str(row["target_key"] or "") or (
+                    str(row["target"] or ""), str(row["commit"] or "")
+                )
+                for later_id, later in run_data.items():
+                    if later_id <= run_id:
+                        continue
+                    later_row = later["row"]
+                    later_identity = str(later_row["target_key"] or "") or (
+                        str(later_row["target"] or ""),
+                        str(later_row["commit"] or ""),
+                    )
+                    if later_identity != identity:
+                        continue
+                    if later_row["status"] != RUN_DONE or str(
+                        later_row["error"] or ""
+                    ).strip():
+                        continue
+                    clean_later.setdefault(run_id, []).append(
+                        (later_id, set(later["pocs"]))
+                    )
+
+            changes: list[dict[str, Any]] = []
+            for run_id, data in run_data.items():
+                row = data["row"]
+                status = str(row["status"] or "")
+                error = str(row["error"] or "").strip()
+                if not error or status not in {RUN_FAILED, RUN_DONE}:
+                    continue
+                vuln_ids = data["vuln_ids"]
+                superseded_by = next(
+                    (
+                        later_id
+                        for later_id, covered in clean_later.get(run_id, [])
+                        if vuln_ids and vuln_ids <= covered
+                    ),
+                    None,
+                )
+                if superseded_by is not None:
+                    changes.append(
+                        {
+                            "run_id": run_id,
+                            "from_status": status,
+                            "to_status": RUN_SUPERSEDED,
+                            "superseded_by": superseded_by,
+                            "warning": (
+                                f"Superseded by Run #{superseded_by}. "
+                                f"Original error: {error}"
+                            ),
+                        }
+                    )
+                    continue
+
+                # Docker's asynchronous removal race is non-fatal when the
+                # affected task already left a valid report. Do not hide any
+                # other task error behind this normalization.
+                lowered = error.casefold()
+                cleanup_race = (
+                    "cannot remove sandbox container" in lowered
+                    and "already in progress" in lowered
+                )
+                if status == RUN_DONE and cleanup_race:
+                    affected = error.split(":", 1)[0].strip().split("/")[-1]
+                    if self._maintenance_report_path(
+                        str(row["output_dir"] or ""), data["pocs"].get(affected)
+                    ):
+                        changes.append(
+                            {
+                                "run_id": run_id,
+                                "from_status": status,
+                                "to_status": RUN_DONE,
+                                "warning": f"Non-fatal cleanup warning: {error}",
+                            }
+                        )
+
+            if apply and changes:
+                conn.execute("BEGIN IMMEDIATE")
+                for change in changes:
+                    conn.execute(
+                        "UPDATE runs SET status = ?, error = '', warning = ? "
+                        "WHERE id = ? AND status = ?",
+                        (
+                            change["to_status"],
+                            change["warning"],
+                            change["run_id"],
+                            change["from_status"],
+                        ),
+                    )
+
+        return {
+            "inspected": len(rows),
+            "planned": len(changes),
+            "applied": bool(apply),
+            "changes": changes,
+            "unresolved": [
+                {
+                    "run_id": int(data["row"]["id"]),
+                    "status": str(data["row"]["status"]),
+                    "error": str(data["row"]["error"] or ""),
+                }
+                for data in run_data.values()
+                if str(data["row"]["error"] or "").strip()
+                and int(data["row"]["id"])
+                not in {int(change["run_id"]) for change in changes}
+            ],
+        }
 
     def cancel_running_run(
         self,
@@ -1160,7 +1676,8 @@ class AuditStore:
                              THEN MAX(0, ? - active_started_at)
                              ELSE 0 END,
                     active_started_at = NULL
-                WHERE id = ? AND status = ?
+                WHERE id = ? AND status = ? AND run_kind = ?
+                    AND output_dir NOT LIKE ?
                 """,
                 (
                     RUN_CANCELLED,
@@ -1169,6 +1686,8 @@ class AuditStore:
                     finished_at,
                     run_id,
                     RUN_RUNNING,
+                    RUN_KIND_AUDIT,
+                    _POC_BACKFILL_OUTPUT_LIKE,
                 ),
             )
             return cursor.rowcount == 1
@@ -1186,8 +1705,14 @@ class AuditStore:
             run_ids = [
                 int(row["id"])
                 for row in conn.execute(
-                    "SELECT id FROM runs WHERE status = ? ORDER BY id",
-                    (RUN_RUNNING,),
+                    "SELECT id FROM runs "
+                    "WHERE status = ? AND run_kind = ? "
+                    "AND output_dir NOT LIKE ? ORDER BY id",
+                    (
+                        RUN_RUNNING,
+                        RUN_KIND_AUDIT,
+                        _POC_BACKFILL_OUTPUT_LIKE,
+                    ),
                 ).fetchall()
             ]
             if run_ids:
@@ -1200,7 +1725,8 @@ class AuditStore:
                                  THEN MAX(0, ? - active_started_at)
                                  ELSE 0 END,
                         active_started_at = NULL
-                    WHERE status = ?
+                    WHERE status = ? AND run_kind = ?
+                        AND output_dir NOT LIKE ?
                     """,
                     (
                         RUN_CANCELLED,
@@ -1208,6 +1734,8 @@ class AuditStore:
                         finished_at,
                         finished_at,
                         RUN_RUNNING,
+                        RUN_KIND_AUDIT,
+                        _POC_BACKFILL_OUTPUT_LIKE,
                     ),
                 )
         return run_ids
@@ -1236,12 +1764,16 @@ class AuditStore:
                     UPDATE runs
                     SET status = ?, error = '', ended_at = NULL,
                         active_started_at = ?
-                    WHERE id = ? AND (status IN (?, ?) OR (status = ? AND error != ''))
+                    WHERE id = ? AND run_kind = ?
+                        AND output_dir NOT LIKE ?
+                        AND (status IN (?, ?) OR (status = ? AND error != ''))
                     """,
                     (
                         RUN_RUNNING,
                         active_started_at,
                         run_id,
+                        RUN_KIND_AUDIT,
+                        _POC_BACKFILL_OUTPUT_LIKE,
                         RUN_CANCELLED,
                         RUN_FAILED,
                         RUN_DONE,
@@ -1253,7 +1785,9 @@ class AuditStore:
                     UPDATE runs
                     SET status = ?, error = '', ended_at = NULL,
                         active_started_at = ?, backend = ?, model = ?
-                    WHERE id = ? AND (status IN (?, ?) OR (status = ? AND error != ''))
+                    WHERE id = ? AND run_kind = ?
+                        AND output_dir NOT LIKE ?
+                        AND (status IN (?, ?) OR (status = ? AND error != ''))
                     """,
                     (
                         RUN_RUNNING,
@@ -1261,6 +1795,8 @@ class AuditStore:
                         backend,
                         model,
                         run_id,
+                        RUN_KIND_AUDIT,
+                        _POC_BACKFILL_OUTPUT_LIKE,
                         RUN_CANCELLED,
                         RUN_FAILED,
                         RUN_DONE,
@@ -1502,8 +2038,9 @@ class AuditStore:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO disclosures (
-                        run_id, vuln_id, report_path, email_path, zip_path
-                    ) VALUES (?, ?, ?, ?, ?)
+                        run_id, vuln_id, report_path, email_path, zip_path,
+                        trigger_graph_path, asan_report_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -1511,6 +2048,8 @@ class AuditStore:
                         disclosure["report_path"],
                         disclosure["email_path"],
                         disclosure["zip_path"],
+                        disclosure["trigger_graph_path"],
+                        disclosure["asan_report_path"],
                     ),
                 )
             reproduced = sum(
@@ -1558,8 +2097,11 @@ class AuditStore:
             SELECT v.vuln_id, v.title, v.location, v.trigger, v.cwe_ids,
                    v.vulnerability_class, v.dedupe_key, v.raw_json,
                    d.report_path, d.email_path, d.zip_path,
+                   d.trigger_graph_path AS disclosure_trigger_graph_path,
+                   d.asan_report_path AS disclosure_asan_report_path,
                    p.report_path AS poc_report_path,
-                   p.trigger_graph_path, p.asan_report_path,
+                   p.trigger_graph_path AS poc_trigger_graph_path,
+                   p.asan_report_path AS poc_asan_report_path,
                    p.status AS p_status,
                    r.repo_name, r.repo_url, r.target, r."commit",
                    r.backend, r.ended_at, r.started_at, r.created_at
@@ -1597,8 +2139,12 @@ class AuditStore:
             email_path = resolved_file(row["email_path"])
             zip_path = resolved_file(row["zip_path"])
             poc_path = resolved_file(row["poc_report_path"])
-            trigger_graph_path = resolved_file(row["trigger_graph_path"])
-            asan_report_path = resolved_file(row["asan_report_path"])
+            trigger_graph_path = resolved_file(
+                row["disclosure_trigger_graph_path"]
+            ) or resolved_file(row["poc_trigger_graph_path"])
+            asan_report_path = resolved_file(
+                row["disclosure_asan_report_path"]
+            ) or resolved_file(row["poc_asan_report_path"])
             finding_path = resolved_file(
                 os.path.join(
                     "stage4-vulnerabilities", f"{row['vuln_id']}.json"
@@ -1707,6 +2253,9 @@ class AuditStore:
         offset: int = 0,
         target: str | None = None,
         target_key: str | None = None,
+        status: str | None = None,
+        run_kind: str | None = None,
+        query: str | None = None,
     ) -> tuple[list[dict], int]:
         clauses = []
         args: list = []
@@ -1716,6 +2265,35 @@ class AuditStore:
         if target_key:
             clauses.append("r.target_key = ?")
             args.append(target_key)
+        if status:
+            if status not in RUN_STATUSES:
+                raise ValueError(f"Unsupported run status: {status}")
+            clauses.append("r.status = ?")
+            args.append(status)
+        if run_kind:
+            if run_kind not in RUN_KINDS:
+                raise ValueError(f"Unsupported run kind: {run_kind}")
+            if run_kind == RUN_KIND_MAINTENANCE:
+                clauses.append("(r.run_kind = ? OR r.output_dir LIKE ?)")
+                args.extend([run_kind, _POC_BACKFILL_OUTPUT_LIKE])
+            else:
+                clauses.append("r.run_kind = ? AND r.output_dir NOT LIKE ?")
+                args.extend([run_kind, _POC_BACKFILL_OUTPUT_LIKE])
+        if query and (needle := query.strip().lower()):
+            searchable = (
+                "CAST(r.id AS TEXT)",
+                "COALESCE(r.repo_name, '')",
+                "COALESCE(r.target, '')",
+                "COALESCE(r.output_dir, '')",
+                "COALESCE(r.\"commit\", '')",
+                "COALESCE(r.backend, '')",
+                "COALESCE(r.backends_used, '')",
+                "COALESCE(r.models_used, '')",
+            )
+            clauses.append(
+                "(" + " OR ".join(f"instr(lower({field}), ?) > 0" for field in searchable) + ")"
+            )
+            args.extend([needle] * len(searchable))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         statuses = sorted(REPRODUCED_STATUSES)
         status_placeholders = ",".join("?" * len(statuses))
@@ -1740,7 +2318,30 @@ class AuditStore:
                 """,
                 (*statuses, *args, limit, offset),
             ).fetchall()
-        return [dict(row) for row in rows], total
+        result = [dict(row) for row in rows]
+        for run in result:
+            if str(run.get("output_dir") or "").endswith(
+                _POC_BACKFILL_OUTPUT_SUFFIX
+            ):
+                run["run_kind"] = RUN_KIND_MAINTENANCE
+        return result, total
+
+    def list_running_maintenance_runs(self) -> list[dict]:
+        """Return database-owned maintenance rows for the Web job snapshot."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE status = ? "
+                "AND (run_kind = ? OR output_dir LIKE ?) ORDER BY id",
+                (
+                    RUN_RUNNING,
+                    RUN_KIND_MAINTENANCE,
+                    _POC_BACKFILL_OUTPUT_LIKE,
+                ),
+            ).fetchall()
+        result = [dict(row) for row in rows]
+        for run in result:
+            run["run_kind"] = RUN_KIND_MAINTENANCE
+        return result
 
     def dashboard_summary(self) -> dict[str, Any]:
         """Return compact aggregate counts for the Web dashboard."""
@@ -1803,6 +2404,10 @@ class AuditStore:
             if row is None:
                 return None
             run = dict(row)
+            if str(run.get("output_dir") or "").endswith(
+                _POC_BACKFILL_OUTPUT_SUFFIX
+            ):
+                run["run_kind"] = RUN_KIND_MAINTENANCE
             statuses = sorted(REPRODUCED_STATUSES)
             status_placeholders = ",".join("?" * len(statuses))
             run["vulnerabilities"] = [
@@ -2312,8 +2917,9 @@ class AuditStore:
             poc_rows = conn.execute(
                 """
                 SELECT v.dedupe_key, v.run_id, v.vuln_id, v.title,
-                       p.report_path AS poc_report_path
+                       p.report_path AS poc_report_path, r.output_dir
                 FROM vulnerabilities v
+                JOIN runs r ON r.id = v.run_id
                 JOIN pocs p
                   ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
                 WHERE p.status = 'reproduced'
@@ -2329,7 +2935,17 @@ class AuditStore:
             keys_by_cve.setdefault(cve["cve_id"], []).append(cve["dedupe_key"])
         poc_by_key: dict[str, dict] = {}
         for poc in poc_rows:
-            poc_by_key.setdefault(poc["dedupe_key"], dict(poc))
+            report_path = _registered_stage5_report(
+                str(poc["output_dir"] or ""), poc["poc_report_path"]
+            )
+            if report_path is None:
+                # A stale historical ``reproduced`` row without a retained
+                # report is not a runnable Terminal target.  Leave it out so
+                # the Disclosure view can show the explicit missing reason.
+                continue
+            item = dict(poc)
+            item.pop("output_dir", None)
+            poc_by_key.setdefault(poc["dedupe_key"], item)
         for row in entries:
             try:
                 artifacts = json.loads(row.pop("artifact_links") or "[]")

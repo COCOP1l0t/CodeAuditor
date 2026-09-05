@@ -185,6 +185,7 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, checkpoint, _target, output_dir = _stage6_config(tmp_path)
+    config.poc_source_commit = "b" * 40
     report = _write_stage5(output_dir, "H-07")
     scratch_root = tmp_path / "fake-stage6-scratch"
     instances: list[object] = []
@@ -199,6 +200,7 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
             instances.append(self)
 
         async def prepare(self, _target: str, _commit: str):  # type: ignore[no-untyped-def]
+            self.prepared_commit = _commit
             self.source_dir.mkdir(parents=True)
             self.artifact_dir.mkdir(parents=True)
             self.input_dir.mkdir(parents=True)
@@ -279,6 +281,7 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
     ]
     assert not (persistent / "temporary-build.bin").exists()
     assert instances and instances[0].closed is True  # type: ignore[attr-defined]
+    assert instances[0].prepared_commit == "b" * 40  # type: ignore[attr-defined]
     assert checkpoint.is_complete("stage6:H-07")
 
 

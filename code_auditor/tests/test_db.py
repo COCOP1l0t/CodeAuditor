@@ -15,7 +15,10 @@ from code_auditor.db import (
     RUN_DONE,
     RUN_FAILED,
     RUN_IMPORTED,
+    RUN_KIND_AUDIT,
+    RUN_KIND_MAINTENANCE,
     RUN_RUNNING,
+    RUN_SUPERSEDED,
     AuditStore,
     scan_output_dir,
 )
@@ -136,7 +139,9 @@ def _write_stage5_evidence(out: Path, vuln_id: str = "H-01") -> None:
         json.dumps(graph), encoding="utf-8"
     )
     (poc / "asan-report.txt").write_text(
-        "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n",
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+        "    #0 0x1 in parse src/parser.c:20\n"
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow src/parser.c:20 in parse\n",
         encoding="utf-8",
     )
 
@@ -161,6 +166,25 @@ def _write_stage6_retention(out: Path, vuln_id: str = "H-01") -> Path:
         encoding="utf-8",
     )
     manifest.chmod(0o600)
+    return disclosure
+
+
+def _write_stage6_retained_evidence(out: Path, vuln_id: str = "H-01") -> Path:
+    _write_stage5_evidence(out, vuln_id)
+    disclosure = _write_stage6_retention(out, vuln_id)
+    source = out / "stage5-pocs" / vuln_id
+    for name in ("trigger-graph.json", "asan-report.txt"):
+        shutil.copyfile(source / name, disclosure / name)
+    manifest_path = disclosure / "retain-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].extend(
+        [
+            {"path": "trigger-graph.json", "role": "evidence"},
+            {"path": "asan-report.txt", "role": "evidence"},
+        ]
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_path.chmod(0o600)
     return disclosure
 
 
@@ -199,6 +223,28 @@ def test_scan_output_dir_parses_all_stages(tmp_path) -> None:
     assert disclosure["zip_path"].endswith("disclosure.zip")
 
 
+def test_scan_output_dir_normalizes_failed_status_in_fp_directory(
+    tmp_path,
+) -> None:
+    out = tmp_path / "audit-output"
+    poc = out / "stage5-pocs" / "M-01_fp"
+    poc.mkdir(parents=True)
+    (poc / "report.md").write_text(
+        "# PoC\n\nReproduction Status: partially-reproduced\n",
+        encoding="utf-8",
+    )
+
+    artifacts = scan_output_dir(str(out))
+
+    assert artifacts["pocs"] == [
+        {
+            "vuln_id": "M-01",
+            "status": "false-positive",
+            "report_path": "stage5-pocs/M-01_fp/report.md",
+            "trigger_graph_path": "",
+            "asan_report_path": "",
+        }
+    ]
 def test_scan_output_dir_indexes_standardized_stage5_evidence(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     _write_stage5_evidence(out)
@@ -208,6 +254,39 @@ def test_scan_output_dir_indexes_standardized_stage5_evidence(tmp_path) -> None:
 
     assert poc["trigger_graph_path"].endswith("stage5-pocs/H-01/trigger-graph.json")
     assert poc["asan_report_path"].endswith("stage5-pocs/H-01/asan-report.txt")
+
+
+def test_scan_output_dir_indexes_valid_retained_stage6_evidence(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    _write_stage6_retained_evidence(out)
+
+    artifacts = scan_output_dir(str(out))
+    disclosure = artifacts["disclosures"][0]
+
+    assert disclosure["trigger_graph_path"].endswith(
+        "stage6-disclosures/H-01/disclosure/trigger-graph.json"
+    )
+    assert disclosure["asan_report_path"].endswith(
+        "stage6-disclosures/H-01/disclosure/asan-report.txt"
+    )
+
+
+def test_scan_output_dir_rejects_unretained_or_incomplete_stage6_evidence(
+    tmp_path,
+) -> None:
+    out = _make_output_dir(tmp_path)
+    disclosure = _write_stage6_retention(out)
+    (disclosure / "trigger-graph.json").write_text("{}", encoding="utf-8")
+    (disclosure / "asan-report.txt").write_text(
+        "AddressSanitizer was mentioned but no runtime report was captured.\n",
+        encoding="utf-8",
+    )
+
+    artifacts = scan_output_dir(str(out))
+    indexed = artifacts["disclosures"][0]
+
+    assert indexed["trigger_graph_path"] == ""
+    assert indexed["asan_report_path"] == ""
 
 
 def test_scan_output_dir_ignores_invalid_trigger_graph(tmp_path) -> None:
@@ -428,14 +507,34 @@ def test_schema_init_is_idempotent(tmp_path) -> None:
     AuditStore(db)  # second init must not raise
     with store._connect() as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(pocs)")}
+        disclosure_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(disclosures)")
+        }
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
     assert {"trigger_graph_path", "asan_report_path"} <= columns
+    assert {"trigger_graph_path", "asan_report_path"} <= disclosure_columns
     assert {
         "backends_used",
         "duration_seconds",
         "active_started_at",
         "duration_known",
+        "run_kind",
     } <= run_columns
+
+
+def test_schema_migrates_poc_backfill_runs_to_maintenance(tmp_path) -> None:
+    out = tmp_path / "audit-output-deadbeef-poc-backfill"
+    out.mkdir()
+    db = str(tmp_path / "history.db")
+    store = AuditStore(db)
+    run_id = store.create_run(_make_config(tmp_path, out))
+    with store._connect() as conn:
+        conn.execute("ALTER TABLE runs DROP COLUMN run_kind")
+
+    migrated = AuditStore(db).get_run(run_id)
+
+    assert migrated is not None
+    assert migrated["run_kind"] == RUN_KIND_MAINTENANCE
 
 
 def test_record_run_persists_run_and_artifacts(tmp_path) -> None:
@@ -661,6 +760,11 @@ def test_cancel_running_runs_only_recovers_active_rows(tmp_path) -> None:
     )
     done_id = store.create_run(_make_config(tmp_path, out), started_at=200.0)
     store.finish_run(done_id, RUN_DONE, ended_at=250.0)
+    maintenance_id = store.create_run(
+        _make_config(tmp_path, out),
+        started_at=225.0,
+        run_kind=RUN_KIND_MAINTENANCE,
+    )
 
     recovered = store.cancel_running_runs("worker exited", ended_at=300.0)
 
@@ -673,8 +777,11 @@ def test_cancel_running_runs_only_recovers_active_rows(tmp_path) -> None:
     assert interrupted["duration_seconds"] == 200.0
     assert interrupted["active_started_at"] is None
     assert store.get_run(done_id)["status"] == RUN_DONE
+    assert store.get_run(maintenance_id)["status"] == RUN_RUNNING
     assert store.cancel_running_runs("again") == []
     assert store.resume_cancelled_run(interrupted_id)
+    store.finish_run(maintenance_id, RUN_FAILED, ended_at=350.0)
+    assert store.resume_cancelled_run(maintenance_id) is False
 
 
 def test_import_output_dir(tmp_path) -> None:
@@ -705,6 +812,160 @@ def test_list_runs_pagination(tmp_path) -> None:
     assert len(runs) == 2
     runs, total = store.list_runs(limit=2, offset=2)
     assert len(runs) == 1
+
+
+def test_list_runs_filters_status_kind_and_query(tmp_path) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    audit_id = store.create_run(
+        _make_config(tmp_path, out), status=RUN_DONE
+    )
+    maintenance = AuditConfig(
+        target=str(tmp_path / "MaintenanceTarget"),
+        output_dir=str(tmp_path / "audit-output-maintenance"),
+        backend="claude",
+        models_used=["maintenance-model"],
+    )
+    maintenance_id = store.create_run(
+        maintenance,
+        status=RUN_FAILED,
+        run_kind=RUN_KIND_MAINTENANCE,
+    )
+
+    runs, total = store.list_runs(status=RUN_DONE)
+    assert total == 1
+    assert runs[0]["id"] == audit_id
+
+    runs, total = store.list_runs(run_kind=RUN_KIND_MAINTENANCE)
+    assert total == 1
+    assert runs[0]["id"] == maintenance_id
+
+    runs, total = store.list_runs(query="maintenancetarget")
+    assert total == 1
+    assert runs[0]["run_kind"] == RUN_KIND_MAINTENANCE
+
+    with pytest.raises(ValueError, match="Unsupported run kind"):
+        store.list_runs(run_kind="unknown")
+
+    assert store.get_run(audit_id)["run_kind"] == RUN_KIND_AUDIT
+
+
+def test_repair_maintenance_statuses_marks_only_proven_superseded_rows(
+    tmp_path,
+) -> None:
+    store = AuditStore(str(tmp_path / "history.db"))
+    target = tmp_path / "repo"
+    target.mkdir()
+    old_output = tmp_path / "audit-output-old-poc-backfill"
+    new_output = tmp_path / "audit-output-new-poc-backfill"
+    (old_output / "stage5-pocs" / "H-01_fp").mkdir(parents=True)
+    (new_output / "stage5-pocs" / "H-01_fp").mkdir(parents=True)
+    for output in (old_output, new_output):
+        (output / "stage5-pocs" / "H-01_fp" / "report.md").write_text(
+            "# Reproduction Status: false-positive\n", encoding="utf-8"
+        )
+
+    old_id = store.create_run(
+        AuditConfig(target=str(target), output_dir=str(old_output)),
+        status=RUN_FAILED,
+        run_kind=RUN_KIND_MAINTENANCE,
+        started_at=100.0,
+    )
+    new_id = store.create_run(
+        AuditConfig(target=str(target), output_dir=str(new_output)),
+        status=RUN_DONE,
+        run_kind=RUN_KIND_MAINTENANCE,
+        started_at=200.0,
+    )
+    with store._connect() as conn:
+        for run_id in (old_id, new_id):
+            conn.execute(
+                "UPDATE runs SET target_key = ?, \"commit\" = ? WHERE id = ?",
+                ("target-key", "a" * 40, run_id),
+            )
+        for run_id in (old_id, new_id):
+            conn.execute(
+                """
+                INSERT INTO vulnerabilities (
+                    run_id, vuln_id, raw_json, dedupe_key
+                ) VALUES (?, 'H-01', '{}', ?)
+                """,
+                (run_id, f"key-{run_id}"),
+            )
+        conn.execute(
+            """
+            INSERT INTO pocs (run_id, vuln_id, status, report_path)
+            VALUES (?, 'H-01', 'false-positive', 'stage5-pocs/H-01_fp/report.md')
+            """,
+            (new_id,),
+        )
+        conn.execute(
+            "UPDATE runs SET error = ? WHERE id = ?",
+            ("qemu/H-01: provider failed", old_id),
+        )
+
+    plan = store.repair_maintenance_statuses()
+    assert plan["inspected"] == 2
+    assert plan["planned"] == 1
+    assert plan["applied"] is False
+    assert store.get_run(old_id)["status"] == RUN_FAILED
+
+    applied = store.repair_maintenance_statuses(apply=True)
+    assert applied["planned"] == 1
+    assert store.get_run(old_id)["status"] == RUN_SUPERSEDED
+    assert store.get_run(old_id)["error"] == ""
+    assert "Run #%d" % new_id in store.get_run(old_id)["warning"]
+
+
+def test_repair_maintenance_statuses_downgrades_cleanup_race_to_warning(
+    tmp_path,
+) -> None:
+    store = AuditStore(str(tmp_path / "history.db"))
+    target = tmp_path / "repo"
+    target.mkdir()
+    output = tmp_path / "audit-output-race-poc-backfill"
+    report = output / "stage5-pocs" / "H-17_fp" / "report.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("# Reproduction Status: false-positive\n", encoding="utf-8")
+    run_id = store.create_run(
+        AuditConfig(target=str(target), output_dir=str(output)),
+        status=RUN_DONE,
+        run_kind=RUN_KIND_MAINTENANCE,
+    )
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO vulnerabilities (
+                run_id, vuln_id, raw_json, dedupe_key
+            ) VALUES (?, 'H-17', '{}', 'race-key')
+            """,
+            (run_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pocs (run_id, vuln_id, status, report_path)
+            VALUES (?, 'H-17', 'false-positive', 'stage5-pocs/H-17_fp/report.md')
+            """,
+            (run_id,),
+        )
+        conn.execute(
+            """
+            UPDATE runs SET error = ? WHERE id = ?
+            """,
+            (
+                "virtualbox/H-17: cannot remove sandbox container(s) abc: "
+                "sandbox command failed: docker rm -f abc: Error response from daemon: "
+                "removal of container abc is already in progress",
+                run_id,
+            ),
+        )
+
+    result = store.repair_maintenance_statuses(apply=True)
+    assert result["planned"] == 1
+    run = store.get_run(run_id)
+    assert run["status"] == RUN_DONE
+    assert run["error"] == ""
+    assert run["warning"].startswith("Non-fatal cleanup warning:")
 
 
 def test_get_run_unknown_returns_none(tmp_path) -> None:
@@ -1102,6 +1363,46 @@ def test_record_run_registers_stage5_evidence_for_disclosure(tmp_path) -> None:
     assert "Stage 5 ASan Report" in labels
 
 
+def test_backfill_registers_only_valid_retained_stage6_evidence(tmp_path) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    _write_stage6_retention(out)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    assert {
+        artifact["label"] for artifact in store.list_disclosed()[0]["artifacts"]
+    }.isdisjoint({"Stage 5 Trigger Graph", "Stage 5 ASan Report"})
+
+    _write_stage6_retained_evidence(out)
+    shutil.rmtree(out / "stage5-pocs" / "H-01")
+    report = store.backfill_retained_stage6_evidence()
+
+    assert report == {
+        "disclosure_rows": 1,
+        "catalogue_rows": 1,
+        "trigger_graphs": 1,
+        "asan_reports": 1,
+    }
+    labels = {artifact["label"] for artifact in store.list_disclosed()[0]["artifacts"]}
+    assert {"Stage 5 Trigger Graph", "Stage 5 ASan Report"} <= labels
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT trigger_graph_path, asan_report_path FROM disclosures "
+            "WHERE run_id = ? AND vuln_id = 'H-01'",
+            (run_id,),
+        ).fetchone()
+    assert row["trigger_graph_path"].endswith("disclosure/trigger-graph.json")
+    assert row["asan_report_path"].endswith("disclosure/asan-report.txt")
+    assert store.backfill_retained_stage6_evidence() == {
+        "disclosure_rows": 0,
+        "catalogue_rows": 0,
+        "trigger_graphs": 0,
+        "asan_reports": 0,
+    }
+
+
 def test_database_disclosures_dedupe_and_preserve_review_status(tmp_path) -> None:
     first = _make_disclosure_output(tmp_path / "one" / "qemu")
     second = _make_disclosure_output(tmp_path / "two" / "qemu")
@@ -1313,6 +1614,25 @@ def test_manual_cve_import_links_local_disclosure_and_reproduced_poc(tmp_path) -
     assert terminal is not None
     assert terminal["poc_dir"] == str(out / "stage5-pocs" / "H-01")
     assert store.get_poc_terminal_candidate(run_id, "L-02") is None
+
+
+def test_disclosure_does_not_expose_stale_reproduced_poc_as_terminal(tmp_path) -> None:
+    out = _make_output_dir(tmp_path / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE pocs SET report_path = '' WHERE run_id = ? AND vuln_id = 'H-01'",
+            (run_id,),
+        )
+    (out / "stage5-pocs" / "H-01" / "report.md").unlink()
+
+    entry = store.list_disclosed()[0]
+    assert entry["terminal"] is None
+    assert entry["poc"] is None
 
 
 def test_confirmed_disclosure_reassigns_cve_links_atomically(tmp_path) -> None:

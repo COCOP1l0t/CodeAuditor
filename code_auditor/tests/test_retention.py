@@ -11,6 +11,7 @@ from code_auditor.retention import (
     RetentionError,
     export_retained_artifacts,
     load_retain_manifest,
+    secure_generated_manifest_mode,
 )
 
 
@@ -123,6 +124,25 @@ def test_manifest_rejects_group_or_world_access(tmp_path: Path) -> None:
 
     with pytest.raises(RetentionError, match="group/world accessible"):
         load_retain_manifest(source)
+
+
+def test_secure_generated_manifest_mode_tightens_regular_file(tmp_path: Path) -> None:
+    source = tmp_path / "scratch"
+    _write_retained_tree(source)
+    manifest_path = source / RETAIN_MANIFEST_FILENAME
+    manifest_path.chmod(0o644)
+
+    assert secure_generated_manifest_mode(source) is True
+    assert manifest_path.stat().st_mode & 0o777 == 0o600
+    assert load_retain_manifest(source).entrypoint == "reproduce.sh"
+
+
+def test_secure_generated_manifest_mode_rejects_hardlink(tmp_path: Path) -> None:
+    source = tmp_path / "scratch"
+    _write_retained_tree(source)
+    os.link(source / RETAIN_MANIFEST_FILENAME, tmp_path / "manifest-copy.json")
+
+    assert secure_generated_manifest_mode(source) is False
 
 
 def test_manifest_rejects_nonportable_support_file(tmp_path: Path) -> None:

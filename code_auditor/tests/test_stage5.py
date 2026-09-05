@@ -8,6 +8,7 @@ from pathlib import Path
 
 from code_auditor.checkpoint import CheckpointManager
 from code_auditor.config import AuditConfig
+from code_auditor.poc_artifacts import load_asan_report
 from code_auditor.stages import stage5
 from code_auditor.validation.stage5 import validate_stage5_trigger_graph
 
@@ -99,6 +100,22 @@ def test_validate_stage5_trigger_graph_requires_evidence_path(tmp_path: Path) ->
     assert any("path from a trigger/source to a sink" in issue.description for issue in issues)
 
 
+def test_load_asan_report_requires_complete_runtime_evidence(tmp_path: Path) -> None:
+    report = tmp_path / "asan-report.txt"
+    report.write_text("AddressSanitizer was enabled\n", encoding="utf-8")
+    assert load_asan_report(str(report))[0] is None
+
+    report.write_text(
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+        "    #0 0x1 in copy_payload src/parser.c:91\n"
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow src/parser.c:91\n",
+        encoding="utf-8",
+    )
+    loaded, errors = load_asan_report(str(report))
+    assert loaded is not None
+    assert errors == []
+
+
 def test_run_stage5_records_standardized_graph_and_asan_names(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -120,7 +137,9 @@ def test_run_stage5_records_standardized_graph_and_asan_names(
             json.dumps(_trigger_graph("H-05")), encoding="utf-8"
         )
         (poc_dir / "asan-report.txt").write_text(
-            "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n",
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+            "    #0 0x1 in copy_payload src/parser.c:91\n"
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow src/parser.c:91\n",
             encoding="utf-8",
         )
         return "done"
@@ -245,6 +264,7 @@ def test_run_stage5_exports_only_retained_files_from_scratch(
 ) -> None:
     config, checkpoint, output_dir = _stage5_config(tmp_path)
     config.sandbox_enabled = True
+    config.poc_source_commit = "a" * 40
     vuln = _write_vuln_file(output_dir, "H-09")
     scratch_root = tmp_path / "fake-scratch"
     instances: list[object] = []
@@ -259,6 +279,7 @@ def test_run_stage5_exports_only_retained_files_from_scratch(
             instances.append(self)
 
         async def prepare(self, _target: str, _commit: str):  # type: ignore[no-untyped-def]
+            self.prepared_commit = _commit
             self.source_dir.mkdir(parents=True)
             self.artifact_dir.mkdir(parents=True)
             self.input_dir.mkdir(parents=True)
@@ -331,4 +352,111 @@ def test_run_stage5_exports_only_retained_files_from_scratch(
     ]
     assert not (persistent / "large-build.bin").exists()
     assert instances and instances[0].closed is True  # type: ignore[attr-defined]
+    assert instances[0].prepared_commit == "a" * 40  # type: ignore[attr-defined]
     assert checkpoint.is_complete("stage5:H-09")
+
+
+def test_run_stage5_repairs_invalid_retain_manifest_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, checkpoint, output_dir = _stage5_config(tmp_path)
+    config.sandbox_enabled = True
+    config.poc_source_commit = "b" * 40
+    vuln = _write_vuln_file(output_dir, "H-10")
+    scratch_root = tmp_path / "fake-scratch"
+
+    class FakeScratch:
+        def __init__(self, owner: AuditConfig, _task_name: str) -> None:
+            self.owner = owner
+            self.source_dir = scratch_root / "source"
+            self.artifact_dir = scratch_root / "artifacts"
+            self.input_dir = scratch_root / "inputs"
+
+        async def prepare(self, _target: str, _commit: str):  # type: ignore[no-untyped-def]
+            self.source_dir.mkdir(parents=True)
+            self.artifact_dir.mkdir(parents=True)
+            self.input_dir.mkdir(parents=True)
+            return self
+
+        def audit_config(self, owner: AuditConfig) -> AuditConfig:
+            return replace(
+                owner,
+                target=str(self.source_dir),
+                output_dir=str(self.artifact_dir),
+                poc_worktree=str(self.source_dir),
+            )
+
+        def copy_input(self, source: str, name: str) -> Path:
+            destination = self.input_dir / name
+            shutil.copyfile(source, destination)
+            return destination
+
+        async def close(self) -> None:
+            return None
+
+    prompts: list[str] = []
+
+    async def fake_run_agent(
+        prompt: str,
+        work_config: AuditConfig,
+        **_kwargs: object,
+    ) -> str:
+        prompts.append(prompt)
+        poc = Path(work_config.output_dir) / "stage5-pocs" / "H-10"
+        poc.mkdir(parents=True, exist_ok=True)
+        if len(prompts) == 1:
+            (poc / "report.md").write_text(
+                "# H-10\n\n## Reproduction Status\n\nreproduced\n",
+                encoding="utf-8",
+            )
+            reproduce = poc / "reproduce.sh"
+            reproduce.write_text("#!/bin/sh\nexec echo reproduced\n", encoding="utf-8")
+            reproduce.chmod(0o700)
+            (poc / "trigger-graph.json").write_text(
+                json.dumps(_trigger_graph("H-10")), encoding="utf-8"
+            )
+            (poc / "retain-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "entrypoint": "reproduce.sh",
+                        "files": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        else:
+            assert "files must be a non-empty array" in prompt
+            assert "Do not alter the reproduction result" in prompt
+            (poc / "retain-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "entrypoint": "reproduce.sh",
+                        "files": [
+                            {"path": "reproduce.sh", "role": "entrypoint"},
+                            {"path": "report.md", "role": "report"},
+                            {"path": "trigger-graph.json", "role": "evidence"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return "done"
+
+    monkeypatch.setattr(stage5, "DockerScratch", FakeScratch)
+    monkeypatch.setattr(stage5, "run_agent", fake_run_agent)
+
+    reports = asyncio.run(stage5.run_stage5([str(vuln)], config, checkpoint))
+
+    persistent = output_dir / "stage5-pocs" / "H-10"
+    assert reports == [str(persistent / "report.md")]
+    assert len(prompts) == 2
+    assert sorted(path.name for path in persistent.iterdir()) == [
+        "report.md",
+        "reproduce.sh",
+        "retain-manifest.json",
+        "trigger-graph.json",
+    ]
+    assert checkpoint.is_complete("stage5:H-10")

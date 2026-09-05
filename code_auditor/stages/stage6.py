@@ -15,7 +15,7 @@ from ..logger import get_logger
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
 from ..reproduction_status import is_failed_status, is_reproduced_status, read_reproduction_status
-from ..retention import export_retained_artifacts
+from ..retention import export_retained_artifacts, secure_generated_manifest_mode
 from ..sandbox import DockerScratch
 from ..utils import extract_json_object, record_task_error, run_parallel_limited
 from ..wiki import build_wiki_context
@@ -415,9 +415,10 @@ async def _run_disclosure(
     finding_file = _find_finding_file(vuln_id, config.output_dir)
     if config.sandbox_enabled:
         identity = capture_repo_identity(config.target)
+        source_commit = config.poc_source_commit or identity.get("commit") or ""
         sandbox = DockerScratch(config, f"stage6-{vuln_id}")
         try:
-            await sandbox.prepare(config.target, identity.get("commit") or "")
+            await sandbox.prepare(config.target, source_commit)
             work_config = sandbox.audit_config(config)
             copied_poc_dir = sandbox.copy_input_tree(poc_dir, "stage5-poc")
             poc_dir = str(copied_poc_dir)
@@ -475,6 +476,7 @@ async def _run_disclosure(
             sandbox=sandbox,
         )
         if sandbox is not None:
+            secure_generated_manifest_mode(disclosure_dir)
             manifest = export_retained_artifacts(
                 disclosure_dir,
                 persistent_disclosure_dir,

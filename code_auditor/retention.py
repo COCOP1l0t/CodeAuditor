@@ -66,6 +66,32 @@ class RetentionError(ValueError):
     """Raised when retained artifacts do not satisfy the export contract."""
 
 
+def secure_generated_manifest_mode(
+    artifact_dir: str | os.PathLike[str],
+) -> bool:
+    """Make an isolated agent's regular manifest owner-only before validation.
+
+    The sandbox root is already owner-only, but agents commonly create text
+    files with the process umask (0644).  Tightening a single, known manifest
+    is deterministic output finalization; unsafe links and multiply-linked
+    files are left untouched so the normal validator still rejects them.
+    """
+    path = Path(artifact_dir) / RETAIN_MANIFEST_FILENAME
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            return False
+        os.fchmod(fd, 0o600)
+        return True
+    finally:
+        os.close(fd)
+
+
 @dataclass(frozen=True)
 class RetainedFile:
     path: str

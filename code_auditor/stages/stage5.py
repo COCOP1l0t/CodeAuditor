@@ -12,7 +12,11 @@ from ..poc_artifacts import ASAN_REPORT_FILENAME, TRIGGER_GRAPH_FILENAME
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
 from ..reproduction_status import is_failed_status, read_reproduction_status
-from ..retention import export_retained_artifacts
+from ..retention import (
+    RetentionError,
+    export_retained_artifacts,
+    secure_generated_manifest_mode,
+)
 from ..sandbox import DockerScratch
 from ..utils import format_validation_issues, record_task_error, run_parallel_limited
 from ..validation.stage5 import validate_stage5_trigger_graph
@@ -107,9 +111,10 @@ async def _run_reproduce(
     work_vuln_file = vuln_file_path
     if config.sandbox_enabled:
         identity = capture_repo_identity(config.target)
+        source_commit = config.poc_source_commit or identity.get("commit") or ""
         sandbox = DockerScratch(config, f"stage5-{vuln_id}")
         try:
-            await sandbox.prepare(config.target, identity.get("commit") or "")
+            await sandbox.prepare(config.target, source_commit)
             work_config = sandbox.audit_config(config)
             work_vuln_file = str(
                 sandbox.copy_input(vuln_file_path, "finding.json")
@@ -194,13 +199,54 @@ async def _run_reproduce(
             persistent_destination = persistent_poc_dir
             if os.path.basename(retained_source).endswith("_fp"):
                 persistent_destination += "_fp"
-            manifest = export_retained_artifacts(
-                retained_source,
-                persistent_destination,
-                required_paths=("report.md", "reproduce.sh"),
-                max_file_bytes=config.retain_max_file_bytes,
-                max_total_bytes=config.retain_max_total_bytes,
-            )
+            secure_generated_manifest_mode(retained_source)
+            try:
+                manifest = export_retained_artifacts(
+                    retained_source,
+                    persistent_destination,
+                    required_paths=("report.md", "reproduce.sh"),
+                    max_file_bytes=config.retain_max_file_bytes,
+                    max_total_bytes=config.retain_max_total_bytes,
+                )
+            except RetentionError as exc:
+                manifest_path = os.path.join(
+                    retained_source, "retain-manifest.json"
+                )
+                logger.warning(
+                    "Stage 5: Retain manifest validation failed for %s: %s. "
+                    "Requesting one bounded repair.",
+                    vuln_id,
+                    exc,
+                )
+                repair_prompt = (
+                    f"The Stage 5 retain manifest at `{manifest_path}` was rejected: "
+                    f"{exc}. Repair only `retain-manifest.json` so it exactly follows "
+                    "the schema in the Stage 5 instructions and lists the existing, "
+                    "small files needed for independent reproduction and review. "
+                    "It must include `reproduce.sh` with role `entrypoint` and "
+                    "`report.md` with role `report`; do not list the manifest itself, "
+                    "agent.log, build trees, caches, source checkouts, binaries, or "
+                    "other disposable files. Do not alter the reproduction result or "
+                    "create any new runtime evidence."
+                )
+                await run_agent(
+                    repair_prompt,
+                    work_config,
+                    cwd=poc_target,
+                    max_turns=15,
+                    model=select_poc_model(config),
+                    effort=_DEFAULT_EFFORT,
+                    log_file=log_file,
+                    sandbox=sandbox,
+                )
+                secure_generated_manifest_mode(retained_source)
+                manifest = export_retained_artifacts(
+                    retained_source,
+                    persistent_destination,
+                    required_paths=("report.md", "reproduce.sh"),
+                    max_file_bytes=config.retain_max_file_bytes,
+                    max_total_bytes=config.retain_max_total_bytes,
+                )
             logger.info(
                 "Stage 5: Exported %d retained files (%d bytes) for %s.",
                 len(manifest.files),

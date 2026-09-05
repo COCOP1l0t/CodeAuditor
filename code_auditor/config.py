@@ -78,6 +78,11 @@ class AuditConfig:
     task_errors: list[str] = field(default_factory=list, repr=False)
     # Isolated worktree for Stage 5/6 PoC agents; set up by the orchestrator.
     poc_worktree: str | None = None
+    # Optional immutable source revision for Stage 5/6 recovery work.  Normal
+    # audits leave this unset and reproduce against the target's current HEAD;
+    # evidence backfills set it so an old finding is never tested against a
+    # newer, unrelated checkout.
+    poc_source_commit: str | None = None
     # Stage 5/6 use a disposable Docker workspace by default; Web settings may
     # instead select a detached host worktree. The only writable Docker bind
     # mount is a per-task directory below sandbox_root.

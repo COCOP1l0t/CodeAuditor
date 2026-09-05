@@ -23,6 +23,8 @@ from code_auditor.db import (
     RUN_CANCELLED,
     RUN_DONE,
     RUN_FAILED,
+    RUN_KIND_MAINTENANCE,
+    RUN_SUPERSEDED,
     AuditStore,
     compute_target_key,
 )
@@ -1376,7 +1378,9 @@ def _write_web_stage5_evidence(output_dir: str) -> None:
         json.dumps(graph), encoding="utf-8"
     )
     (poc / "asan-report.txt").write_text(
-        "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n#0 memcpy\n",
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
+        "    #0 0x1 in memcpy src/a.c:2\n"
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow src/a.c:2 in memcpy\n",
         encoding="utf-8",
     )
 
@@ -1682,7 +1686,14 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="s-backend"' in res.text
     assert 'id="s-mode"' in res.text
     assert "Active jobs switch on their next agent call" in res.text
-    assert res.text.count('class="table-shell"') == 3
+    assert res.text.count('class="table-shell') == 4
+    assert 'class="table-shell history-table-shell"' in res.text
+    assert 'id="history-search"' in res.text
+    assert 'id="history-status"' in res.text
+    assert 'id="history-kind"' not in res.text
+    assert 'id="history-page-size"' in res.text
+    assert 'id="history-prev"' in res.text
+    assert 'id="history-next"' in res.text
     assert 'id="trash-table"' in res.text
     assert 'class="col-disclosure-title"' in res.text
     assert 'class="col-cve-local"' in res.text
@@ -1726,6 +1737,11 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'btnStart.textContent = "Starting…"' in script.text
     assert "openCveDialog" in script.text
     assert "appendEvidenceActionButtons" in script.text
+    assert "disclosureUnavailableReasons" in script.text
+    assert "No validated retained Stage 5/6 reproducer is registered." in script.text
+    assert "No validated runtime trigger-graph.json is registered." in script.text
+    assert "ASan may not apply or may have produced no report." in script.text
+    assert "Unavailable actions:" in script.text
     assert "renderTriggerGraph" in script.text
     assert "openAsanReport" in script.text
     assert "pollDetailHeartbeat" in script.text
@@ -1743,6 +1759,9 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "backendsUsedDisplay" in script.text
     assert "updateRunAgentHistoryMeta" in script.text
     assert "Backends used" in res.text
+    assert "historyServerFiltering" in script.text
+    assert "externalMaintenanceJob" in script.text
+    assert "refreshJobSnapshot" in script.text
     assert "/api/jobs/events" in script.text
     assert "/resume`" in script.text
     assert "notifyStageCompleted" in script.text
@@ -2303,7 +2322,72 @@ def test_api_history_empty(tmp_path) -> None:
     body = res.json()
     assert body["runs"] == []
     assert body["total"] == 0
+    assert body["capabilities"]["server_filtering"] is True
     assert body["db_path"].endswith("history.db")
+
+
+def test_api_history_filters_and_paginates(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    audit_id = app.state.store.create_run(
+        AuditConfig(
+            target=str(tmp_path / "AuditTarget"),
+            output_dir=str(tmp_path / "audit-output-audit"),
+        ),
+        status=RUN_DONE,
+    )
+    maintenance_id = app.state.store.create_run(
+        AuditConfig(
+            target=str(tmp_path / "MaintenanceTarget"),
+            output_dir=str(tmp_path / "audit-output-maintenance"),
+        ),
+        status=RUN_FAILED,
+        run_kind=RUN_KIND_MAINTENANCE,
+    )
+    client = TestClient(app)
+
+    page = client.get("/api/history", params={"limit": 1, "offset": 1}).json()
+    assert page["total"] == 2
+    assert page["limit"] == 1
+    assert page["offset"] == 1
+    assert len(page["runs"]) == 1
+
+    filtered = client.get(
+        "/api/history",
+        params={"status": RUN_FAILED, "run_kind": "maintenance", "q": "target"},
+    ).json()
+    assert filtered["total"] == 1
+    assert filtered["runs"][0]["id"] == maintenance_id
+    assert filtered["filters"] == {
+        "status": RUN_FAILED,
+        "run_kind": "maintenance",
+        "q": "target",
+    }
+
+    searched = client.get("/api/history", params={"q": "audittarget"}).json()
+    assert searched["total"] == 1
+    assert searched["runs"][0]["id"] == audit_id
+    assert client.get("/api/history", params={"status": "unknown"}).status_code == 422
+
+
+def test_api_history_accepts_superseded_maintenance_status(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    run_id = app.state.store.create_run(
+        AuditConfig(
+            target=str(tmp_path / "target"),
+            output_dir=str(tmp_path / "audit-output-maintenance"),
+        ),
+        status=RUN_SUPERSEDED,
+        run_kind=RUN_KIND_MAINTENANCE,
+    )
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/history",
+        params={"status": RUN_SUPERSEDED, "run_kind": RUN_KIND_MAINTENANCE},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["runs"][0]["id"] == run_id
 
 
 def test_app_startup_recovers_interrupted_running_history(tmp_path) -> None:
@@ -2315,15 +2399,30 @@ def test_app_startup_recovers_interrupted_running_history(tmp_path) -> None:
         ),
         started_at=100.0,
     )
+    maintenance_id = app.state.store.create_run(
+        AuditConfig(
+            target=str(tmp_path),
+            output_dir=str(tmp_path / "audit-output-maintenance"),
+        ),
+        started_at=200.0,
+        run_kind=RUN_KIND_MAINTENANCE,
+    )
 
     with TestClient(app) as client:
         detail = client.get(f"/api/history/{run_id}").json()
+        maintenance = client.get(f"/api/history/{maintenance_id}").json()
         jobs = client.get("/api/jobs").json()
 
     assert detail["status"] == RUN_CANCELLED
     assert "Web worker exited" in detail["error"]
     assert detail["ended_at"] is not None
-    assert jobs["jobs"] == []
+    assert maintenance["status"] == "running"
+    assert maintenance["run_kind"] == "maintenance"
+    assert jobs["external_maintenance_supported"] is True
+    assert len(jobs["jobs"]) == 1
+    assert jobs["jobs"][0]["run_id"] == maintenance_id
+    assert jobs["jobs"][0]["kind"] == "maintenance"
+    assert jobs["jobs"][0]["controllable"] is False
 
 
 def test_api_resumes_cancelled_history_run_in_place(tmp_path, monkeypatch) -> None:

@@ -43,6 +43,10 @@ const reproductionViewerPanel = $("reproduction-viewer-panel");
 // meaningful for liveness checks.
 const activeJobs = new Map();
 const durationKnownByRun = new Map();
+const inferredMaintenanceJobKeys = new Set();
+const historyState = { offset: 0, limit: 25, total: 0 };
+let historySearchTimer = null;
+let historyServerFiltering = null;
 // Run id currently streamed into the run detail page's Stages/Logs panels.
 let liveDetailRunId = null;
 // Run id currently displayed on the run detail page (live or static).
@@ -77,6 +81,11 @@ const disclosureSort = { key: "", direction: "ascending" };
 const cveSort = { key: "", direction: "ascending" };
 const TRIGGER_GRAPH_ARTIFACT = "Stage 5 Trigger Graph";
 const ASAN_REPORT_ARTIFACT = "Stage 5 ASan Report";
+const DISCLOSURE_MISSING_REASONS = Object.freeze({
+  terminal: "No validated retained Stage 5/6 reproducer is registered.",
+  graph: "No validated runtime trigger-graph.json is registered.",
+  asan: "No captured ASan report is registered; ASan may not apply or may have produced no report.",
+});
 const SVG_NS = "http://www.w3.org/2000/svg";
 const TRIGGER_GRAPH_ROLES = new Set([
   "trigger",
@@ -365,6 +374,7 @@ function dashboardStatusLabel(status) {
     failed: "Failed",
     cancelled: "Cancelled",
     imported: "Imported",
+    superseded: "Superseded",
     unreviewed: "Unreviewed",
     reported: "Reported",
     confirmed: "Confirmed",
@@ -417,7 +427,7 @@ function renderDashboardRecentRuns(runs) {
         `<a class="dashboard-recent-run" href="#/run/${escapeHtml(run.id)}">` +
         `<span class="dashboard-run-identity">` +
         `<span class="dashboard-run-name">${escapeHtml(repoDisplay(run))}</span>` +
-        `<span class="dashboard-run-meta">Run #${escapeHtml(run.id)} · ${escapeHtml(commit)}</span>` +
+        `<span class="dashboard-run-meta">${escapeHtml(runKindLabel(run))} #${escapeHtml(run.id)} · ${escapeHtml(commit)}</span>` +
         `</span>` +
         `<span class="badge badge-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>` +
         `<span class="dashboard-run-result"><strong>${escapeHtml(reproduced)}</strong> reproduced</span>` +
@@ -431,10 +441,17 @@ function renderDashboardRecentRuns(runs) {
 function updateDashboardActiveJobs(jobs = busyJobs()) {
   const active = jobs.filter((job) => BUSY_JOB_STATES.has(job.state));
   $("dashboard-active").textContent = String(active.length);
-  const audits = active.filter((job) => job.kind !== "reproduction").length;
-  const reproductions = active.length - audits;
+  const audits = active.filter((job) => (job.kind || "audit") === "audit").length;
+  const reproductions = active.filter((job) => job.kind === "reproduction").length;
+  const maintenance = active.filter((job) => job.kind === "maintenance").length;
+  const parts = [];
+  if (audits) parts.push(`${audits} audit${audits === 1 ? "" : "s"}`);
+  if (reproductions) {
+    parts.push(`${reproductions} reproduction${reproductions === 1 ? "" : "s"}`);
+  }
+  if (maintenance) parts.push(`${maintenance} maintenance`);
   $("dashboard-active-detail").textContent = active.length
-    ? `${audits} audit${audits === 1 ? "" : "s"} · ${reproductions} reproduction${reproductions === 1 ? "" : "s"}`
+    ? parts.join(" · ")
     : "No jobs running";
 }
 
@@ -976,6 +993,9 @@ function jobDisplayLabel(job) {
       ? `repro ${candidate.vuln_id}${backend}`
       : `repro ${String(job.job_key).slice(0, 12)}${backend}`;
   }
+  if (job.kind === "maintenance") {
+    return `Maintenance #${job.run_id ?? "?"}${backend}`;
+  }
   return `Run #${job.run_id ?? "?"}${backend}`;
 }
 
@@ -996,6 +1016,9 @@ function renderJobList() {
     );
     item.className = "job-list-item";
     if (item.tagName === "A") item.href = `#/run/${job.run_id}`;
+    if (job.controllable === false) {
+      item.title = "Managed by an external maintenance process";
+    }
     const badge = document.createElement("span");
     badge.className = `badge badge-${job.state}`;
     badge.textContent = job.state;
@@ -1008,6 +1031,38 @@ function renderJobList() {
     elapsed.textContent = fmtRunDuration(job);
     item.append(badge, label, elapsed);
     jobList.appendChild(item);
+  }
+}
+
+async function refreshJobSnapshot({ reloadHistory = false } = {}) {
+  try {
+    const res = await fetch("/api/jobs", { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    const seen = new Set();
+    for (const job of data.jobs || []) {
+      if (!job?.job_key || !BUSY_JOB_STATES.has(job.state)) continue;
+      const key = String(job.job_key);
+      seen.add(key);
+      activeJobs.set(key, job);
+      if (job.kind === "maintenance" && job.controllable === false) {
+        inferredMaintenanceJobKeys.delete(key);
+      }
+    }
+    for (const [key, job] of activeJobs) {
+      if (seen.has(key)) continue;
+      if (data.external_maintenance_supported || job.controllable !== false) {
+        activeJobs.delete(key);
+        inferredMaintenanceJobKeys.delete(key);
+      }
+    }
+    renderJobList();
+    updateResumeButtons();
+    updateReproductionStartAvailability();
+    updateDashboardActiveJobs();
+    if (reloadHistory && !$("view-history").hidden) loadHistory();
+  } catch {
+    // The global lifecycle stream and the next snapshot retry remain available.
   }
 }
 
@@ -1782,6 +1837,19 @@ function repoDisplay(run) {
   return run.repo_name || baseName(run.target);
 }
 
+function runKind(run) {
+  if (run?.run_kind === "maintenance") return "maintenance";
+  // Compatibility with a Web worker started before run_kind was added.
+  if (String(run?.output_dir || "").endsWith("-poc-backfill")) {
+    return "maintenance";
+  }
+  return "audit";
+}
+
+function runKindLabel(run) {
+  return "Audit";
+}
+
 function fmtTime(ts) {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString();
@@ -1952,6 +2020,85 @@ async function resumeCancelledAudit(runId, button) {
 let _loadingHistory = false;
 let _pendingHistoryLoad = false;
 
+function historyFilterValues() {
+  return {
+    query: $("history-search").value.trim(),
+    status: $("history-status").value,
+  };
+}
+
+function historyRunMatches(run, filters) {
+  if (filters.status && run.status !== filters.status) return false;
+  if (!filters.query) return true;
+  const haystack = [
+    run.id,
+    run.repo_name,
+    run.target,
+    run.output_dir,
+    run.commit,
+    run.backend,
+    run.backends_used,
+    run.models_used,
+  ].join(" ").toLocaleLowerCase();
+  return haystack.includes(filters.query.toLocaleLowerCase());
+}
+
+function externalMaintenanceJob(run) {
+  return {
+    job_key: String(run.id),
+    kind: "maintenance",
+    state: "running",
+    error: run.error || "",
+    target: run.target || "",
+    output_dir: run.output_dir || "",
+    started_at: run.started_at || 0,
+    duration_seconds: run.duration_seconds || 0,
+    active_started_at: run.active_started_at || 0,
+    duration_known: run.duration_known ?? true,
+    run_id: run.id,
+    backend: run.backend || "",
+    model: run.model || null,
+    backends_used: parseJsonList(run.backends_used),
+    models_used: parseJsonList(run.models_used),
+    usage_stats: parseJsonObject(run.usage_stats),
+    controllable: false,
+    source: "history-compatibility",
+  };
+}
+
+function syncLegacyMaintenanceJobs(runs) {
+  const visibleRunning = new Set();
+  for (const run of runs) {
+    if (run.status !== "running" || runKind(run) !== "maintenance") continue;
+    const key = String(run.id);
+    visibleRunning.add(key);
+    if (!activeJobs.has(key) || activeJobs.get(key)?.controllable === false) {
+      activeJobs.set(key, externalMaintenanceJob(run));
+      inferredMaintenanceJobKeys.add(key);
+    }
+  }
+  for (const key of inferredMaintenanceJobKeys) {
+    if (!visibleRunning.has(key)) {
+      inferredMaintenanceJobKeys.delete(key);
+      activeJobs.delete(key);
+    }
+  }
+}
+
+function updateHistoryPagination() {
+  const total = historyState.total;
+  const start = total ? historyState.offset + 1 : 0;
+  const end = Math.min(historyState.offset + historyState.limit, total);
+  const page = total ? Math.floor(historyState.offset / historyState.limit) + 1 : 1;
+  const pages = Math.max(1, Math.ceil(total / historyState.limit));
+  $("history-count").textContent = total
+    ? `${start}–${end} of ${total} runs`
+    : "0 runs";
+  $("history-page-label").textContent = `Page ${page} of ${pages}`;
+  $("history-prev").disabled = historyState.offset === 0;
+  $("history-next").disabled = end >= total;
+}
+
 async function loadHistory() {
   if (_loadingHistory) {
     _pendingHistoryLoad = true;
@@ -1960,20 +2107,59 @@ async function loadHistory() {
   _loadingHistory = true;
   _pendingHistoryLoad = false;
   const tbody = document.querySelector("#history-table tbody");
-  tbody.innerHTML = "";
+  const tableShell = document.querySelector(".history-table-shell");
+  tableShell.setAttribute("aria-busy", "true");
   setResumeMessage("");
   try {
-    const res = await fetch("/api/history");
+    const filters = historyFilterValues();
+    const params = new URLSearchParams({
+      limit: String(historyState.limit),
+      offset: String(historyState.offset),
+    });
+    if (filters.query) params.set("q", filters.query);
+    if (filters.status) params.set("status", filters.status);
+    const res = await fetch(`/api/history?${params}`, { cache: "no-store" });
     const data = await res.json();
-    for (const run of data.runs || []) {
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    historyServerFiltering = data.capabilities?.server_filtering === true;
+    let runs = data.runs || [];
+    let total = Number(data.total || 0);
+    if (!historyServerFiltering) {
+      const legacyRes = await fetch("/api/history?limit=500", { cache: "no-store" });
+      const legacy = await legacyRes.json();
+      if (!legacyRes.ok) throw new Error(legacy.detail || `HTTP ${legacyRes.status}`);
+      const legacyRuns = legacy.runs || [];
+      syncLegacyMaintenanceJobs(legacyRuns);
+      const filtered = legacyRuns.filter((run) =>
+        historyRunMatches(run, filters)
+      );
+      total = filtered.length;
+      runs = filtered.slice(
+        historyState.offset,
+        historyState.offset + historyState.limit
+      );
+    }
+
+    historyState.total = total;
+    if (total && historyState.offset >= total) {
+      historyState.offset = Math.floor((total - 1) / historyState.limit) * historyState.limit;
+      _pendingHistoryLoad = true;
+      return;
+    }
+
+    tbody.replaceChildren();
+    for (const run of runs) {
       durationKnownByRun.set(String(run.id), run.duration_known);
       const tr = document.createElement("tr");
       tr.className = "run-row";
       const liveJob = busyJobForRun(run.id);
       if (liveJob) tr.classList.add("run-live");
+      if (liveJob?.controllable === false) tr.classList.add("run-external");
+      const displayStatus = liveJob?.state || run.status;
       const cells = [
         run.id,
-        repoDisplay(run),
+        { kind: "target" },
         { kind: "commit" },
         fmtTime(run.started_at || run.created_at),
         run.status === "imported" ? "—" : fmtRunDuration(liveJob || run),
@@ -1984,7 +2170,10 @@ async function loadHistory() {
       ];
       for (const c of cells) {
         const td = document.createElement("td");
-        if (c && c.kind === "commit") {
+        if (c && c.kind === "target") {
+          td.textContent = repoDisplay(run);
+          td.title = run.target || repoDisplay(run);
+        } else if (c && c.kind === "commit") {
           if (run.commit) {
             td.textContent = run.commit.slice(0, 7) + (run.dirty ? "*" : "");
             td.title = `${run.repo_name || ""} ${run.commit}${run.dirty ? " (dirty)" : ""}`;
@@ -1994,8 +2183,8 @@ async function loadHistory() {
           }
         } else if (c && c.kind === "status") {
           const badge = document.createElement("span");
-          badge.className = `badge badge-${run.status}`;
-          badge.textContent = run.status;
+          badge.className = `badge badge-${displayStatus}`;
+          badge.textContent = displayStatus;
           td.appendChild(badge);
           if (run.status === "done" && run.error) {
             const warn = document.createElement("span");
@@ -2005,12 +2194,13 @@ async function loadHistory() {
           }
         } else {
           td.textContent = c ?? "—";
+          if (typeof c === "string" && c !== "—") td.title = c;
         }
         tr.appendChild(td);
       }
       const actionCell = document.createElement("td");
       actionCell.className = "history-action";
-      if (liveJob) {
+      if (liveJob && liveJob.controllable !== false && runKind(run) === "audit") {
         const stopButton = document.createElement("button");
         stopButton.type = "button";
         stopButton.className = "btn btn-stop";
@@ -2021,10 +2211,17 @@ async function loadHistory() {
           stopRunAudit(run.id);
         });
         actionCell.appendChild(stopButton);
+      } else if (liveJob?.controllable === false) {
+        const external = document.createElement("span");
+        external.className = "history-external";
+        external.textContent = "External";
+        external.title = "This maintenance run is managed by an external process.";
+        actionCell.appendChild(external);
       } else if (
-        run.status === "cancelled" ||
-        run.status === "failed" ||
-        (run.status === "done" && run.error)
+        runKind(run) === "audit" &&
+        (run.status === "cancelled" ||
+          run.status === "failed" ||
+          (run.status === "done" && run.error))
       ) {
         const resumeButton = document.createElement("button");
         resumeButton.type = "button";
@@ -2047,9 +2244,11 @@ async function loadHistory() {
       tbody.appendChild(tr);
     }
     renderJobList();
-    if (!data.runs || data.runs.length === 0) {
+    updateDashboardActiveJobs();
+    updateHistoryPagination();
+    if (runs.length === 0) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td colspan="10" class="dim">No audit runs recorded yet.</td>`;
+      tr.innerHTML = `<td colspan="10" class="dim">No runs match the current filters.</td>`;
       tbody.appendChild(tr);
     }
   } catch (e) {
@@ -2057,12 +2256,38 @@ async function loadHistory() {
       `<tr><td colspan="10" class="error">Failed to load history: ` +
       `${escapeHtml(String(e))}</td></tr>`;
   } finally {
+    tableShell.setAttribute("aria-busy", "false");
     _loadingHistory = false;
     if (_pendingHistoryLoad) {
       loadHistory();
     }
   }
 }
+
+function resetHistoryPageAndLoad() {
+  historyState.offset = 0;
+  loadHistory();
+}
+
+$("history-search").addEventListener("input", () => {
+  clearTimeout(historySearchTimer);
+  historySearchTimer = setTimeout(resetHistoryPageAndLoad, 220);
+});
+$("history-search").addEventListener("search", resetHistoryPageAndLoad);
+$("history-status").addEventListener("change", resetHistoryPageAndLoad);
+$("history-page-size").addEventListener("change", () => {
+  historyState.limit = Number($("history-page-size").value) || 25;
+  resetHistoryPageAndLoad();
+});
+$("history-prev").addEventListener("click", () => {
+  historyState.offset = Math.max(0, historyState.offset - historyState.limit);
+  loadHistory();
+});
+$("history-next").addEventListener("click", () => {
+  if (historyState.offset + historyState.limit >= historyState.total) return;
+  historyState.offset += historyState.limit;
+  loadHistory();
+});
 
 $("btn-import").addEventListener("click", async () => {
   $("import-error").textContent = "";
@@ -2098,6 +2323,7 @@ $("btn-import").addEventListener("click", async () => {
     const ok = $("import-ok");
     ok.textContent = `Imported ${data.imported} run(s).`;
     setTimeout(() => (ok.textContent = ""), 8000);
+    historyState.offset = 0;
     await loadHistory();
   } catch (e) {
     $("import-error").textContent = `Import failed: ${e}`;
@@ -2183,6 +2409,7 @@ async function loadRunDetail(runId) {
   $("run-detail-title").textContent = `Run #${run.id} — ${repoDisplay(run)}`;
   if (
     !isLive &&
+    runKind(run) === "audit" &&
     (run.status === "cancelled" ||
       run.status === "failed" ||
       (run.status === "done" && run.error))
@@ -2199,8 +2426,10 @@ async function loadRunDetail(runId) {
     submodules = [];
   }
   const meta = [
+    ["Type", runKindLabel(run)],
     ["Status", run.status],
     ["Error", run.error ? (run.error.length > 300 ? run.error.slice(0, 300) + "…" : run.error) : "—"],
+    ["Warning", run.warning ? (run.warning.length > 300 ? run.warning.slice(0, 300) + "…" : run.warning) : "—"],
     ["Target", repoDisplay(run)],
     ["Repo", run.repo_name || "—"],
     ["Branch", run.branch || "—"],
@@ -2538,8 +2767,13 @@ function appendEvidenceActionButtons(container, entries, title) {
   graphButton.disabled = graphReference === null;
   graphButton.title = graphReference
     ? "Open the interactive PoC trigger graph"
-    : "No standardized trigger-graph.json artifact is registered";
-  graphButton.setAttribute("aria-label", `Open trigger graph for ${title}`);
+    : DISCLOSURE_MISSING_REASONS.graph;
+  graphButton.setAttribute(
+    "aria-label",
+    graphReference
+      ? `Open trigger graph for ${title}`
+      : `Graph unavailable for ${title}: ${DISCLOSURE_MISSING_REASONS.graph}`
+  );
   if (graphReference) {
     graphButton.addEventListener("click", () =>
       openTriggerGraph(
@@ -2559,8 +2793,13 @@ function appendEvidenceActionButtons(container, entries, title) {
   asanButton.disabled = asanReference === null;
   asanButton.title = asanReference
     ? "Open the captured AddressSanitizer report"
-    : "No standardized asan-report.txt artifact is registered";
-  asanButton.setAttribute("aria-label", `Open ASan report for ${title}`);
+    : DISCLOSURE_MISSING_REASONS.asan;
+  asanButton.setAttribute(
+    "aria-label",
+    asanReference
+      ? `Open ASan report for ${title}`
+      : `ASan unavailable for ${title}: ${DISCLOSURE_MISSING_REASONS.asan}`
+  );
   if (asanReference) {
     asanButton.addEventListener("click", () =>
       openAsanReport(asanReference.entry, asanReference.artifact, title)
@@ -2941,7 +3180,11 @@ async function loadDisclosures() {
         ? disclosureTerminalButtonHtml(e)
         : e.poc
           ? terminalButtonHtml(e.poc.run_id, e.poc.vuln_id, e.poc.title)
-          : "—";
+          : unavailableActionButtonHtml(
+              "Terminal",
+              "btn-terminal",
+              DISCLOSURE_MISSING_REASONS.terminal
+            );
       const tr = document.createElement("tr");
       tr.className = "record-row";
       tr.innerHTML =
@@ -3002,6 +3245,10 @@ async function loadDisclosures() {
         .map((artifact) => disclosureArtifactLinkHtml(e, artifact))
         .filter(Boolean)
         .join(" · ");
+      const unavailableReasons = disclosureUnavailableReasons(e);
+      const unavailable = unavailableReasons.length
+        ? `<div class="kv evidence-unavailable">Unavailable actions: ${escapeHtml(unavailableReasons.join(" · "))}</div>`
+        : "";
       details.innerHTML =
         `<td colspan="8"><details><summary>details</summary>` +
         `<div class="kv">${escapeHtml(e.summary) || "—"}</div>` +
@@ -3010,6 +3257,7 @@ async function loadDisclosures() {
         `<div class="kv">Repo: ${externalLinkHtml(e.repo_url, e.repo_url) || "—"} · ` +
         `backend: ${escapeHtml(e.model_backend) || "legacy record (not recorded)"}</div>` +
         `<div class="kv">Artifacts: ${artifacts || "—"}</div>` +
+        unavailable +
         `</details></td>`;
       tbody.appendChild(details);
     }
@@ -3685,6 +3933,30 @@ function terminalButtonHtml(runId, vulnId, title) {
   );
 }
 
+function unavailableActionButtonHtml(label, className, reason) {
+  return (
+    `<button type="button" class="btn ${escapeHtml(className)}" disabled ` +
+    `title="${escapeHtml(reason)}" ` +
+    `aria-label="${escapeHtml(`${label} unavailable: ${reason}`)}">` +
+    `${escapeHtml(label)}</button>`
+  );
+}
+
+function disclosureUnavailableReasons(entry) {
+  const labels = new Set((entry.artifacts || []).map((artifact) => artifact.label));
+  const reasons = [];
+  if (!entry.terminal && !entry.poc) {
+    reasons.push(`Terminal — ${DISCLOSURE_MISSING_REASONS.terminal}`);
+  }
+  if (!labels.has(TRIGGER_GRAPH_ARTIFACT)) {
+    reasons.push(`Graph — ${DISCLOSURE_MISSING_REASONS.graph}`);
+  }
+  if (!labels.has(ASAN_REPORT_ARTIFACT)) {
+    reasons.push(`ASan — ${DISCLOSURE_MISSING_REASONS.asan}`);
+  }
+  return reasons;
+}
+
 function disclosureTerminalButtonHtml(entry) {
   const terminal = entry.terminal || {};
   return (
@@ -4092,24 +4364,17 @@ async function boot() {
       $("agent-settings-summary").textContent = `Settings unavailable: ${error}`;
     }),
   ]);
-  try {
-    const res = await fetch("/api/jobs");
-    if (res.ok) {
-      const data = await res.json();
-      for (const job of data.jobs || []) {
-        if (BUSY_JOB_STATES.has(job.state)) applyJobStatus(job);
-      }
-    }
-  } catch {
-    // server not reachable yet; the lifecycle stream will retry
-  }
+  await refreshJobSnapshot();
   route();
   await Promise.all([loadRepos(), loadWikis(), refreshTrashCount()]);
   connectGlobalJobEvents();
   initScrollTopButton();
   window.setInterval(pollDetailHeartbeat, 10000);
-  // The sidebar elapsed times tick once a minute.
-  window.setInterval(renderJobList, 30000);
+  // Refresh external maintenance state and elapsed times between SSE events.
+  window.setInterval(
+    () => refreshJobSnapshot({ reloadHistory: true }),
+    30000
+  );
 }
 
 boot();

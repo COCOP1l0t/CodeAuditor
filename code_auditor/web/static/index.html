@@ -539,16 +539,61 @@
           root to batch-import every output directory it contains. Projects
           matching a cloned repo are linked automatically.
         </p>
-        <table id="history-table">
-          <thead>
-            <tr>
-              <th>ID</th><th>Target</th><th>Commit</th><th>Started</th><th>Duration</th>
-              <th>Status</th><th>Backends used</th><th>Tokens / Cost</th>
-              <th>Reproduced Vulns</th><th>Actions</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+        <div class="registry-toolbar history-toolbar">
+          <label class="toolbar-search">
+            <span>Search</span>
+            <input id="history-search" type="search" maxlength="256"
+                   autocomplete="off" placeholder="Run, target, commit, backend…">
+          </label>
+          <label class="toolbar-filter">
+            <span>Status</span>
+            <select id="history-status">
+              <option value="">All statuses</option>
+              <option value="running">Running</option>
+              <option value="done">Complete</option>
+              <option value="failed">Failed</option>
+              <option value="cancelled">Cancelled</option>
+              <option value="imported">Imported</option>
+              <option value="superseded">Superseded</option>
+            </select>
+          </label>
+          <label class="toolbar-filter history-page-size">
+            <span>Rows</span>
+            <select id="history-page-size">
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <span id="history-count" class="record-count" aria-live="polite"></span>
+        </div>
+        <div class="table-shell history-table-shell" tabindex="0"
+             aria-label="Audit history">
+            <table id="history-table">
+            <colgroup>
+              <col class="col-history-id">
+              <col class="col-history-target"><col class="col-history-commit">
+              <col class="col-history-started"><col class="col-history-duration">
+              <col class="col-history-status"><col class="col-history-backends">
+              <col class="col-history-usage"><col class="col-history-reproduced">
+              <col class="col-history-actions">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>ID</th><th>Target</th><th>Commit</th>
+                <th>Started</th><th>Duration</th><th>Status</th>
+                <th>Backends used</th><th>Tokens / Cost</th>
+                <th>Reproduced Vulns</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <nav class="history-pagination" aria-label="History pages">
+          <button type="button" id="history-prev" class="btn">Previous</button>
+          <span id="history-page-label" aria-live="polite">Page 1 of 1</span>
+          <button type="button" id="history-next" class="btn">Next</button>
+        </nav>
       </section>
     </div><!-- /view-history -->
 

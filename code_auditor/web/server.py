@@ -22,6 +22,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from ..db import (
     DEFAULT_DB_PATH,
     DISCLOSURE_TRASH_RETENTION_DAYS,
+    RUN_KIND_MAINTENANCE,
+    RUN_RUNNING,
     AuditStore,
 )
 from ..logger import configure_logging, get_logger
@@ -81,6 +83,10 @@ DisclosureStatus = Literal[
     "bug",
     "slop",
 ]
+RunStatus = Literal[
+    "running", "done", "failed", "cancelled", "imported", "superseded"
+]
+RunKind = Literal["audit", "maintenance"]
 
 
 class StrictRequest(BaseModel):
@@ -536,6 +542,60 @@ def create_app(
     # One process-wide log handler routes records to the owning job's bus.
     install_web_log_handler(manager.bus_for_job)
 
+    def jobs_snapshot() -> list[dict]:
+        """Combine Web-owned jobs with externally owned maintenance runs."""
+        jobs = [
+            {**status, "controllable": True, "source": "web"}
+            for status in manager.list_jobs()
+        ]
+        known_run_ids = {
+            int(job["run_id"])
+            for job in jobs
+            if job.get("kind") == JOB_AUDIT and job.get("run_id") is not None
+        }
+
+        def json_value(value: object, fallback: object) -> object:
+            if not isinstance(value, str):
+                return value if value is not None else fallback
+            try:
+                decoded = json.loads(value)
+            except (TypeError, ValueError):
+                return fallback
+            return decoded
+
+        for run in store.list_running_maintenance_runs():
+            run_id = int(run["id"])
+            if run_id in known_run_ids:
+                continue
+            jobs.append(
+                {
+                    "job_key": str(run_id),
+                    "kind": RUN_KIND_MAINTENANCE,
+                    "state": RUN_RUNNING,
+                    "error": str(run.get("error") or ""),
+                    "target": str(run.get("target") or ""),
+                    "output_dir": str(run.get("output_dir") or ""),
+                    "started_at": float(run.get("started_at") or 0),
+                    "ended_at": float(run.get("ended_at") or 0),
+                    "duration_seconds": float(run.get("duration_seconds") or 0),
+                    "active_started_at": float(run.get("active_started_at") or 0),
+                    "duration_known": bool(run.get("duration_known", True)),
+                    "history_persist_pending": False,
+                    "run_id": run_id,
+                    "backend": str(run.get("backend") or ""),
+                    "model": run.get("model"),
+                    "backends_used": json_value(run.get("backends_used"), []),
+                    "models_used": json_value(run.get("models_used"), []),
+                    "usage_stats": json_value(run.get("usage_stats"), {}),
+                    "stages": [],
+                    "reproduction_candidate": None,
+                    "reproduction_reports": [],
+                    "controllable": False,
+                    "source": "database",
+                }
+            )
+        return jobs
+
     async def require_sandbox_environment(backend: str, sandbox_mode: str) -> None:
         if sandbox_mode == "local-worktree":
             return
@@ -600,7 +660,7 @@ def create_app(
         return {
             **store.dashboard_summary(),
             "recent_runs": recent_runs,
-            "jobs": manager.list_jobs(),
+            "jobs": jobs_snapshot(),
             "repositories": {
                 "total": len(list_cloned_repos(settings.repos_dir)),
             },
@@ -770,7 +830,10 @@ def create_app(
     @app.get("/api/jobs")
     async def list_jobs() -> dict:
         """Active and recently finished jobs (sidebar + History live badges)."""
-        return {"jobs": manager.list_jobs()}
+        return {
+            "jobs": jobs_snapshot(),
+            "external_maintenance_supported": True,
+        }
 
     @app.get("/api/jobs/events")
     async def job_events() -> StreamingResponse:
@@ -1099,6 +1162,9 @@ def create_app(
     def list_history(
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
+        status: RunStatus | None = Query(default=None),
+        run_kind: RunKind | None = Query(default=None),
+        q: str | None = Query(default=None, max_length=256),
         repository: str | None = Query(
             default=None,
             min_length=1,
@@ -1115,9 +1181,27 @@ def create_app(
             else None
         )
         runs, total = store.list_runs(
-            limit=limit, offset=offset, target=target, target_key=target_key
+            limit=limit,
+            offset=offset,
+            target=target,
+            target_key=target_key,
+            status=status,
+            run_kind=run_kind,
+            query=q,
         )
-        return {"runs": runs, "total": total, "db_path": store.db_path}
+        return {
+            "runs": runs,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "filters": {
+                "status": status or "",
+                "run_kind": run_kind or "",
+                "q": q or "",
+            },
+            "capabilities": {"server_filtering": True},
+            "db_path": store.db_path,
+        }
 
     @app.get("/api/history/{run_id}")
     def history_run(run_id: int) -> dict:

@@ -627,6 +627,12 @@ textarea:focus {
   background: rgba(248, 81, 73, 0.1);
 }
 
+.badge-superseded {
+  color: var(--dim);
+  border-color: rgba(143, 160, 176, 0.5);
+  background: rgba(143, 160, 176, 0.1);
+}
+
 @keyframes badge-pulse {
   0%,
   100% {
@@ -1428,6 +1434,22 @@ button.tab {
   font-size: 0.85rem;
 }
 
+#history-table {
+  min-width: 1460px;
+  table-layout: fixed;
+}
+
+.col-history-id { width: 54px; }
+.col-history-target { width: 150px; }
+.col-history-commit { width: 85px; }
+.col-history-started { width: 180px; }
+.col-history-duration { width: 105px; }
+.col-history-status { width: 105px; }
+.col-history-backends { width: 220px; }
+.col-history-usage { width: 220px; }
+.col-history-reproduced { width: 135px; }
+.col-history-actions { width: 105px; }
+
 #history-table th,
 #history-table td,
 #run-vulns-table th,
@@ -1437,6 +1459,14 @@ button.tab {
   text-align: left;
   padding: 0.35rem 0.5rem;
   border-bottom: 1px solid var(--border);
+}
+
+#history-table th,
+#history-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 
 #history-table th,
@@ -1455,6 +1485,45 @@ tr.run-row {
 
 tr.run-row:hover {
   background: rgba(88, 214, 235, 0.06);
+}
+
+.registry-toolbar.history-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) 150px 100px auto;
+  align-items: end;
+}
+
+.history-toolbar .toolbar-filter {
+  min-width: 0;
+}
+
+.history-run-kind {
+  color: var(--dim);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.history-external {
+  color: var(--dim);
+  cursor: help;
+  font-size: 0.75rem;
+}
+
+.history-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 0.85rem;
+  color: var(--dim);
+  font-size: 0.8rem;
+}
+
+.history-pagination .btn {
+  min-height: 30px;
+  padding: 0.25rem 0.7rem;
 }
 
 .history-run-header {
@@ -2493,6 +2562,10 @@ th[aria-sort="descending"] .sort-button::after {
   border-color: var(--border);
 }
 
+.evidence-unavailable {
+  color: var(--dim);
+}
+
 .btn-delete,
 .btn-restore {
   min-height: 28px;
@@ -2835,6 +2908,17 @@ body.terminal-resizing {
   }
 }
 
+@media (max-width: 1100px) {
+  .registry-toolbar.history-toolbar {
+    grid-template-columns: minmax(240px, 1fr) 1fr 1fr;
+  }
+
+  .history-toolbar .toolbar-search,
+  .history-toolbar .record-count {
+    grid-column: 1 / -1;
+  }
+}
+
 @media (max-width: 1000px) {
   #content-pane > div:not([hidden]) {
     padding: 1.25rem 1.1rem 3rem;
@@ -2881,6 +2965,12 @@ body.terminal-resizing {
 
   .toolbar-filter {
     width: min(100%, 320px);
+  }
+}
+
+@media (max-width: 860px) {
+  .registry-toolbar.history-toolbar {
+    grid-template-columns: 1fr 1fr;
   }
 }
 
@@ -2962,6 +3052,11 @@ body.terminal-resizing {
 
   .registry-header .btn {
     width: 100%;
+  }
+
+  .history-toolbar .toolbar-search,
+  .history-toolbar .record-count {
+    grid-column: 1 / -1;
   }
 
   .log-panel-header {

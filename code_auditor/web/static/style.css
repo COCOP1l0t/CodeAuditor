@@ -55,6 +55,19 @@ body {
   display: none;
 }
 
+#auth-loading {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  color: var(--dim);
+  background: var(--bg);
+}
+
+#auth-loading[hidden] {
+  display: none;
+}
+
 .auth-card {
   width: min(100%, 430px);
   padding: 2rem;

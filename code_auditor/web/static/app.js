@@ -20,6 +20,7 @@ const STATUS_LABEL = {
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
+const authLoading = $("auth-loading");
 const authGate = $("auth-gate");
 const appShell = $("app-shell");
 const authSetupPanel = $("auth-setup-panel");
@@ -4386,12 +4387,14 @@ function showAuthPanel(mode, message = "") {
     authSwitchButton.textContent = register ? "Sign in" : "Create account";
   }
   authGate.hidden = false;
+  authLoading.hidden = true;
   appShell.hidden = true;
   authUserMenu.hidden = true;
   setAuthError(message);
 }
 
 function showAuthenticatedApp(user) {
+  authLoading.hidden = true;
   authGate.hidden = true;
   appShell.hidden = false;
   authUserMenu.hidden = false;

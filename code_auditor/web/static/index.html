@@ -10,7 +10,8 @@
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css" />
 </head>
 <body>
-  <section id="auth-gate" aria-labelledby="auth-title">
+  <div id="auth-loading" role="status" aria-live="polite">Checking your session…</div>
+  <section id="auth-gate" aria-labelledby="auth-title" hidden>
     <div class="auth-card">
       <div class="auth-brand">
         <img class="auth-logo" src="/static/icon.svg" alt="" aria-hidden="true" />

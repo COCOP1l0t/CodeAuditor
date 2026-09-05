@@ -1684,6 +1684,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="btn-settings"' in res.text
     assert 'id="settings-dialog"' in res.text
     assert 'id="auth-gate"' in res.text
+    assert '<div id="auth-loading"' in res.text
+    assert '<section id="auth-gate" aria-labelledby="auth-title" hidden>' in res.text
     assert 'id="auth-setup-form"' in res.text
     assert 'id="auth-login-form"' in res.text
     assert 'id="auth-register-form"' in res.text

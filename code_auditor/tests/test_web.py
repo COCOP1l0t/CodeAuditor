@@ -1683,6 +1683,11 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="results-agent-logs"' in res.text
     assert 'id="btn-settings"' in res.text
     assert 'id="settings-dialog"' in res.text
+    assert 'id="auth-gate"' in res.text
+    assert 'id="auth-setup-form"' in res.text
+    assert 'id="auth-login-form"' in res.text
+    assert 'id="auth-register-form"' in res.text
+    assert 'id="btn-logout"' in res.text
     assert 'id="s-backend"' in res.text
     assert 'id="s-mode"' in res.text
     assert "Active jobs switch on their next agent call" in res.text
@@ -1694,6 +1699,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="history-page-size"' in res.text
     assert 'id="history-prev"' in res.text
     assert 'id="history-next"' in res.text
+    assert 'data-route="reproduction"' not in res.text
+    assert 'href="#/reproduction"' not in res.text
     assert 'id="trash-table"' in res.text
     assert 'class="col-disclosure-title"' in res.text
     assert 'class="col-cve-local"' in res.text
@@ -1738,6 +1745,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "openCveDialog" in script.text
     assert "appendEvidenceActionButtons" in script.text
     assert "disclosureUnavailableReasons" in script.text
+    assert "bootstrapAuthentication" in script.text
+    assert "auth-setup" in script.text
     assert "No validated retained Stage 5/6 reproducer is registered." in script.text
     assert "No validated runtime trigger-graph.json is registered." in script.text
     assert "ASan may not apply or may have produced no report." in script.text

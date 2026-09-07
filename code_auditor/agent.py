@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import time
 from contextvars import ContextVar
@@ -522,12 +523,19 @@ def _open_agent_log(log_file: str | None) -> TextIO | None:
     log_dir = os.path.dirname(log_file)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-    log_fh = open(log_file, "a")  # noqa: SIM115
+    fd = os.open(
+        log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600,
+    )
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise RuntimeError("agent log must be a regular file with a single link")
+    log_fh = os.fdopen(fd, "a")
     if log_fh.tell() > 0:
         log_fh.write("\n--- new agent invocation ---\n\n")
         log_fh.flush()
     else:
-        os.utime(log_file, None)
+        os.utime(log_fh.fileno(), None)
     return log_fh
 
 
@@ -1166,6 +1174,8 @@ async def run_agent(
     log_file: str | None = None,
     sandbox: DockerScratch | None = None,
 ) -> str:
+    if sandbox is not None and log_file:
+        log_file = sandbox.protected_log_path(log_file)
     # Backend/provider settings are hot-swappable on the owning Web job.
     # Freeze them for this invocation so an already-running Codex call cannot
     # observe Claude provider fields (or vice versa) after a settings update.
@@ -1253,10 +1263,35 @@ async def run_agent(
         status = "cancelled"
         raise
     finally:
+        async def cleanup_resources() -> None:
+            try:
+                await run_control.cleanup_processes()
+            except Exception as exc:
+                logger.error("Agent process cleanup failed: %s", exc)
+            if sandbox is not None:
+                # Docker, including runsc, owns processes outside the SDK's
+                # host process tree. Verify shutdown using container labels.
+                await sandbox.cleanup_invocation(run_control.process_marker, status)
+
+        # Stop can be requested repeatedly, including while host descendants
+        # are being reaped. Keep both cleanup steps alive until they finish.
+        cleanup = asyncio.create_task(cleanup_resources())
+        cancelled_during_cleanup = False
         try:
-            await run_control.cleanup_processes()
-        except Exception as exc:
-            logger.error("Agent process cleanup failed: %s", exc)
+            while True:
+                try:
+                    await asyncio.shield(cleanup)
+                    break
+                except asyncio.CancelledError:
+                    if cleanup.cancelled():
+                        raise
+                    cancelled_during_cleanup = True
+        except Exception:
+            if status in {"completed", "killed_after_status_check"}:
+                raise
+            logger.exception("Sandbox cleanup failed after an unsuccessful agent invocation")
+        if cancelled_during_cleanup:
+            raise asyncio.CancelledError
         logger.debug(
             "Destroyed %s subagent subagent_id=%s status=%s elapsed=%.2fs",
             config.backend,

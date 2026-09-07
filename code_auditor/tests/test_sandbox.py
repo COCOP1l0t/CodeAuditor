@@ -309,7 +309,7 @@ def test_container_cleanup_retries_async_docker_removal_race(
         del timeout
         calls.append(command)
         if command[1:3] == ["ps", "-aq"]:
-            return "container-id"
+            return "container-id" if len(calls) < 5 else ""
         if len(calls) == 2:
             raise DockerSandboxError(
                 "sandbox command failed: docker rm -f container-id: "
@@ -322,5 +322,5 @@ def test_container_cleanup_retries_async_docker_removal_race(
 
     scratch._remove_containers()
 
-    assert sum(command[1:3] == ["ps", "-aq"] for command in calls) == 2
+    assert sum(command[1:3] == ["ps", "-aq"] for command in calls) == 3
     assert sum(command[1:3] == ["rm", "-f"] for command in calls) == 2

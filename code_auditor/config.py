@@ -9,6 +9,9 @@ from typing import Any, Callable, Literal
 AgentBackend = Literal["claude", "codex"]
 ProviderMode = Literal["local", "custom"]
 SandboxMode = Literal["docker-networked", "docker-isolated", "local-worktree"]
+SandboxRuntime = Literal["docker-default", "runc", "runsc"]
+DEFAULT_SANDBOX_RUNTIME: SandboxRuntime = "docker-default"
+SANDBOX_RUNTIMES = ("docker-default", "runc", "runsc")
 
 DEFAULT_BACKEND: AgentBackend = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -87,6 +90,10 @@ class AuditConfig:
     # instead select a detached host worktree. The only writable Docker bind
     # mount is a per-task directory below sandbox_root.
     sandbox_enabled: bool = True
+    sandbox_runtime: SandboxRuntime = DEFAULT_SANDBOX_RUNTIME
+    # Host-owned identity for per-launch records, including resumed runs.
+    sandbox_run_id: int | None = None
+    sandbox_job_key: str | None = None
     sandbox_root: str = field(
         default_factory=lambda: os.environ.get(
             "CODE_AUDITOR_SANDBOX_ROOT", DEFAULT_SANDBOX_ROOT

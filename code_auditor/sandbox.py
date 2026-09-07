@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -16,9 +18,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .config import AuditConfig, AgentBackend
+from .config import AuditConfig, AgentBackend, SandboxRuntime, SANDBOX_RUNTIMES
 from .logger import get_logger
 from .process_tree import current_audit_subprocess_env
+from .sandbox_records import (
+    create_execution_directory, read_execution_records, write_execution_record,
+)
 
 DOCKER_SPEC_ENV = "CODE_AUDITOR_DOCKER_SPEC"
 DOCKER_CWD_ENV = "CODE_AUDITOR_DOCKER_CWD"
@@ -61,6 +66,8 @@ class DockerSandboxCapability:
     image: str
     free_bytes: int | None
     minimum_free_bytes: int
+    requested_runtime: str = "docker-default"
+    runtime: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -69,6 +76,9 @@ class DockerSandboxCapability:
             "image": self.image,
             "free_bytes": self.free_bytes,
             "minimum_free_bytes": self.minimum_free_bytes,
+            "requested_runtime": self.requested_runtime,
+            "runtime": self.runtime,
+            "launch_verified": False,
         }
 
 
@@ -226,8 +236,23 @@ class DockerScratch:
         self.pids_limit = config.sandbox_pids_limit
         self.network_enabled = config.sandbox_network_enabled
         self.min_free_bytes = config.sandbox_min_free_bytes
+        if config.sandbox_runtime not in SANDBOX_RUNTIMES:
+            raise DockerSandboxError("unsupported sandbox runtime")
+        self.requested_runtime = config.sandbox_runtime
+        self.runtime: str | None = None
+        self.image_id: str | None = None
+        self.runtime_version: str | None = None
+        self.server_version: str | None = None
+        self.host_kernel: str | None = None
+        self.architecture: str | None = None
+        self.output_dir = config.output_dir
+        self.execution_dir: Path | None = None
+        self.source_commit = ""
+        self.audit_run_id = config.sandbox_run_id
+        self.job_key = config.sandbox_job_key
 
     async def prepare(self, target: str, commit: str) -> DockerScratch:
+        self.source_commit = commit
         self.verify_environment()
         self.root_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         root = Path(
@@ -252,6 +277,9 @@ class DockerScratch:
         self.control_dir = control_dir
         try:
             os.chmod(control_dir, 0o700)
+            self.execution_dir = create_execution_directory(self.output_dir, self.scratch_id)
+            if self.execution_dir.is_relative_to(root):
+                raise DockerSandboxError("execution records must be outside the sandbox")
             self.source_dir = root / "source"
             self.input_dir = root / "inputs"
             self.artifact_dir = root / "artifacts"
@@ -273,15 +301,45 @@ class DockerScratch:
         return self
 
     def _verify_runtime(self) -> None:
-        _run_checked([self.docker_bin, "version", "--format", "{{.Server.Version}}"])
         try:
-            _run_checked([self.docker_bin, "image", "inspect", self.image])
+            info = json.loads(_run_checked([
+                self.docker_bin, "info", "--format", "{{json .}}",
+            ]))
+            runtimes = info["Runtimes"]
+            selected = (info["DefaultRuntime"] if self.requested_runtime == "docker-default"
+                        else self.requested_runtime)
+            if not isinstance(selected, str) or selected not in runtimes:
+                raise DockerSandboxError(f"Docker runtime {selected!r} is not registered")
+            self.runtime = selected
+            self.server_version = info.get("ServerVersion")
+            self.host_kernel = info.get("KernelVersion")
+            self.architecture = info.get("Architecture")
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise DockerSandboxError("cannot decode Docker runtime information") from exc
+        # Version annotations are optional OCI metadata. Their absence must
+        # remain unknown rather than being inferred from an unrelated PATH binary.
+        try:
+            features = runtimes[selected].get("status", {}).get(
+                "org.opencontainers.runtime-spec.features", "{}"
+            )
+            annotations = json.loads(features).get("annotations", {})
+            version = annotations.get("org.opencontainers.runc.version")
+            self.runtime_version = version.strip() if isinstance(version, str) else None
+        except (TypeError, ValueError, AttributeError):
+            self.runtime_version = None
+        try:
+            inspected = json.loads(_run_checked([self.docker_bin, "image", "inspect", self.image]))
+            self.image_id = inspected[0]["Id"]
+            if not isinstance(self.image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.image_id):
+                raise ValueError("invalid image id")
         except DockerSandboxError as exc:
             raise DockerSandboxError(
                 f"required sandbox image {self.image!r} is missing; build it with "
                 "`docker build -f docker/code-auditor-sandbox.Dockerfile "
                 "-t code-auditor-sandbox:latest docker`"
             ) from exc
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise DockerSandboxError("cannot decode sandbox image identity") from exc
 
     def verify_environment(self) -> int:
         """Check Docker, image, storage, and backend assets without writing."""
@@ -387,7 +445,7 @@ class DockerScratch:
         else:
             raise DockerSandboxError(f"unsupported sandbox backend: {self.backend}")
         spec = {
-            "schema_version": 1,
+            "schema_version": 2,
             "docker_bin": self.docker_bin,
             "image": self.image,
             "scratch_root": str(self.root),
@@ -402,6 +460,18 @@ class DockerScratch:
             "claude_cli": claude_cli,
             "codex_vendor": codex_vendor,
             "readonly_mounts": [str(path) for path in self.readonly_mounts],
+            "requested_runtime": self.requested_runtime,
+            "runtime": self.runtime,
+            "image_id": self.image_id,
+            "runtime_version": self.runtime_version,
+            "server_version": self.server_version,
+            "host_kernel": self.host_kernel,
+            "architecture": self.architecture,
+            "source_commit": self.source_commit or None,
+            "task_name": self.task_name,
+            "audit_run_id": self.audit_run_id,
+            "job_key": self.job_key,
+            "execution_dir": str(self.execution_dir),
         }
         # The agent can write every byte below ``root``. Keep the Docker spec
         # and executable wrappers in a sibling control directory so a later
@@ -458,6 +528,38 @@ class DockerScratch:
             raise DockerSandboxError("sandbox wrapper requested before preparation")
         return str(self.control_dir / tool)
 
+    def protected_log_path(self, requested: str) -> str:
+        """Map a logical agent log to a host-only, durable file."""
+        if self.execution_dir is None:
+            raise DockerSandboxError("sandbox log requested before preparation")
+        # Hash the logical path without resolving agent-controlled symlinks.
+        name = hashlib.sha256(os.path.abspath(requested).encode()).hexdigest()[:24]
+        return str(self.execution_dir / f"agent-{name}.log")
+
+    async def cleanup_invocation(self, agent_run_id: str, outcome: str) -> None:
+        """Clean one invocation without stopping a concurrent status checker."""
+        try:
+            await asyncio.to_thread(self._remove_containers, agent_run_id)
+        except Exception:
+            self._finalize_records(agent_run_id, outcome, "failed")
+            raise
+        self._finalize_records(agent_run_id, outcome, "verified")
+
+    def _finalize_records(self, agent_run_id: str | None, outcome: str, cleanup: str) -> None:
+        if self.execution_dir is None:
+            return
+        for record in read_execution_records(self.execution_dir):
+            if agent_run_id is not None and record.get("agent_run_id") != agent_run_id:
+                continue
+            record["cleanup"] = cleanup
+            interrupted = record.get("state") in {"pending", "created", "starting", "running"}
+            if interrupted:
+                record["state"] = "interrupted"
+                record["ended_at"] = time.time()
+            if agent_run_id is not None or interrupted:
+                record["invocation_outcome"] = outcome
+            write_execution_record(self.execution_dir, record)
+
     def wrapper_env(self, cwd: str) -> dict[str, str]:
         if self.spec_path is None or self.root is None:
             raise DockerSandboxError("sandbox environment requested before preparation")
@@ -484,7 +586,12 @@ class DockerScratch:
     async def close(self) -> None:
         if self.root is None:
             return
-        await asyncio.to_thread(self._remove_containers)
+        try:
+            await asyncio.to_thread(self._remove_containers)
+        except Exception:
+            self._finalize_records(None, "task_cleanup_failed", "failed")
+            raise
+        self._finalize_records(None, "task_closed", "verified")
         root = self.root
         control_dir = self.control_dir
         resolved = root.resolve()
@@ -513,14 +620,14 @@ class DockerScratch:
         self.root = None
         self.control_dir = None
 
-    def _remove_containers(self) -> None:
+    def _remove_containers(self, agent_run_id: str | None = None) -> None:
         # Docker removes ``--rm`` containers asynchronously. A second cleanup
         # racing that removal can report "already in progress" even though the
         # container is about to disappear. Re-scan and retry a few times so a
         # harmless teardown race cannot turn an otherwise successful PoC into
         # a maintenance ``done ⚠`` result.
         last_error: DockerSandboxError | None = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 ids = _run_checked(
                     [
@@ -529,6 +636,8 @@ class DockerScratch:
                         "-aq",
                         "--filter",
                         f"label=code_auditor.scratch_id={self.scratch_id}",
+                        *(["--filter", f"label=code_auditor.agent_run_id={agent_run_id}"]
+                          if agent_run_id is not None else []),
                     ],
                     timeout=15,
                 ).split()
@@ -540,25 +649,27 @@ class DockerScratch:
                 return
             try:
                 _run_checked([self.docker_bin, "rm", "-f", *ids], timeout=30)
-                return
+                # A successful rm must be followed by an empty scan.
+                last_error = DockerSandboxError("containers remain after removal")
             except DockerSandboxError as exc:
                 last_error = exc
                 message = str(exc).casefold()
                 if "already in progress" not in message and "no such container" not in message:
                     break
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
+            if attempt < 3:
+                time.sleep(0.2 * (attempt + 1))
         assert last_error is not None
         raise DockerSandboxError(
-            f"cannot remove sandbox container(s) {', '.join(ids)}: {last_error}"
+            f"sandbox container cleanup could not be verified for {', '.join(ids)}: {last_error}"
         ) from last_error
 
 
 def inspect_docker_sandbox_environment(
     backend: AgentBackend,
+    runtime: SandboxRuntime = "docker-default",
 ) -> DockerSandboxCapability:
     """Inspect the server environment used by a selected Agent backend."""
-    config = AuditConfig(target=".", output_dir=".", backend=backend)
+    config = AuditConfig(target=".", output_dir=".", backend=backend, sandbox_runtime=runtime)
     try:
         scratch = DockerScratch(config, "capability-check")
         free_bytes = scratch.verify_environment()
@@ -569,16 +680,19 @@ def inspect_docker_sandbox_environment(
             image=config.sandbox_image,
             free_bytes=None,
             minimum_free_bytes=config.sandbox_min_free_bytes,
+            requested_runtime=runtime,
         )
     return DockerSandboxCapability(
         available=True,
         reason=(
             "Docker daemon, sandbox image, scratch storage, and "
-            f"{backend} runtime are ready."
+            f"{backend} assets are available; container launch has not been tested."
         ),
         image=scratch.image,
         free_bytes=free_bytes,
         minimum_free_bytes=scratch.min_free_bytes,
+        requested_runtime=runtime,
+        runtime=scratch.runtime,
     )
 
 
@@ -587,8 +701,11 @@ def _load_docker_spec(path: str) -> dict[str, Any]:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise DockerSandboxError(f"cannot load Docker sandbox spec: {exc}") from exc
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
+    if not isinstance(data, dict) or data.get("schema_version") not in {1, 2}:
         raise DockerSandboxError("unsupported Docker sandbox spec")
+    if data["schema_version"] == 2:
+        if not data.get("runtime") or not data.get("image_id") or not data.get("execution_dir"):
+            raise DockerSandboxError("sandbox runtime and image must be resolved before launch")
     return data
 
 
@@ -662,6 +779,8 @@ def docker_cli_command(tool: str, argv: list[str], environ: dict[str, str]) -> l
         "--network",
         "bridge" if spec.get("network_enabled") else "none",
     ]
+    if spec.get("runtime"):
+        command.extend(("--runtime", str(spec["runtime"])))
     readonly_mounts = spec.get("readonly_mounts", [])
     if not isinstance(readonly_mounts, list):
         raise DockerSandboxError("Docker sandbox readonly_mounts must be a list")
@@ -719,7 +838,7 @@ def docker_cli_command(tool: str, argv: list[str], environ: dict[str, str]) -> l
             (
                 "--mount",
                 _docker_mount(str(spec["claude_cli"]), "/opt/code-auditor/claude", readonly=True),
-                str(spec["image"]),
+                str(spec.get("image_id") or spec["image"]),
                 "/opt/code-auditor/claude",
                 *argv,
             )
@@ -729,7 +848,7 @@ def docker_cli_command(tool: str, argv: list[str], environ: dict[str, str]) -> l
             (
                 "--mount",
                 _docker_mount(str(spec["codex_vendor"]), "/opt/code-auditor/codex", readonly=True),
-                str(spec["image"]),
+                str(spec.get("image_id") or spec["image"]),
                 "/opt/code-auditor/codex/bin/codex",
                 *argv,
             )
@@ -739,11 +858,175 @@ def docker_cli_command(tool: str, argv: list[str], environ: dict[str, str]) -> l
     return command
 
 
+def _inspect_container(docker_bin: str, container: str) -> dict[str, Any]:
+    try:
+        result = json.loads(_run_checked([docker_bin, "inspect", container]))
+        if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], dict):
+            raise ValueError("unexpected inspect result")
+        return result[0]
+    except (ValueError, TypeError) as exc:
+        raise DockerSandboxError("cannot decode container state") from exc
+
+
+def _supervise_container(command: list[str], spec: dict[str, Any], tool: str) -> int:
+    """Create, inspect, attach, and remove a single container on the host.
+
+    Keep a durable record before creating anything. The parent can finish
+    cleanup using labels even if this supervisor is killed with SIGKILL.
+    """
+    directory = Path(spec["execution_dir"])
+    docker_bin = command[0]
+    name = command[command.index("--name") + 1]
+    marker = os.environ.get("CODE_AUDITOR_AGENT_RUN_ID", "")
+    record = {
+        "schema_version": 1,
+        "execution_id": uuid4().hex,
+        "scratch_id": spec["scratch_id"],
+        "agent_run_id": marker,
+        "task_name": spec["task_name"],
+        "audit_run_id": spec.get("audit_run_id"),
+        "job_key": spec.get("job_key"),
+        "backend": tool,
+        "source_commit": spec.get("source_commit"),
+        "requested_runtime": spec["requested_runtime"],
+        "runtime": None,
+        "configured_runtime": spec["runtime"],
+        "runtime_version": spec.get("runtime_version"),
+        "docker_version": spec.get("server_version"),
+        "host_kernel": spec.get("host_kernel"),
+        "architecture": spec.get("architecture"),
+        "requested_image": spec["image"],
+        "image_id": None,
+        "network": "bridge" if spec["network_enabled"] else "none",
+        "limits": {"memory": spec["memory"], "cpus": spec["cpus"],
+                   "pids": spec["pids_limit"]},
+        "container_name": name,
+        "container_id": None,
+        "started_at": time.time(),
+        "ended_at": None,
+        "exit_code": None,
+        "oom_killed": None,
+        "state": "pending",
+        "cleanup": "pending",
+    }
+    write_execution_record(directory, record)
+    attached: subprocess.Popen | None = None
+    exit_code = 125
+    phase = "create"
+    previous_handlers = {}
+
+    def interrupted(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous_handlers[signum] = signal.signal(signum, interrupted)
+        create_command = [docker_bin, "create", *command[3:]]
+        container_id = _run_checked(create_command, timeout=60)
+        record["container_id"] = container_id
+        record["state"] = "created"
+        phase = "inspect"
+        inspected = _inspect_container(docker_bin, container_id)
+        record["runtime"] = inspected["HostConfig"]["Runtime"]
+        record["image_id"] = inspected["Image"]
+        host_config = inspected["HostConfig"]
+        record["effective_limits"] = {
+            "memory_bytes": host_config.get("Memory"),
+            "nano_cpus": host_config.get("NanoCpus"),
+            "pids": host_config.get("PidsLimit"),
+        }
+        record["effective_network"] = host_config.get("NetworkMode")
+        record["security"] = {
+            "read_only_rootfs": host_config.get("ReadonlyRootfs"),
+            "cap_drop": host_config.get("CapDrop"),
+            "security_options": host_config.get("SecurityOpt"),
+            "user": inspected.get("Config", {}).get("User"),
+        }
+        if record["runtime"] != spec["runtime"] or record["image_id"] != spec["image_id"]:
+            raise DockerSandboxError("container runtime or image does not match the pinned configuration")
+        write_execution_record(directory, record)
+        phase = "start"
+        attached = subprocess.Popen([docker_bin, "start", "--attach", "--interactive", container_id])
+        record["state"] = "starting"
+        write_execution_record(directory, record)
+        attached.wait()
+        phase = "exit inspection"
+        state = _inspect_container(docker_bin, container_id)["State"]
+        if state.get("Status") != "exited":
+            raise DockerSandboxError("container attach ended without a confirmed container exit")
+        record["exit_code"] = int(state["ExitCode"])
+        record["oom_killed"] = bool(state.get("OOMKilled", False))
+        record["state"] = "exited"
+        exit_code = record["exit_code"]
+    except SystemExit as exc:
+        record["state"] = "interrupted"
+        exit_code = int(exc.code or 125)
+    except (DockerSandboxError, OSError, KeyError, TypeError, ValueError) as exc:
+        record["state"] = "failed"
+        record["failure_phase"] = phase
+        # Error text is sent to the SDK, but never persisted as environment
+        # metadata, since commands and daemon errors can contain secrets.
+        print(f"CodeAuditor sandbox {phase} failed: {exc}", file=sys.stderr)
+    finally:
+        # Let the parent perform label-based cleanup if we receive a second
+        # termination signal while removing the container.
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            if attached is not None and attached.poll() is None:
+                attached.terminate()
+                try:
+                    attached.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    attached.kill()
+                    attached.wait()
+            # This query also handles a create request which reached Docker
+            # even though its client failed before returning the container ID.
+            # Scope by container name as well as labels: retries of one SDK
+            # invocation must not remove a later container with the same marker.
+            _remove_named_container(docker_bin, name, str(spec["scratch_id"]), marker)
+            record["cleanup"] = "verified"
+        except (DockerSandboxError, OSError) as exc:
+            record["cleanup"] = "failed"
+            exit_code = 125
+            print(f"CodeAuditor sandbox cleanup failed: {exc}", file=sys.stderr)
+        finally:
+            record["ended_at"] = time.time()
+            write_execution_record(directory, record)
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+    return exit_code
+
+
+def _remove_named_container(docker_bin: str, name: str, scratch_id: str, marker: str) -> None:
+    for attempt in range(4):
+        ids = _run_checked([
+            docker_bin, "ps", "-aq", "--filter", f"name=^/{name}$",
+            "--filter", f"label=code_auditor.scratch_id={scratch_id}",
+            "--filter", f"label=code_auditor.agent_run_id={marker}",
+        ], timeout=15).split()
+        if not ids:
+            return
+        try:
+            _run_checked([docker_bin, "rm", "-f", *ids], timeout=30)
+        except DockerSandboxError as exc:
+            if not any(token in str(exc).casefold() for token in ("already in progress", "no such container")):
+                raise
+        if attempt < 3:
+            time.sleep(0.2 * (attempt + 1))
+    raise DockerSandboxError("cannot verify container removal")
+
+
 def docker_cli_main(tool: str) -> int:
     try:
         command = docker_cli_command(tool, sys.argv[1:], dict(os.environ))
+        spec = _load_docker_spec(os.environ[DOCKER_SPEC_ENV])
+        if spec["schema_version"] == 2:
+            return _supervise_container(command, spec, tool)
     except DockerSandboxError as exc:
         print(f"CodeAuditor Docker sandbox error: {exc}", file=sys.stderr)
         return 125
+    # Preserve already-running workers whose protected wrappers use a v1 spec.
+    # Newly prepared tasks always use the inspected, recorded v2 lifecycle.
     os.execvp(command[0], command)
     return 125

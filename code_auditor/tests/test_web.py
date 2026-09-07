@@ -212,6 +212,7 @@ async def test_start_maps_local_worktree_mode_to_runtime_flags(
 
     assert captured[0].sandbox_enabled is False
     assert captured[0].sandbox_network_enabled is False
+    assert captured[0].sandbox_job_key == job.job_key
     assert job.status()["sandbox_mode"] == "local-worktree"
 
 
@@ -772,6 +773,7 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
         provider_base_url="https://codex.example.test/v1",
         provider_api_key="secret-key",
         model="fresh-codex-model",
+        sandbox_runtime="runsc",
     )
     assert job.state == STATE_RESTORING
     restoring_status = job.status()
@@ -806,6 +808,9 @@ async def test_resume_cancelled_job_reuses_run_and_pinned_output(
     assert audited[0].backend == "codex"
     assert audited[0].sandbox_enabled is True
     assert audited[0].sandbox_network_enabled is True
+    assert audited[0].sandbox_runtime == "runsc"
+    assert audited[0].sandbox_run_id == 17
+    assert audited[0].sandbox_job_key == "17"
     assert audited[0].provider_mode == "custom"
     assert audited[0].provider_base_url == "https://codex.example.test/v1"
     assert audited[0].provider_api_key == "secret-key"
@@ -1205,6 +1210,7 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
         assert config.wiki_path == str(wiki)
         assert config.sandbox_enabled is True
         assert config.sandbox_network_enabled is False
+        assert config.sandbox_runtime == "runsc"
         report = Path(config.output_dir) / "stage5-pocs" / "H-03" / "report.md"
         report.parent.mkdir(parents=True)
         report.write_text(
@@ -1225,6 +1231,7 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
             output_dir=str(reproduction_root),
             wikis_dir=str(tmp_path / "wikis"),
             sandbox_mode="docker-isolated",
+            sandbox_runtime="runsc",
         )
     )
     await job.task
@@ -1235,6 +1242,8 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
     assert job.config is not None
     assert job.config.target == str(reproduction_root / "source")
     assert job.config.output_dir == str(reproduction_root / "output")
+    assert job.config.sandbox_job_key == job.job_key
+    assert job.config.sandbox_run_id is None
     assert job.reproduction_candidate["vuln_id"] == "H-03"
     assert len(job.reproduction_reports) == 1
 
@@ -1439,6 +1448,7 @@ def test_api_dashboard_returns_compact_operational_summary(tmp_path) -> None:
     assert body["runtime"] == {
         "backend": "claude",
         "sandbox_mode": "local-worktree",
+        "sandbox_runtime": "docker-default",
     }
 
 
@@ -1457,7 +1467,7 @@ def test_api_sandbox_capability_reports_server_check(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(
         server_module,
         "inspect_docker_sandbox_environment",
-        lambda backend: capability if backend == "codex" else None,
+        lambda backend, runtime: capability if backend == "codex" else None,
     )
 
     response = TestClient(_make_app(tmp_path)).get(
@@ -1475,7 +1485,7 @@ def test_api_rejects_unavailable_docker_sandbox_setting(tmp_path, monkeypatch) -
     monkeypatch.setattr(
         server_module,
         "inspect_docker_sandbox_environment",
-        lambda _backend: capability,
+        lambda _backend, _runtime: capability,
     )
     client = TestClient(_make_app(tmp_path))
 
@@ -1504,7 +1514,7 @@ def test_api_revalidates_docker_sandbox_before_start(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(
         server_module,
         "inspect_docker_sandbox_environment",
-        lambda _backend: capability,
+        lambda _backend, _runtime: capability,
     )
 
     response = TestClient(app).post("/api/audit", json={"repository": repository})
@@ -2867,6 +2877,7 @@ def test_api_audit_rejects_conflicting_or_hidden_configuration(tmp_path) -> None
         ("backend", "codex"),
         ("model", "gpt-5.5"),
         ("sandbox_mode", "local-worktree"),
+        ("sandbox_runtime", "runsc"),
         ("log_level", "INFO"),
         ("discovered", "/tmp/bugs.html"),
         ("output_dir", "/tmp/output"),

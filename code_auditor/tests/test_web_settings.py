@@ -82,6 +82,23 @@ def test_load_web_settings_adds_default_sandbox_mode(tmp_path: Path) -> None:
     assert stored["sandbox_mode"] == "docker-networked"
 
 
+def test_runtime_migration_and_persistence(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    raw = WebSettings.for_state_dir(str(tmp_path)).serialized()
+    raw.pop("sandbox_runtime")
+    path.write_text(json.dumps(raw))
+    settings = load_web_settings(str(path))
+    assert settings.sandbox_runtime == "docker-default"
+    assert json.loads(path.read_text())["sandbox_runtime"] == "docker-default"
+    settings = update_agent_settings(settings, backend="claude", mode="local", base_url="",
+                                     model="", sandbox_runtime="runsc")
+    assert load_web_settings(str(path)).sandbox_runtime == "runsc"
+    assert settings.public_agent_settings()["sandbox_runtime"] == "runsc"
+    with pytest.raises(WebSettingsError, match="sandbox_runtime"):
+        update_agent_settings(settings, backend="claude", mode="local", base_url="",
+                              model="", sandbox_runtime="unregistered-runtime")
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -90,6 +107,7 @@ def test_load_web_settings_adds_default_sandbox_mode(tmp_path: Path) -> None:
         {"max_parallel": 0},
         {"results_dir": "/tmp/outside-managed-state"},
         {"sandbox_mode": "host"},
+        {"sandbox_runtime": "unregistered-runtime"},
         {"unknown_key": "value"},
     ],
 )

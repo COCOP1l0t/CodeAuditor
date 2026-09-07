@@ -182,6 +182,14 @@
         </div>
         <fieldset class="settings-sandbox">
           <legend>Stage 5/6 execution</legend>
+          <label>Container runtime
+            <select id="s-sandbox-runtime">
+              <option value="docker-default">Docker default</option>
+              <option value="runc">runc</option>
+              <option value="runsc">gVisor (runsc)</option>
+            </select>
+            <span class="hint">Applies to new tasks and resumed executions. gVisor must be registered on the server.</span>
+          </label>
           <div class="settings-radio-list">
             <label class="settings-radio-option" data-sandbox-option="docker-networked">
               <input type="radio" name="sandbox-mode" value="docker-networked" required />
@@ -194,7 +202,7 @@
               <input type="radio" name="sandbox-mode" value="docker-isolated" required />
               <span>
                 <strong>Docker sandbox without network</strong>
-                <small>The same disposable workspace with container networking disabled.</small>
+                <small>Disables networking for both the Agent CLI and target; network model APIs will be unavailable.</small>
               </span>
             </label>
             <label class="settings-radio-option" data-sandbox-option="local-worktree">
@@ -403,6 +411,17 @@
         </div>
         <p id="run-resume-message" class="registry-message dim" role="status"></p>
         <div id="run-meta" class="meta-grid"></div>
+      </section>
+      <section class="panel" id="sandbox-executions-panel">
+        <h2>Container executions</h2>
+        <p class="dim" id="sandbox-executions-status">Loading recorded environments…</p>
+        <button type="button" class="btn" id="btn-refresh-sandbox-executions">Refresh</button>
+        <div class="table-wrap">
+          <table id="sandbox-executions-table">
+            <thead><tr><th>Task</th><th>Started</th><th>Runtime</th><th>Image ID</th><th>State / exit</th><th>Cleanup</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </section>
       <section class="panel" id="stages-panel">
         <h2>Stages</h2>

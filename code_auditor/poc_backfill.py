@@ -383,6 +383,7 @@ def _build_config(
         provider_base_url=provider.base_url or None,
         provider_api_key=provider.api_key or None,
         sandbox_enabled=sandbox_enabled,
+        sandbox_runtime=settings.sandbox_runtime,
         sandbox_network_enabled=sandbox_network_enabled,
         poc_source_commit=candidate.commit,
     )
@@ -432,6 +433,8 @@ async def _run_group(
         started_at=started_at,
         run_kind=RUN_KIND_MAINTENANCE,
     )
+    config.sandbox_run_id = run_id
+    config.sandbox_job_key = f"maintenance-{run_id}"
     _pin_run_identity(store, run_id, first)
     checkpoint = CheckpointManager(output_dir, resume=True)
     results: list[dict[str, Any]] = []

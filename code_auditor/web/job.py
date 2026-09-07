@@ -26,10 +26,12 @@ from ..checkpoint import CheckpointManager
 from ..config import (
     DEFAULT_AGENT_TIMEOUT_SECONDS,
     DEFAULT_SANDBOX_MODE,
+    DEFAULT_SANDBOX_RUNTIME,
     AgentBackend,
     AuditConfig,
     ProviderMode,
     SandboxMode,
+    SandboxRuntime,
     local_claude_model,
     resolve_wiki_arg,
     sandbox_mode_flags,
@@ -108,6 +110,7 @@ class AuditStartParams:
     repos_dir: str = DEFAULT_REPOS_DIR
     results_dir: str = DEFAULT_RESULTS_DIR
     sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE
+    sandbox_runtime: SandboxRuntime = DEFAULT_SANDBOX_RUNTIME
 
 
 @dataclass
@@ -124,6 +127,7 @@ class ReproductionStartParams:
     reproductions_dir: str = DEFAULT_REPRODUCTIONS_DIR
     wikis_dir: str = DEFAULT_WIKIS_DIR
     sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE
+    sandbox_runtime: SandboxRuntime = DEFAULT_SANDBOX_RUNTIME
 
 
 def _safe_path_segment(value: str) -> str:
@@ -326,6 +330,7 @@ class AuditJob:
             "backend": self.config.backend if self.config else "",
             "model": self.config.model if self.config else None,
             "provider_mode": self.config.provider_mode if self.config else "",
+            "sandbox_runtime": self.config.sandbox_runtime if self.config else None,
             "sandbox_mode": (
                 sandbox_mode_from_flags(
                     self.config.sandbox_enabled,
@@ -349,6 +354,8 @@ class AuditJob:
     def _set_config(self, config: AuditConfig) -> None:
         """Attach Web-only runtime observers to the job's active config."""
         self.config = config
+        config.sandbox_run_id = self.run_id
+        config.sandbox_job_key = self.job_key or None
         config.agent_history_changed = self._agent_history_changed
 
     def _agent_history_changed(self) -> None:
@@ -467,6 +474,7 @@ class AuditJob:
             "backend": self.config.backend if self.config else "",
             "model": self.config.model if self.config else None,
             "provider_mode": self.config.provider_mode if self.config else "",
+            "sandbox_runtime": self.config.sandbox_runtime if self.config else None,
             "sandbox_mode": (
                 sandbox_mode_from_flags(
                     self.config.sandbox_enabled,
@@ -611,6 +619,7 @@ class AuditJob:
             target_au_count=params.target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             sandbox_enabled=sandbox_enabled,
+            sandbox_runtime=params.sandbox_runtime,
             sandbox_network_enabled=sandbox_network_enabled,
             known_disclosures=tuple(
                 self.store.disclosure_dedupe_index() if self.store else ()
@@ -648,6 +657,7 @@ class AuditJob:
             target_au_count=params.target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             sandbox_enabled=sandbox_enabled,
+            sandbox_runtime=params.sandbox_runtime,
             sandbox_network_enabled=sandbox_network_enabled,
             known_disclosures=tuple(
                 self.store.disclosure_dedupe_index() if self.store else ()
@@ -914,6 +924,7 @@ class AuditJob:
                 provider_api_key=params.provider_api_key,
                 agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
                 sandbox_enabled=sandbox_enabled,
+                sandbox_runtime=params.sandbox_runtime,
                 sandbox_network_enabled=sandbox_network_enabled,
             )
             self._set_config(config)
@@ -1076,6 +1087,9 @@ class AuditJobManager:
     @staticmethod
     def _launch(job: AuditJob, coroutine) -> None:
         """Start the job task with the log-routing context variable set."""
+        if job.config is not None:
+            job.config.sandbox_run_id = job.run_id
+            job.config.sandbox_job_key = job.job_key
         job_token = CURRENT_JOB_KEY.set(job.job_key)
         process_token = CURRENT_AUDIT_PROCESS_MARKER.set(job.process_marker)
         try:
@@ -1171,6 +1185,7 @@ class AuditJobManager:
         provider_api_key: str | None = None,
         model: str | None = None,
         sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE,
+        sandbox_runtime: SandboxRuntime = DEFAULT_SANDBOX_RUNTIME,
     ) -> AuditJob:
         """Start restoring a cancelled audit in its original output directory."""
         self._prune_finished_jobs()
@@ -1245,6 +1260,7 @@ class AuditJobManager:
                 log_level=str(run.get("log_level") or "INFO"),
                 wiki=wiki_path,
                 sandbox_mode=sandbox_mode,
+                sandbox_runtime=sandbox_runtime,
             )
             self._check_start_allowed(target, run_id=run_id)
             job = AuditJob(self, JOB_AUDIT)
@@ -1320,6 +1336,7 @@ class AuditJobManager:
             target_au_count=target_au_count,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             sandbox_enabled=sandbox_enabled,
+            sandbox_runtime=sandbox_runtime,
             sandbox_network_enabled=sandbox_network_enabled,
             known_disclosures=tuple(self.store.disclosure_dedupe_index()),
         )
@@ -1370,6 +1387,7 @@ class AuditJobManager:
             repos_dir=repos_dir,
             results_dir=results_dir,
             sandbox_mode=sandbox_mode,
+            sandbox_runtime=sandbox_runtime,
         )
         self._check_start_allowed(target, run_id=run_id)
         job = AuditJob(self, JOB_AUDIT)

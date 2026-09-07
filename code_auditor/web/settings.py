@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from ..config import DEFAULT_BACKEND, DEFAULT_SANDBOX_MODE, SandboxMode
+from ..config import (
+    DEFAULT_BACKEND, DEFAULT_SANDBOX_MODE, DEFAULT_SANDBOX_RUNTIME,
+    SANDBOX_RUNTIMES, SandboxMode, SandboxRuntime,
+)
 
 DEFAULT_STATE_DIR = os.path.join("~", ".code_auditor")
 DEFAULT_SETTINGS_PATH = os.path.join(DEFAULT_STATE_DIR, "settings.json")
@@ -24,6 +27,7 @@ _CONFIG_KEYS = {
     "results_dir",
     "reproductions_dir",
     "sandbox_mode",
+    "sandbox_runtime",
     "providers",
 }
 _PROVIDER_KEYS = {"mode", "base_url", "api_key", "model"}
@@ -74,6 +78,7 @@ class WebSettings:
     results_dir: str
     reproductions_dir: str
     sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE
+    sandbox_runtime: SandboxRuntime = DEFAULT_SANDBOX_RUNTIME
     claude_provider: ModelProviderSettings = field(
         default_factory=ModelProviderSettings, repr=False
     )
@@ -91,6 +96,7 @@ class WebSettings:
         max_parallel: int = 1,
         max_concurrent_jobs: int = 4,
         sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE,
+        sandbox_runtime: SandboxRuntime = DEFAULT_SANDBOX_RUNTIME,
     ) -> "WebSettings":
         """Build validated settings for an isolated state directory."""
         root = os.path.realpath(os.path.expanduser(state_dir))
@@ -105,6 +111,7 @@ class WebSettings:
                 "results_dir": os.path.join(root, "results"),
                 "reproductions_dir": os.path.join(root, "reproductions"),
                 "sandbox_mode": sandbox_mode,
+                "sandbox_runtime": sandbox_runtime,
                 "providers": {"claude": {}, "codex": {}},
             },
         )
@@ -119,6 +126,7 @@ class WebSettings:
             "results_dir": self.results_dir,
             "reproductions_dir": self.reproductions_dir,
             "sandbox_mode": self.sandbox_mode,
+            "sandbox_runtime": self.sandbox_runtime,
             "providers": {
                 "claude": self.claude_provider.serialized(),
                 "codex": self.codex_provider.serialized(),
@@ -137,6 +145,7 @@ class WebSettings:
         return {
             "backend": self.backend,
             "sandbox_mode": self.sandbox_mode,
+            "sandbox_runtime": self.sandbox_runtime,
             "providers": {
                 "claude": self.claude_provider.public(),
                 "codex": self.codex_provider.public(),
@@ -214,13 +223,15 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
     removed_model = raw.pop("model", None) is not None
     added_providers = "providers" not in raw
     added_sandbox_mode = "sandbox_mode" not in raw
+    added_sandbox_runtime = "sandbox_runtime" not in raw
     unknown = sorted(set(raw) - _CONFIG_KEYS)
     if unknown:
         raise WebSettingsError(
             f"Unknown web settings: {', '.join(unknown)}"
         )
     if (
-        removed_legacy_paths or removed_model or added_providers or added_sandbox_mode
+        removed_legacy_paths or removed_model or added_providers
+        or added_sandbox_mode or added_sandbox_runtime
     ) and not migrated_legacy_file:
         _write_settings_file(config_path, {**defaults, **raw})
     os.chmod(config_path, 0o600)
@@ -258,6 +269,10 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
             "or 'local-worktree'."
         )
 
+    sandbox_runtime = raw.get("sandbox_runtime", DEFAULT_SANDBOX_RUNTIME)
+    if sandbox_runtime not in SANDBOX_RUNTIMES:
+        raise WebSettingsError("sandbox_runtime must be docker-default, runc, or runsc.")
+
     managed_paths = {}
     for key in (
         "repos_dir",
@@ -290,6 +305,7 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         results_dir=managed_paths["results_dir"],
         reproductions_dir=managed_paths["reproductions_dir"],
         sandbox_mode=sandbox_mode,
+        sandbox_runtime=sandbox_runtime,
         claude_provider=validated_providers["claude"],
         codex_provider=validated_providers["codex"],
     )
@@ -303,6 +319,7 @@ def update_agent_settings(
     base_url: str,
     model: str,
     sandbox_mode: str | None = None,
+    sandbox_runtime: str | None = None,
     api_key: str | None = None,
     clear_api_key: bool = False,
 ) -> WebSettings:
@@ -329,10 +346,14 @@ def update_agent_settings(
                 "or 'local-worktree'."
             )
         selected_sandbox_mode = sandbox_mode
+    selected_runtime = settings.sandbox_runtime if sandbox_runtime is None else sandbox_runtime
+    if selected_runtime not in SANDBOX_RUNTIMES:
+        raise WebSettingsError("sandbox_runtime must be docker-default, runc, or runsc.")
     updated = replace(
         settings,
         backend=backend,
         sandbox_mode=selected_sandbox_mode,
+        sandbox_runtime=selected_runtime,
         **{f"{backend}_provider": provider},
     )
     _write_settings_file(updated.config_path, updated.serialized())

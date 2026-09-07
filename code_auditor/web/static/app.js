@@ -172,6 +172,10 @@ function sandboxModeLabel(mode) {
   return "Docker sandbox · networked";
 }
 
+function sandboxRuntimeLabel(runtime) {
+  return runtime === "runsc" ? "gVisor" : runtime === "runc" ? "runc" : "Docker default";
+}
+
 function formatBytes(bytes) {
   const value = Number(bytes);
   if (!Number.isFinite(value) || value < 0) return "unknown";
@@ -192,7 +196,9 @@ function updateAgentSettingsSummary() {
   const providerSummary = provider.mode === "custom"
     ? `${agentBackendLabel(backend)} · ${provider.model || "custom provider"}`
     : `${agentBackendLabel(backend)} · local CLI configuration`;
-  const summary = `${providerSummary} · ${sandboxModeLabel(agentSettings.sandbox_mode)}`;
+  const runtime = agentSettings.sandbox_mode === "local-worktree" ? ""
+    : ` · ${sandboxRuntimeLabel(agentSettings.sandbox_runtime)}`;
+  const summary = `${providerSummary} · ${sandboxModeLabel(agentSettings.sandbox_mode)}${runtime}`;
   $("agent-settings-summary").textContent = summary;
   $("f-agent-summary").textContent = summary;
   renderDashboardRuntime();
@@ -226,6 +232,7 @@ function renderAgentSettingsForm() {
     ? "Stored key (leave blank to keep)"
     : "Enter API key";
   const sandboxMode = agentSettings.sandbox_mode || "docker-networked";
+  $("s-sandbox-runtime").value = agentSettings.sandbox_runtime || "docker-default";
   for (const input of document.querySelectorAll('input[name="sandbox-mode"]')) {
     input.checked = input.value === sandboxMode;
   }
@@ -248,13 +255,14 @@ function setDockerSandboxOptionsAvailable(available) {
 
 async function loadSandboxCapability(backend) {
   const request = ++sandboxCapabilityRequest;
+  const runtime = $("s-sandbox-runtime").value;
   setDockerSandboxOptionsAvailable(false);
   $("s-sandbox-status").dataset.state = "checking";
   $("s-sandbox-status").textContent =
     "Checking Docker, image, scratch disk, and Agent runtime on this server…";
   try {
     const res = await fetch(
-      `/api/sandbox/capability?backend=${encodeURIComponent(backend)}`,
+      `/api/sandbox/capability?backend=${encodeURIComponent(backend)}&runtime=${encodeURIComponent(runtime)}`,
       { cache: "no-store" }
     );
     const data = await res.json();
@@ -305,6 +313,7 @@ $("btn-settings").addEventListener("click", async () => {
 $("btn-settings-cancel").addEventListener("click", () => settingsDialog.close());
 $("s-backend").addEventListener("change", renderAgentSettingsForm);
 $("s-mode").addEventListener("change", updateAgentSettingsMode);
+$("s-sandbox-runtime").addEventListener("change", () => loadSandboxCapability($("s-backend").value));
 $("s-clear-key").addEventListener("change", updateAgentSettingsMode);
 
 $("settings-form").addEventListener("submit", async (event) => {
@@ -325,6 +334,7 @@ $("settings-form").addEventListener("submit", async (event) => {
     return;
   }
   body.sandbox_mode = sandboxMode.value;
+  body.sandbox_runtime = $("s-sandbox-runtime").value;
   const apiKey = $("s-api-key").value;
   if (apiKey) body.api_key = apiKey;
   saveButton.disabled = true;
@@ -2343,6 +2353,41 @@ $("btn-import").addEventListener("click", async () => {
 });
 
 // ── Run detail view ─────────────────────────────────────────────────────────
+async function loadSandboxExecutions(runId) {
+  const table = $("sandbox-executions-table");
+  const status = $("sandbox-executions-status");
+  table.querySelector("tbody").replaceChildren();
+  status.textContent = "Loading recorded environments…";
+  try {
+    const res = await fetch(`/api/history/${runId}/sandbox-executions`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (String(detailRunId) !== String(runId)) return;
+    const rows = data.executions || [];
+    status.textContent = rows.length
+      ? `Showing ${rows.length} of ${data.total} launches. Earlier artifacts may have no environment record.`
+      : "No container execution records. The environment of earlier artifacts is unknown.";
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      const runtime = row.runtime || `Not verified (${row.configured_runtime || "unknown"})`;
+      for (const value of [row.task_name, fmtTime(row.started_at), runtime,
+        row.image_id || "Not verified", `${row.state || "unknown"} / ${row.exit_code ?? "—"}`,
+        row.cleanup || "unknown"]) {
+        const td = document.createElement("td");
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      table.querySelector("tbody").appendChild(tr);
+    }
+  } catch (error) {
+    if (String(detailRunId) === String(runId)) status.textContent = `Execution records unavailable: ${error.message}`;
+  }
+}
+
+$("btn-refresh-sandbox-executions").addEventListener("click", () => {
+  if (detailRunId != null) void loadSandboxExecutions(detailRunId);
+});
+
 async function loadRunDetail(runId) {
   stopAuditProcessTree();
   const resumeButton = $("btn-run-resume");
@@ -2371,6 +2416,7 @@ async function loadRunDetail(runId) {
   // Decide whether this run has a live job: then the Stages/Logs panels
   // follow its per-run SSE stream; otherwise they show recorded artifacts.
   detailRunId = run.id;
+  void loadSandboxExecutions(run.id);
   let status = null;
   try {
     const res = await fetch(`/api/audit/${run.id}/status`);

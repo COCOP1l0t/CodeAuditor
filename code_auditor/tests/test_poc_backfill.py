@@ -29,7 +29,7 @@ def _candidate(tmp_path: Path) -> BackfillCandidate:
 
 
 def test_build_config_can_override_active_web_backend(tmp_path: Path) -> None:
-    settings = WebSettings.for_state_dir(str(tmp_path), backend="claude")
+    settings = WebSettings.for_state_dir(str(tmp_path), backend="claude", sandbox_runtime="runsc")
 
     config = _build_config(
         settings,
@@ -43,6 +43,7 @@ def test_build_config_can_override_active_web_backend(tmp_path: Path) -> None:
     assert config.backend == "codex"
     assert config.model == "gpt-5.6-luna"
     assert config.provider_mode == settings.codex_provider.mode
+    assert config.sandbox_runtime == "runsc"
 
 
 @pytest.mark.parametrize(
@@ -70,6 +71,9 @@ def test_cleanup_race_is_nonfatal_after_report_export() -> None:
         )
     ) is True
     assert _is_nonfatal_cleanup_error(RuntimeError("build failed")) is False
+    assert _is_nonfatal_cleanup_error(RuntimeError(
+        "sandbox container cleanup could not be verified: removal already in progress"
+    )) is False
 
 
 def test_recovery_output_isolated_when_commit_tree_already_exists(tmp_path: Path) -> None:

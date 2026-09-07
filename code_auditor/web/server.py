@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..config import SandboxRuntime
+from ..sandbox_records import list_sandbox_executions
 from ..db import (
     DEFAULT_DB_PATH,
     DISCLOSURE_TRASH_RETENTION_DAYS,
@@ -76,6 +78,7 @@ _AGENT_LOG_PATTERNS = (
     "stage3-findings/logs/*.log",
     "stage5-pocs/*/agent.log",
     "stage6-disclosures/*/agent.log",
+    ".sandbox-executions/*/agent-*.log",
 )
 
 _REPOSITORY_NAME_PATTERN = r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
@@ -155,6 +158,7 @@ class AgentSettingsRequest(StrictRequest):
     sandbox_mode: Literal[
         "docker-networked", "docker-isolated", "local-worktree"
     ] | None = None
+    sandbox_runtime: SandboxRuntime | None = None
 
 
 def _sse(event: dict) -> str:
@@ -678,11 +682,13 @@ def create_app(
             )
         return jobs
 
-    async def require_sandbox_environment(backend: str, sandbox_mode: str) -> None:
+    async def require_sandbox_environment(
+        backend: str, sandbox_mode: str, runtime: SandboxRuntime
+    ) -> None:
         if sandbox_mode == "local-worktree":
             return
         capability = await asyncio.to_thread(
-            inspect_docker_sandbox_environment, backend
+            inspect_docker_sandbox_environment, backend, runtime
         )
         if not capability.available:
             raise HTTPException(
@@ -705,7 +711,9 @@ def create_app(
             "/api/dashboard",
             "/api/settings",
             "/api/sandbox/capability",
-        } or re.fullmatch(r"/api/audit/\d+/processes", request.url.path):
+        } or re.fullmatch(r"/api/audit/\d+/processes", request.url.path) or (
+            request.url.path.startswith("/api/") and request.url.path.endswith("/sandbox-executions")
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -832,15 +840,17 @@ def create_app(
             "runtime": {
                 "backend": settings.backend,
                 "sandbox_mode": settings.sandbox_mode,
+                "sandbox_runtime": settings.sandbox_runtime,
             },
         }
 
     @app.get("/api/sandbox/capability")
     async def get_sandbox_capability(
         backend: Literal["claude", "codex"] = Query(...),
+        runtime: SandboxRuntime = Query("docker-default"),
     ) -> dict:
         capability = await asyncio.to_thread(
-            inspect_docker_sandbox_environment, backend
+            inspect_docker_sandbox_environment, backend, runtime
         )
         return {
             "backend": backend,
@@ -859,7 +869,8 @@ def create_app(
     async def put_agent_settings(request: AgentSettingsRequest) -> dict:
         nonlocal settings
         sandbox_mode = request.sandbox_mode or settings.sandbox_mode
-        await require_sandbox_environment(request.backend, sandbox_mode)
+        runtime = request.sandbox_runtime or settings.sandbox_runtime
+        await require_sandbox_environment(request.backend, sandbox_mode, runtime)
         try:
             settings = update_agent_settings(
                 settings,
@@ -868,6 +879,7 @@ def create_app(
                 base_url=request.base_url,
                 model=request.model,
                 sandbox_mode=sandbox_mode,
+                sandbox_runtime=runtime,
                 api_key=request.api_key,
                 clear_api_key=request.clear_api_key,
             )
@@ -933,7 +945,7 @@ def create_app(
                 git_url = validate_remote_repo_url(request.git_url or "")
             except RepoError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await require_sandbox_environment(settings.backend, settings.sandbox_mode)
+        await require_sandbox_environment(settings.backend, settings.sandbox_mode, settings.sandbox_runtime)
         provider = settings.provider()
         try:
             job = await manager.start(
@@ -953,6 +965,7 @@ def create_app(
                     repos_dir=settings.repos_dir,
                     results_dir=settings.results_dir,
                     sandbox_mode=settings.sandbox_mode,
+                    sandbox_runtime=settings.sandbox_runtime,
                 )
             )
         except JobValidationError as e:
@@ -1150,7 +1163,7 @@ def create_app(
 
     @app.post("/api/reproduction", status_code=202)
     async def start_reproduction(request: ReproductionStartRequest) -> dict:
-        await require_sandbox_environment(settings.backend, settings.sandbox_mode)
+        await require_sandbox_environment(settings.backend, settings.sandbox_mode, settings.sandbox_runtime)
         provider = settings.provider()
         try:
             job = await manager.start_reproduction(
@@ -1166,6 +1179,7 @@ def create_app(
                     reproductions_dir=settings.reproductions_dir,
                     wikis_dir=settings.wikis_dir,
                     sandbox_mode=settings.sandbox_mode,
+                    sandbox_runtime=settings.sandbox_runtime,
                 )
             )
         except JobValidationError as e:
@@ -1372,10 +1386,27 @@ def create_app(
     def history_run(run_id: int) -> dict:
         return _get_history_run(run_id)
 
+    @app.get("/api/history/{run_id}/sandbox-executions")
+    def history_sandbox_executions(
+        run_id: int, limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> dict:
+        run = _get_history_run(run_id)
+        records = list_sandbox_executions(run["output_dir"], run_id=run_id)
+        return {"executions": records[offset:offset + limit], "total": len(records),
+                "coverage": "recorded-container-launches", "limit": limit, "offset": offset}
+
+    @app.get("/api/reproduction/{job_key}/sandbox-executions")
+    def reproduction_sandbox_executions(job_key: str) -> dict:
+        job = _reproduction_job_or_404(job_key)
+        records = list_sandbox_executions(job.config.output_dir, job_key=job_key) if job.config else []
+        return {"executions": records, "total": len(records),
+                "coverage": "recorded-container-launches"}
+
     @app.post("/api/history/{run_id}/resume", status_code=202)
     async def resume_history_run(run_id: int) -> dict:
         _get_history_run(run_id)
-        await require_sandbox_environment(settings.backend, settings.sandbox_mode)
+        await require_sandbox_environment(settings.backend, settings.sandbox_mode, settings.sandbox_runtime)
         provider = settings.provider()
         try:
             job = await manager.resume_cancelled(
@@ -1389,6 +1420,7 @@ def create_app(
                 provider_api_key=provider.api_key or None,
                 model=provider.model if provider.mode == "custom" else None,
                 sandbox_mode=settings.sandbox_mode,
+                sandbox_runtime=settings.sandbox_runtime,
             )
         except JobValidationError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e

@@ -88,6 +88,10 @@ docker build -f docker/code-auditor-sandbox.Dockerfile \
   -t code-auditor-sandbox:latest docker
 ```
 
+在 **Settings → Stage 5/6 execution** 中选择 `docker-default`（默认）、`runc` 或可选的 gVisor（`runsc`）。所选 runtime 必须已在服务端 Docker 中注册；不可用时检查或启动失败，不会自动回退。设置对新任务和恢复执行生效。断网模式也会阻断容器内 Agent 对模型 API 的访问。
+
+每次新容器启动都会固定镜像 ID，并在 `.sandbox-executions/` 中记录实际检查到的 runtime、资源设置、退出状态及清理验证结果。Agent 日志由宿主机写入，位于容器挂载范围之外，在临时沙箱清理后保留。**History → Container executions** 可查看记录；没有记录的旧产物仍标记为环境未知。详见[沙箱运行与可选 gVisor 验证](docs/sandbox.md)。
+
 ## Wiki 知识库
 
 Web 界面会发现 `~/.code_auditor/wiki/` 下的知识库。CodeAuditor 将所选 Wiki 视为只读辅助背景，而不是漏洞证据。
@@ -104,6 +108,7 @@ Web 界面会发现 `~/.code_auditor/wiki/` 下的知识库。CodeAuditor 将所
 ├── stage4-vulnerabilities/
 ├── stage5-pocs/
 ├── stage6-disclosures/
+├── .sandbox-executions/  # 宿主机写入的容器记录和 Agent 日志
 └── .markers/
 ```
 

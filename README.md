@@ -88,6 +88,10 @@ docker build -f docker/code-auditor-sandbox.Dockerfile \
   -t code-auditor-sandbox:latest docker
 ```
 
+In **Settings → Stage 5/6 execution**, select `docker-default` (the default), `runc`, or optional gVisor (`runsc`). The server must already have the selected runtime registered in Docker. An unavailable runtime fails the check or launch without falling back. Settings apply to new jobs and resumed executions. Offline mode also disables the containerized Agent's access to model APIs.
+
+Each new container launch pins the image ID and records the inspected runtime, resource settings, exit status, and verified cleanup under `.sandbox-executions/`. Its Agent logs are written by the host outside the container's mounts and survive scratch cleanup. **History → Container executions** shows these records; older artifacts without records retain an unknown environment. See [sandbox operation and optional gVisor checks](docs/sandbox.md).
+
 ## Wiki knowledge base
 
 The Web UI discovers knowledge bases under `~/.code_auditor/wiki/`. CodeAuditor treats the selected Wiki as read-only and uses available pages as supporting context rather than vulnerability evidence.
@@ -104,6 +108,7 @@ See [QEMU-Security-Wiki](https://github.com/qianfei11/QEMU-Security-Wiki) for an
 ├── stage4-vulnerabilities/
 ├── stage5-pocs/
 ├── stage6-disclosures/
+├── .sandbox-executions/  # Host-written container records and Agent logs
 └── .markers/
 ```
 

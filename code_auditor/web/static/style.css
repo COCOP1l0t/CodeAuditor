@@ -3011,6 +3011,15 @@ body.terminal-resizing {
   white-space: nowrap;
 }
 
+.terminal-session-meta {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
 .terminal-cwd {
   flex: 0 1 65vw;
   max-width: 65vw;
@@ -3020,6 +3029,12 @@ body.terminal-resizing {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.terminal-refresh {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.75rem;
 }
 
 .terminal-host {

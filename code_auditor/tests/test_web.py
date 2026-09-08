@@ -1417,6 +1417,7 @@ def test_api_config_returns_defaults(tmp_path) -> None:
     assert body["wikis_dir"] == str(tmp_path / "wiki")
     assert body["terminal_enabled"] is True
     assert len(body["terminal_token"]) >= 32
+    assert res.headers["cache-control"] == "no-store"
     assert body["capabilities"]["dashboard_summary"] is True
     assert "backends" not in body
     assert "default_models" not in body
@@ -1743,6 +1744,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "setupTerminalSplitter" in script.text
     assert "showTerminalDock" in script.text
     assert "terminalSessions" in script.text
+    assert "refreshTerminalToken" in script.text
+    assert "terminal-refresh" in script.text
     assert "wireSortableTable" in script.text
     assert "openDisclosureEditDialog" in script.text
     assert "disclosureCvesReady" in script.text
@@ -2056,10 +2059,13 @@ def test_slop_disclosure_terminal_starts_from_registered_stage5_artifact(
             "token": token,
         }
     )
-    with pytest.raises(WebSocketDisconnect) as missing_target:
-        with client.websocket_connect(f"/ws/disclosure-terminal?{missing_params}"):
-            pass
+    with client.websocket_connect(
+        f"/ws/disclosure-terminal?{missing_params}"
+    ) as websocket:
+        with pytest.raises(WebSocketDisconnect) as missing_target:
+            websocket.receive_json()
     assert missing_target.value.code == 1008
+    assert missing_target.value.reason == "Disclosure terminal target not found."
 
 
 def test_poc_terminal_websocket_rejects_bad_token_and_origin(tmp_path) -> None:
@@ -2073,6 +2079,7 @@ def test_poc_terminal_websocket_rejects_bad_token_and_origin(tmp_path) -> None:
         with client.websocket_connect(f"/ws/terminal/{run_id}/H-01?token=wrong"):
             pass
     assert bad_token.value.code == 1008
+    assert bad_token.value.reason == "Terminal authorization failed."
 
     with pytest.raises(WebSocketDisconnect) as bad_origin:
         with client.websocket_connect(
@@ -2081,6 +2088,7 @@ def test_poc_terminal_websocket_rejects_bad_token_and_origin(tmp_path) -> None:
         ):
             pass
     assert bad_origin.value.code == 1008
+    assert bad_origin.value.reason == "Terminal authorization failed."
 
 
 def test_api_status_idle_before_any_job(tmp_path) -> None:

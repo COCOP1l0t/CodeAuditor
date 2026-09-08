@@ -708,6 +708,7 @@ def create_app(
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
         elif request.url.path.startswith("/api/auth/") or request.url.path in {
+            "/api/config",
             "/api/dashboard",
             "/api/settings",
             "/api/sandbox/capability",
@@ -1109,15 +1110,22 @@ def create_app(
         if (
             run_id < 1
             or re.fullmatch(_VULN_ID_PATTERN, vuln_id) is None
-            or app.state.active_terminals >= 16
         ):
+            # The token and origin are valid, so complete the handshake before
+            # closing to let the browser receive this diagnostic reason.
+            await websocket.accept()
             await websocket.close(code=1008, reason="Invalid terminal request.")
+            return
+        if app.state.active_terminals >= 16:
+            await websocket.accept()
+            await websocket.close(code=1008, reason="Terminal session limit reached.")
             return
         candidate = store.get_poc_terminal_candidate(run_id, vuln_id)
         if candidate is None or not (
             _is_managed_path(candidate["output_dir"], settings.results_dir)
             and _is_managed_path(candidate["poc_dir"], settings.results_dir)
         ):
+            await websocket.accept()
             await websocket.close(code=1008, reason="PoC terminal target not found.")
             return
         app.state.active_terminals += 1
@@ -1144,13 +1152,15 @@ def create_app(
             await websocket.close(code=1008, reason="Terminal authorization failed.")
             return
         if app.state.active_terminals >= 16:
-            await websocket.close(code=1008, reason="Invalid terminal request.")
+            await websocket.accept()
+            await websocket.close(code=1008, reason="Terminal session limit reached.")
             return
         candidate = store.get_disclosed_terminal_candidate(project, dedupe_key)
         if candidate is None or not (
             _is_managed_path(candidate["output_dir"], settings.results_dir)
             and _is_managed_path(candidate["poc_dir"], settings.results_dir)
         ):
+            await websocket.accept()
             await websocket.close(
                 code=1008, reason="Disclosure terminal target not found."
             )

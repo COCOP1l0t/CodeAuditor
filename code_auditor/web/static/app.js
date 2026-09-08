@@ -142,8 +142,14 @@ function busyReproductionJob() {
 // ── Config form ─────────────────────────────────────────────────────────────
 async function loadConfig() {
   try {
-    const res = await fetch("/api/config");
+    const res = await fetch("/api/config", {
+      credentials: "same-origin",
+      cache: "no-store",
+    });
     const cfg = await res.json();
+    if (!res.ok) {
+      throw new Error(cfg.detail || `Config request failed (${res.status})`);
+    }
     const d = cfg.defaults || {};
     managedResultsDir = cfg.results_dir || "";
     terminalToken = cfg.terminal_token || "";
@@ -160,6 +166,31 @@ async function loadConfig() {
     formError.textContent = `Failed to load config: ${e}`;
     reproductionFormError.textContent = `Failed to load config: ${e}`;
   }
+}
+
+async function refreshTerminalToken() {
+  const res = await fetch("/api/config", {
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  let cfg = {};
+  try {
+    cfg = await res.json();
+  } catch (_) {
+    // The status below remains useful when a proxy returns a non-JSON error.
+  }
+  if (!res.ok) {
+    throw new Error(cfg.detail || `Config request failed (${res.status})`);
+  }
+  const refreshedToken = cfg.terminal_token || "";
+  if (cfg.terminal_enabled !== true || !refreshedToken) {
+    terminalEnabled = false;
+    terminalToken = "";
+    throw new Error("The server did not enable PoC terminals for this session.");
+  }
+  terminalEnabled = true;
+  terminalToken = refreshedToken;
+  return refreshedToken;
 }
 
 function agentBackendLabel(backend) {
@@ -4181,7 +4212,10 @@ function openPocTerminal(runId, vulnId, title, project = "", dedupeKey = "") {
   panel.hidden = true;
   panel.innerHTML =
     `<header class="terminal-session-header"><strong>${escapeHtml(title || vulnId)}</strong>` +
-    `<span class="terminal-cwd">Connecting…</span></header>` +
+    `<div class="terminal-session-meta"><span class="terminal-cwd">Connecting…</span>` +
+    `<button type="button" class="btn terminal-refresh" ` +
+    `aria-label="Refresh ${escapeHtml(vulnId)} terminal" ` +
+    `title="End the current shell and start a new one">Refresh</button></div></header>` +
     `<div class="terminal-host" id="terminal-${terminalSequence}"></div>`;
   tabs.appendChild(tab);
   panels.appendChild(panel);
@@ -4190,6 +4224,7 @@ function openPocTerminal(runId, vulnId, title, project = "", dedupeKey = "") {
   const tabButton = tab.querySelector(".terminal-tab-button");
   const host = panel.querySelector(".terminal-host");
   const cwd = panel.querySelector(".terminal-cwd");
+  const refreshButton = panel.querySelector(".terminal-refresh");
   const term = new window.Terminal({
     cursorBlink: true,
     convertEol: false,
@@ -4209,7 +4244,7 @@ function openPocTerminal(runId, vulnId, title, project = "", dedupeKey = "") {
     const rows = Math.max(5, Math.floor((host.clientHeight - 14) / 17));
     if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
   };
-  const session = { tab, tabButton, panel, term, fit, close: null };
+  const session = { tab, tabButton, panel, term, fit, close: null, refresh: null };
   terminalSessions.set(sessionKey, session);
   activatePocTerminal(sessionKey);
   term.open(host);
@@ -4218,65 +4253,116 @@ function openPocTerminal(runId, vulnId, title, project = "", dedupeKey = "") {
   observer.observe(host);
 
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const socketUrl = isDisclosure
+  const socketUrl = (token) => isDisclosure
     ? `${scheme}://${location.host}/ws/disclosure-terminal?${new URLSearchParams({
         project,
         dedupe_key: dedupeKey,
-        token: terminalToken,
+        token,
       })}`
     : `${scheme}://${location.host}/ws/terminal/${encodeURIComponent(runId)}/` +
-      `${encodeURIComponent(vulnId)}?token=${encodeURIComponent(terminalToken)}`;
-  const socket = new WebSocket(socketUrl);
-  socket.binaryType = "arraybuffer";
-  socket.addEventListener("open", () => {
-    socket.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-  });
-  socket.addEventListener("message", (event) => {
-    if (typeof event.data === "string") {
-      try {
-        const message = JSON.parse(event.data);
-        if (message.type === "ready") {
-          cwd.textContent = message.cwd;
-          tab.title = message.cwd;
-          if (!panel.hidden) term.focus();
-        } else if (message.type === "error") {
-          term.writeln(`\r\n[terminal error: ${message.detail}]`);
-        }
-      } catch {
-        term.write(event.data);
-      }
-      return;
+      `${encodeURIComponent(vulnId)}?token=${encodeURIComponent(token)}`;
+  let socket = null;
+  let connectionAttempt = 0;
+  let closed = false;
+
+  const connect = async ({ refreshToken = false } = {}) => {
+    const attempt = ++connectionAttempt;
+    const previousSocket = socket;
+    socket = null;
+    if (
+      previousSocket &&
+      (previousSocket.readyState === WebSocket.OPEN ||
+        previousSocket.readyState === WebSocket.CONNECTING)
+    ) {
+      previousSocket.close(1000, "Terminal refreshed");
     }
-    term.write(new Uint8Array(event.data));
-  });
-  socket.addEventListener("close", (event) => {
-    cwd.textContent = event.code === 1000 ? "Session closed" : `Session closed (${event.code})`;
-    term.options.cursorBlink = false;
-  });
-  socket.addEventListener("error", () => {
-    term.writeln("\r\n[terminal connection failed]");
-  });
+    cwd.textContent = refreshToken ? "Refreshing…" : "Connecting…";
+    term.options.cursorBlink = true;
+
+    let token = terminalToken;
+    if (refreshToken) {
+      try {
+        token = await refreshTerminalToken();
+      } catch (error) {
+        if (closed || attempt !== connectionAttempt) return;
+        cwd.textContent = "Refresh failed";
+        term.options.cursorBlink = false;
+        term.writeln(`\r\n[terminal refresh failed: ${error.message}]`);
+        return;
+      }
+    }
+    if (closed || attempt !== connectionAttempt) return;
+
+    const nextSocket = new WebSocket(socketUrl(token));
+    socket = nextSocket;
+    nextSocket.binaryType = "arraybuffer";
+    nextSocket.addEventListener("open", () => {
+      if (closed || attempt !== connectionAttempt || socket !== nextSocket) return;
+      nextSocket.send(JSON.stringify({
+        type: "resize",
+        cols: term.cols,
+        rows: term.rows,
+      }));
+    });
+    nextSocket.addEventListener("message", (event) => {
+      if (closed || attempt !== connectionAttempt || socket !== nextSocket) return;
+      if (typeof event.data === "string") {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === "ready") {
+            cwd.textContent = message.cwd;
+            tab.title = message.cwd;
+            if (!panel.hidden) term.focus();
+          } else if (message.type === "error") {
+            term.writeln(`\r\n[terminal error: ${message.detail}]`);
+          }
+        } catch {
+          term.write(event.data);
+        }
+        return;
+      }
+      term.write(new Uint8Array(event.data));
+    });
+    nextSocket.addEventListener("close", (event) => {
+      if (closed || attempt !== connectionAttempt || socket !== nextSocket) return;
+      const reason = event.reason ? `: ${event.reason}` : "";
+      cwd.textContent = event.code === 1000
+        ? `Session closed${reason}`
+        : `Connection failed (${event.code}${reason})`;
+      term.options.cursorBlink = false;
+      if (event.code !== 1000) {
+        term.writeln(`\r\n[terminal closed (${event.code}${reason})]`);
+      }
+    });
+    nextSocket.addEventListener("error", () => {
+      if (closed || attempt !== connectionAttempt || socket !== nextSocket) return;
+      term.writeln("\r\n[terminal connection failed; use Refresh to retry]");
+    });
+  };
 
   term.onData((data) => {
-    if (socket.readyState === WebSocket.OPEN) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "input", data }));
     }
   });
   term.onResize(({ cols, rows }) => {
-    if (socket.readyState === WebSocket.OPEN) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "resize", cols, rows }));
     }
   });
 
-  let closed = false;
   const close = () => {
     if (closed) return;
     closed = true;
+    connectionAttempt += 1;
     const order = [...terminalSessions.keys()];
     const index = order.indexOf(sessionKey);
     const nextKey = order[index + 1] || order[index - 1] || "";
     observer.disconnect();
-    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    if (
+      socket &&
+      (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
+    ) {
       socket.close(1000, "Closed by user");
     }
     term.dispose();
@@ -4289,9 +4375,16 @@ function openPocTerminal(runId, vulnId, title, project = "", dedupeKey = "") {
       activatePocTerminal(nextKey);
     }
   };
+  const refresh = () => {
+    term.writeln("\r\n[refreshing terminal; current shell will be replaced]");
+    void connect({ refreshToken: true });
+  };
   tabButton.addEventListener("click", () => activatePocTerminal(sessionKey));
   tab.querySelector(".terminal-tab-close").addEventListener("click", close);
+  refreshButton.addEventListener("click", refresh);
   session.close = close;
+  session.refresh = refresh;
+  void connect();
 }
 
 $("btn-terminal-dock-close").addEventListener("click", () => {

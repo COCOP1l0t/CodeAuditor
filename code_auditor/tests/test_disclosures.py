@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -233,18 +234,23 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
         **_kwargs: object,
     ) -> str:
         disclosure = (
-            Path(work_config.output_dir)
-            / "stage6-disclosures"
-            / "H-07"
-            / "disclosure"
+            Path(work_config.output_dir) / "stage6-disclosures" / "H-07" / "disclosure"
         )
         disclosure.mkdir(parents=True, exist_ok=True)
         reproduce = disclosure / "reproduce.sh"
         reproduce.write_text("#!/bin/sh\nexec echo reproduced\n", encoding="utf-8")
         reproduce.chmod(0o700)
-        (disclosure / "report.md").write_text("# Disclosure\n", encoding="utf-8")
-        (disclosure / "email.txt").write_text("Subject: H-07\n", encoding="utf-8")
-        (disclosure / "disclosure.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
+        (disclosure / "report.md").write_text(
+            "# Disclosure\n\n### Summary\nExample.\n\n### Details\nExample.\n\n"
+            "### PoC\nExisting evidence.\n\n### Impact\nExample.\n",
+            encoding="utf-8",
+        )
+        (disclosure / "email.txt").write_text(
+            "Subject: Example\n\nBody.\n", encoding="utf-8"
+        )
+        with zipfile.ZipFile(disclosure / "disclosure.zip", "w") as archive:
+            archive.write(disclosure / "report.md", "report.md")
+            archive.write(reproduce, "reproduce.sh")
         (disclosure / "temporary-build.bin").write_bytes(b"disposable")
         manifest_path = disclosure / "retain-manifest.json"
         manifest_path.write_text(
@@ -383,6 +389,8 @@ def test_semantic_dedupe_fails_open_for_invalid_agent_decision(
         ("Subject: Buffer overflow in parser\n\nBody\n", "Buffer overflow in parser"),
         ("subject: Lowercase subject\n", "Lowercase subject"),
         ("Subject: Folded\n continuation\n\nBody\n", "Folded continuation"),
+        ("Subject: Short\nHi, I am reporting a problem\nRegards\n", "Short"),
+        ("Subject: Short\nTo: security@example.test\n\nBody\n", "Short"),
     ],
 )
 def test_extract_email_subject(tmp_path: Path, content: str, expected: str) -> None:
@@ -392,12 +400,85 @@ def test_extract_email_subject(tmp_path: Path, content: str, expected: str) -> N
     assert extract_email_subject(str(email)) == expected
 
 
-def test_extract_email_subject_handles_missing_or_absent_subject(tmp_path: Path) -> None:
+def test_extract_email_subject_handles_missing_or_absent_subject(
+    tmp_path: Path,
+) -> None:
     email = tmp_path / "email.txt"
     email.write_text("To: security@example.test\n\nBody\n", encoding="utf-8")
 
     assert extract_email_subject(str(email)) is None
     assert extract_email_subject(str(tmp_path / "missing.txt")) is None
+
+
+def test_email_subject_in_body_is_not_a_header(tmp_path: Path) -> None:
+    email = tmp_path / "email.txt"
+    email.write_text("To: security@example.test\n\nSubject: quoted body\n")
+    assert extract_email_subject(str(email)) is None
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_semantic_dedupe_compares_current_batch(
+    tmp_path: Path, monkeypatch, historical: bool
+) -> None:
+    config, _, _, output = _stage6_config(tmp_path)
+    candidates = []
+    for i in (1, 2):
+        ident = f"H-0{i}"
+        _write_stage4(output, ident, _finding(id=ident, trigger=f"wording {i}"))
+        candidates.append(
+            stage6._load_candidate(str(_write_stage5(output, ident)), config, "")
+        )
+    prompts = []
+
+    async def compare(prompt, *_args, **_kwargs):
+        prompts.append(prompt)
+        if "wording 2" in prompt:
+            assert candidates[0].dedupe_key in prompt
+            return json.dumps(
+                {
+                    "decision": "duplicate",
+                    "matched_dedupe_key": candidates[0].dedupe_key,
+                    "reason": "Same report root cause",
+                }
+            )
+        return json.dumps(
+            {
+                "decision": "new",
+                "matched_dedupe_key": "",
+                "reason": "Distinct from history",
+            }
+        )
+
+    monkeypatch.setattr(stage6, "run_agent", compare)
+    history = (
+        ({"dedupe_key": "sha256:" + "a" * 64, "title": "Historical"},)
+        if historical
+        else ()
+    )
+    result = asyncio.run(
+        stage6._filter_semantic_duplicates(candidates, history, config)
+    )
+    assert result == candidates[:1]
+    assert len(prompts) == (2 if historical else 1)
+
+
+def test_completed_stage6_with_missing_files_fails_without_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, checkpoint, _, output = _stage6_config(tmp_path)
+    checkpoint.mark_complete("stage6:H-01")
+
+    async def unexpected(*_args, **_kwargs):
+        pytest.fail("No agent should run while rejecting a stale checkpoint")
+
+    monkeypatch.setattr(stage6, "run_agent", unexpected)
+    with pytest.raises(ValueError, match="Invalid completed artifacts"):
+        asyncio.run(
+            stage6._run_disclosure(
+                str(output / "stage5-pocs/H-01/report.md"), config, checkpoint
+            )
+        )
+    assert not checkpoint.is_complete("stage6:H-01")
 
 
 @pytest.mark.parametrize(

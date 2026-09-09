@@ -1,4 +1,5 @@
 """Stable identities and metadata helpers for database-backed disclosures."""
+
 from __future__ import annotations
 
 import hashlib
@@ -35,11 +36,7 @@ def _normalize_path_text(value: Any) -> str:
 
 def _normalize_list(value: Any) -> list[str]:
     return sorted(
-        {
-            _normalize_text(item)
-            for item in display_list(value)
-            if _normalize_text(item)
-        }
+        {_normalize_text(item) for item in display_list(value) if _normalize_text(item)}
     )
 
 
@@ -51,9 +48,7 @@ def build_dedupe_key(finding: dict[str, Any], repo_url: str | None) -> str:
         "repo": _normalize_text(repo_url or ""),
         "location": _normalize_path_text(finding.get("location")),
         "cwe": _normalize_list(finding.get("cwe_id") or finding.get("cwe")),
-        "vulnerability_class": _normalize_list(
-            finding.get("vulnerability_class")
-        ),
+        "vulnerability_class": _normalize_list(finding.get("vulnerability_class")),
         "trigger": _normalize_text(finding.get("trigger")),
         "trace_root": _normalize_path_text(
             trace_data.get("root_path")
@@ -63,9 +58,9 @@ def build_dedupe_key(finding: dict[str, Any], repo_url: str | None) -> str:
         ),
         "trace_sink": _normalize_path_text(trace_data.get("sink")),
     }
-    encoded = json.dumps(
-        stable_payload, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    encoded = json.dumps(stable_payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
@@ -79,6 +74,9 @@ def extract_email_subject(email_path: str | None) -> str | None:
         return None
     lines = content.splitlines()
     for index, line in enumerate(lines):
+        if not line.strip():
+            # Subject-like text in the body is not a mail header.
+            break
         if not line.lower().startswith("subject:"):
             continue
         parts = [line.split(":", 1)[1].strip()]
@@ -88,10 +86,9 @@ def extract_email_subject(email_path: str | None) -> str | None:
             if next_line[0] in " \t":
                 parts.append(next_line.strip())
                 continue
-            header_name, separator, _value = next_line.partition(":")
-            if separator and header_name.replace("-", "").isalpha():
-                break
-            parts.append(next_line.strip())
+            # RFC-style folding requires leading whitespace. An unindented
+            # line is another header or malformed body, never a continuation.
+            break
         subject = " ".join(part for part in parts if part)
         return subject or None
     return None

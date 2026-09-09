@@ -189,7 +189,10 @@ Generate the email and store it in `__DISCLOSURE_DIR__/email.txt`. The email is 
 **Format requirements**:
 
 - Plain text only (no HTML or markdown formatting).
-- First write the email without line wrapping, then use `fold -s -w 72` to wrap lines at word boundaries. Store the wrapped result as the final `email.txt`.
+- Separate the Subject header from the body with a blank line. If the Subject
+  needs wrapping, begin every continuation line with a space. Wrap only the
+  body at word boundaries to 72 columns; do not run a generic line wrapper
+  over the complete email because that breaks header folding.
 
 **Email structure**:
 
@@ -201,8 +204,8 @@ Hi,
 <Opening paragraph: state that you are reporting a security
 vulnerability in [project name], and briefly describe the affected
 component. Explain that the reported bug was discovered through
-AI-assisted static code auditing and passed human validation before
-disclosure. e.g., "I'm writing to report a ...">
+AI-assisted static code auditing. Claim human validation only when explicit
+human-review evidence is supplied; an automated reproduction is not human review.>
 
 <Affected versions paragraph: state which versions and modules are
 known to be affected.>
@@ -236,7 +239,7 @@ Regards
 - [ ] Plain-text format with lines wrapped at 72 characters
 - [ ] Email includes a concise target security guidelines rationale for why the bug is a security issue
 - [ ] Email communicates the security impact and references `disclosure.zip`
-- [ ] Email states the bug was discovered by AI-assisted static code auditing and passed human validation
+- [ ] Email states the AI-assisted origin and does not invent human validation
 - [ ] No internal audit identifiers
 
 ### Step 5: Package Artifacts

@@ -14,10 +14,15 @@ from ..disclosures import build_dedupe_key, display_list, single_line
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
-from ..reproduction_status import is_failed_status, is_reproduced_status, read_reproduction_status
+from ..reproduction_status import (
+    is_failed_status,
+    is_reproduced_status,
+    read_reproduction_status,
+)
 from ..retention import export_retained_artifacts, secure_generated_manifest_mode
 from ..sandbox import DockerScratch
 from ..utils import extract_json_object, record_task_error, run_parallel_limited
+from ..validation.stage6 import validate_stage6_disclosure
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage6")
@@ -95,7 +100,9 @@ def _extract_report_section(content: str, heading: str) -> str | None:
     return None
 
 
-def _fallback_finding_from_report(report_path: str, vuln_id: str | None) -> dict[str, Any]:
+def _fallback_finding_from_report(
+    report_path: str, vuln_id: str | None
+) -> dict[str, Any]:
     """Build deterministic finding metadata when Stage 4 JSON is unavailable."""
     content = _read_text(report_path)
     title = _extract_report_title(report_path) or vuln_id or Path(report_path).stem
@@ -119,7 +126,9 @@ def _fallback_finding_from_report(report_path: str, vuln_id: str | None) -> dict
     }
 
 
-def _load_candidate(report_path: str, config: AuditConfig, repo_url: str) -> _DisclosureCandidate:
+def _load_candidate(
+    report_path: str, config: AuditConfig, repo_url: str
+) -> _DisclosureCandidate:
     vuln_id = _vuln_id_from_report(report_path)
     finding_path = _find_finding_file(vuln_id, config.output_dir) if vuln_id else None
     finding: dict[str, Any] | None = None
@@ -217,27 +226,12 @@ async def _filter_semantic_duplicates(
     config: AuditConfig,
 ) -> list[_DisclosureCandidate]:
     """Compare candidates against database-backed Disclosure metadata."""
-    if not existing_entries:
-        return candidates
-
     logger.info(
         "Stage 6: Running semantic deduplication against %d existing entries.",
         len(existing_entries),
     )
 
-    existing_text = "\n\n".join(
-        (
-            f"Entry {i + 1}\n"
-            f"- dedupe_key: {entry.get('dedupe_key', '')}\n"
-            f"- title: {entry.get('title', '')}\n"
-            f"- location: {entry.get('location', '')}\n"
-            f"- cwe: {entry.get('cwe', '')}\n"
-            f"- vulnerability_class: {entry.get('vulnerability_class', '')}\n"
-            f"- trigger: {entry.get('trigger', '')}\n"
-            f"- summary: {entry.get('summary', '')}"
-        )
-        for i, entry in enumerate(existing_entries)
-    )
+    inventory = list(existing_entries)
     existing_keys = {
         str(entry.get("dedupe_key") or "")
         for entry in existing_entries
@@ -247,18 +241,60 @@ async def _filter_semantic_duplicates(
     filtered: list[_DisclosureCandidate] = []
     for candidate in candidates:
         label = _candidate_label(candidate)
-        prompt = load_prompt("stage6_semantic_dedupe.md", {
-            "candidate_title": candidate.title,
-            "candidate_location": single_line(candidate.finding.get("location")),
-            "candidate_cwe": ", ".join(display_list(candidate.finding.get("cwe_id") or candidate.finding.get("cwe"))),
-            "candidate_vuln_class": ", ".join(display_list(candidate.finding.get("vulnerability_class"))),
-            "candidate_trigger": single_line(candidate.finding.get("trigger")),
-            "candidate_summary": single_line(candidate.finding.get("summary") or candidate.finding.get("description")),
-            "existing_entries": existing_text,
-        })
+        entry = {
+            "dedupe_key": candidate.dedupe_key,
+            "title": candidate.title,
+            "location": single_line(candidate.finding.get("location")),
+            "cwe": ", ".join(
+                display_list(
+                    candidate.finding.get("cwe_id") or candidate.finding.get("cwe")
+                )
+            ),
+            "vulnerability_class": ", ".join(
+                display_list(candidate.finding.get("vulnerability_class"))
+            ),
+            "trigger": single_line(candidate.finding.get("trigger")),
+            "summary": single_line(
+                candidate.finding.get("summary") or candidate.finding.get("description")
+            ),
+        }
+        if not inventory:
+            filtered.append(candidate)
+            inventory.append(entry)
+            existing_keys.add(candidate.dedupe_key)
+            continue
+        existing_text = "\n\n".join(
+            f"Entry {i + 1}\n"
+            + "\n".join(f"- {key}: {known.get(key, '')}" for key in entry)
+            for i, known in enumerate(inventory)
+        )
+        prompt = load_prompt(
+            "stage6_semantic_dedupe.md",
+            {
+                "candidate_title": candidate.title,
+                "candidate_location": single_line(candidate.finding.get("location")),
+                "candidate_cwe": ", ".join(
+                    display_list(
+                        candidate.finding.get("cwe_id") or candidate.finding.get("cwe")
+                    )
+                ),
+                "candidate_vuln_class": ", ".join(
+                    display_list(candidate.finding.get("vulnerability_class"))
+                ),
+                "candidate_trigger": single_line(candidate.finding.get("trigger")),
+                "candidate_summary": single_line(
+                    candidate.finding.get("summary")
+                    or candidate.finding.get("description")
+                ),
+                "existing_entries": existing_text,
+            },
+        )
 
         log_file = os.path.join(
-            config.output_dir, "stage6-disclosures", ".dedupe-logs", f"{candidate.vuln_id or 'unknown'}.log"
+            config.output_dir,
+            "stage6-disclosures",
+            ".dedupe-logs",
+            f"{candidate.vuln_id or 'unknown'}.log",
         )
         try:
             result = await run_agent(
@@ -271,7 +307,9 @@ async def _filter_semantic_duplicates(
             )
             json_text = extract_json_object(result)
             if json_text is None:
-                raise json.JSONDecodeError("No JSON object found in response", result, 0)
+                raise json.JSONDecodeError(
+                    "No JSON object found in response", result, 0
+                )
             parsed = json.loads(json_text)
             decision = str(parsed.get("decision", "")).lower()
             matched_key = str(parsed.get("matched_dedupe_key", ""))
@@ -308,6 +346,9 @@ async def _filter_semantic_duplicates(
             )
 
         filtered.append(candidate)
+        # Later candidates must also see this batch's retained metadata.
+        inventory.append(entry)
+        existing_keys.add(candidate.dedupe_key)
 
     logger.info(
         "Stage 6: Semantic dedupe kept %d/%d candidates.",
@@ -353,7 +394,9 @@ def _filter_reproduced(stage5_reports: list[str]) -> list[str]:
     for report_path in stage5_reports:
         report_dir = Path(report_path).parent
         if report_dir.name.endswith("_fp"):
-            logger.info("Stage 6: Skipping false-positive Stage 5 report: %s", report_path)
+            logger.info(
+                "Stage 6: Skipping false-positive Stage 5 report: %s", report_path
+            )
             continue
 
         status = read_reproduction_status(report_path)
@@ -385,27 +428,28 @@ async def _run_disclosure(
     """Prepare disclosure artifacts for a single reproduced vulnerability."""
     vuln_id = _vuln_id_from_report(report_path)
     if not vuln_id:
-        logger.warning("Stage 6: Cannot extract vuln ID from %s, skipping.", report_path)
+        logger.warning(
+            "Stage 6: Cannot extract vuln ID from %s, skipping.", report_path
+        )
         return None
 
     key = _task_key(vuln_id)
     persistent_stage6_vuln_dir = os.path.join(
         config.output_dir, "stage6-disclosures", vuln_id
     )
-    persistent_disclosure_dir = os.path.join(
-        persistent_stage6_vuln_dir, "disclosure"
-    )
-    persistent_disclosure_report = os.path.join(
-        persistent_disclosure_dir, "report.md"
-    )
+    persistent_disclosure_dir = os.path.join(persistent_stage6_vuln_dir, "disclosure")
+    persistent_disclosure_report = os.path.join(persistent_disclosure_dir, "report.md")
 
     if checkpoint.is_complete(key):
-        logger.info("Stage 6: %s already complete, skipping.", vuln_id)
-        return (
-            persistent_disclosure_report
-            if os.path.exists(persistent_disclosure_report)
-            else None
-        )
+        issues = validate_stage6_disclosure(persistent_disclosure_dir)
+        if issues:
+            checkpoint.clear(key)
+            raise ValueError(
+                f"Stage 6: Invalid completed artifacts for {vuln_id}: "
+                + "; ".join(issue.description for issue in issues)
+            )
+        logger.info("Stage 6: %s already complete and validated, skipping.", vuln_id)
+        return persistent_disclosure_report
 
     logger.info("Stage 6: Starting disclosure preparation for %s.", vuln_id)
     sandbox: DockerScratch | None = None
@@ -424,9 +468,7 @@ async def _run_disclosure(
             poc_dir = str(copied_poc_dir)
             work_report_path = str(copied_poc_dir / "report.md")
             if finding_file:
-                finding_file = str(
-                    sandbox.copy_input(finding_file, "finding.json")
-                )
+                finding_file = str(sandbox.copy_input(finding_file, "finding.json"))
         except Exception:
             await sandbox.close()
             raise
@@ -453,15 +495,18 @@ async def _run_disclosure(
 
     poc_target = work_config.poc_worktree or work_config.target
 
-    prompt = load_prompt("stage6.md", {
-        "vuln_report_path": work_report_path,
-        "poc_dir": poc_dir,
-        "finding_reference": finding_reference,
-        "target_path": poc_target,
-        "disclosure_dir": disclosure_dir,
-        "vuln_id": vuln_id,
-        "wiki_context": build_wiki_context(config, stage=6),
-    })
+    prompt = load_prompt(
+        "stage6.md",
+        {
+            "vuln_report_path": work_report_path,
+            "poc_dir": poc_dir,
+            "finding_reference": finding_reference,
+            "target_path": poc_target,
+            "disclosure_dir": disclosure_dir,
+            "vuln_id": vuln_id,
+            "wiki_context": build_wiki_context(config, stage=6),
+        },
+    )
 
     log_file = os.path.join(stage6_vuln_dir, "agent.log")
     try:
@@ -475,6 +520,12 @@ async def _run_disclosure(
             log_file=log_file,
             sandbox=sandbox,
         )
+        issues = validate_stage6_disclosure(disclosure_dir)
+        if issues:
+            raise ValueError(
+                f"Stage 6: Invalid disclosure artifacts for {vuln_id}: "
+                + "; ".join(issue.description for issue in issues)
+            )
         if sandbox is not None:
             secure_generated_manifest_mode(disclosure_dir)
             manifest = export_retained_artifacts(
@@ -496,6 +547,12 @@ async def _run_disclosure(
                 vuln_id,
             )
             disclosure_report = persistent_disclosure_report
+            issues = validate_stage6_disclosure(persistent_disclosure_dir)
+            if issues:
+                raise ValueError(
+                    f"Stage 6: Invalid retained artifacts for {vuln_id}: "
+                    + "; ".join(issue.description for issue in issues)
+                )
     finally:
         if sandbox is not None:
             await sandbox.close()
@@ -514,7 +571,9 @@ async def run_stage6(
     """Prepare disclosure artifacts for each reproduced vulnerability in parallel."""
     reproduced = _filter_reproduced(stage5_reports)
     if not reproduced:
-        logger.info("Stage 6: No reproduced vulnerabilities to prepare disclosures for.")
+        logger.info(
+            "Stage 6: No reproduced vulnerabilities to prepare disclosures for."
+        )
         return []
 
     repo_url = capture_repo_identity(config.target).get("repo_url", "")
@@ -526,7 +585,10 @@ async def run_stage6(
     if not candidates:
         return []
 
-    logger.info("Stage 6: Preparing disclosures for %d reproduced vulnerabilities.", len(candidates))
+    logger.info(
+        "Stage 6: Preparing disclosures for %d reproduced vulnerabilities.",
+        len(candidates),
+    )
 
     results = await run_parallel_limited(
         candidates,
@@ -539,7 +601,11 @@ async def run_stage6(
         if i >= len(candidates):
             continue
         if status == "rejected":
-            logger.error("Stage 6: %s failed: %s", os.path.basename(candidates[i].report_path), error)
+            logger.error(
+                "Stage 6: %s failed: %s",
+                os.path.basename(candidates[i].report_path),
+                error,
+            )
             record_task_error(
                 config,
                 "stage6",
@@ -552,6 +618,7 @@ async def run_stage6(
 
     logger.info(
         "Stage 6 complete. %d disclosure packages prepared (from %d reproduced vulnerabilities).",
-        len(disclosure_reports), len(candidates),
+        len(disclosure_reports),
+        len(candidates),
     )
     return disclosure_reports

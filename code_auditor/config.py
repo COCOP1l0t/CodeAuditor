@@ -86,6 +86,10 @@ class AuditConfig:
     # evidence backfills set it so an old finding is never tested against a
     # newer, unrelated checkout.
     poc_source_commit: str | None = None
+    # Optional retained Disclosure/PoC directory supplied to a standalone
+    # latest-source reproduction.  Stage 5 treats it as read-only context: the
+    # new result is always written to this run's own output directory.
+    reproduction_reference_dir: str | None = None
     # Stage 5/6 use a disposable Docker workspace by default; Web settings may
     # instead select a detached host worktree. The only writable Docker bind
     # mount is a per-task directory below sandbox_root.
@@ -120,9 +124,7 @@ class AuditConfig:
     models_used: list[str] = field(default_factory=list, repr=False)
     # Web jobs attach a runtime-only observer so History can publish and
     # persist a newly used backend/model as soon as the invocation starts.
-    agent_history_changed: Callable[[], None] | None = field(
-        default=None, repr=False
-    )
+    agent_history_changed: Callable[[], None] | None = field(default=None, repr=False)
     # Runtime-only accumulator of token/cost usage across agent invocations.
     # Keys: agent_calls, input_tokens, output_tokens,
     # cache_creation_input_tokens, cache_read_input_tokens, cost_usd.
@@ -166,9 +168,7 @@ def local_claude_model(
 
 def local_codex_model(config_path: str | None = None) -> str | None:
     """Read the active model from the local Codex CLI configuration."""
-    path = config_path or os.path.join(
-        os.path.expanduser("~"), ".codex", "config.toml"
-    )
+    path = config_path or os.path.join(os.path.expanduser("~"), ".codex", "config.toml")
     try:
         with open(path, "rb") as stream:
             data = tomllib.load(stream)
@@ -210,9 +210,7 @@ def resolve_agent_model(config: AuditConfig, model: str | None = None) -> str:
 def select_poc_model(config: AuditConfig) -> str:
     if config.backend == "claude" and config.provider_mode == "local":
         return (
-            local_claude_model(
-                keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL")
-            )
+            local_claude_model(keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"))
             or config.model
             or DEFAULT_CLAUDE_POC_MODEL
         )

@@ -168,9 +168,7 @@ async def test_event_bus_bounds_twenty_thousand_slow_client_events() -> None:
     bus.publish({"type": "log", "level": "ERROR", "message": "keep error"})
     bus.publish({"type": "stage", "stage": 3, "status": "done"})
     for index in range(100):
-        bus.publish(
-            {"type": "log", "level": "INFO", "message": f"tail {index}"}
-        )
+        bus.publish({"type": "log", "level": "INFO", "message": f"tail {index}"})
     await asyncio.sleep(0)
 
     assert queue.qsize() <= 50
@@ -316,13 +314,16 @@ async def test_manager_hot_switches_active_run_config_params_and_history(
         event.get("type") == "log" and "subsequent calls" in event.get("message", "")
         for event in job.bus.backlog()
     )
-    assert manager.hot_switch_agent_settings(
-        backend="claude",
-        model="new-model",
-        provider_mode="custom",
-        provider_base_url="https://new.example.test/v1",
-        provider_api_key="new-secret",
-    ) == []
+    assert (
+        manager.hot_switch_agent_settings(
+            backend="claude",
+            model="new-model",
+            provider_mode="custom",
+            provider_base_url="https://new.example.test/v1",
+            provider_api_key="new-secret",
+        )
+        == []
+    )
 
     release.set()
     await job.task
@@ -463,9 +464,7 @@ async def test_concurrent_jobs_on_different_targets(tmp_path, monkeypatch) -> No
         assert job_events
         assert all(e["job_key"] == job.job_key for e in job_events)
     # The manager-level bus saw both jobs' lifecycle events.
-    global_keys = {
-        e["job_key"] for e in manager.bus.backlog() if e["type"] == "job"
-    }
+    global_keys = {e["job_key"] for e in manager.bus.backlog() if e["type"] == "job"}
     assert global_keys == {job_a.job_key, job_b.job_key}
 
 
@@ -534,9 +533,7 @@ async def test_start_rejects_low_history_database_free_space(
     monkeypatch.setattr(
         job_module.shutil,
         "disk_usage",
-        lambda _path: SimpleNamespace(
-            free=job_module.MIN_HISTORY_WRITE_FREE_BYTES - 1
-        ),
+        lambda _path: SimpleNamespace(free=job_module.MIN_HISTORY_WRITE_FREE_BYTES - 1),
     )
 
     with pytest.raises(JobValidationError, match="preserve terminal state"):
@@ -1053,16 +1050,12 @@ async def test_checkout_recorded_revision_restores_commit_and_branch(tmp_path) -
     git("commit", "-am", "second")
     second_commit = git("rev-parse", "HEAD")
 
-    await job_module._checkout_recorded_revision(
-        str(repo), first_commit, "main"
-    )
+    await job_module._checkout_recorded_revision(str(repo), first_commit, "main")
     assert git("rev-parse", "HEAD") == first_commit
     assert git("rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
     assert (repo / "source.c").read_text(encoding="utf-8") == "first\n"
 
-    await job_module._checkout_recorded_revision(
-        str(repo), second_commit, "main"
-    )
+    await job_module._checkout_recorded_revision(str(repo), second_commit, "main")
     assert git("rev-parse", "HEAD") == second_commit
     assert git("rev-parse", "--abbrev-ref", "HEAD") == "main"
 
@@ -1176,33 +1169,67 @@ async def test_start_with_invalid_wiki_raises(tmp_path) -> None:
         )
 
 
-async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
+async def test_disclosure_reproduction_pins_latest_and_runs_review_in_isolated_tree(
     tmp_path, monkeypatch
 ) -> None:
     wiki = tmp_path / "wikis" / "qemu-security"
     wiki.mkdir(parents=True)
     (wiki / "index.md").write_text("# Wiki\n", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    reference = tmp_path / "previous-disclosure"
+    reference.mkdir()
+    (reference / "report.md").write_text("# Previous\n", encoding="utf-8")
+    persisted = {}
 
     class FakeStore:
-        def get_reproduction_candidate(self, run_id, vuln_id):
-            assert (run_id, vuln_id) == (7, "H-03")
+        db_path = ""
+
+        def get_disclosure_reproduction_candidate(self, project, dedupe_key):
+            assert (project, dedupe_key) == ("qemu", "sha256:" + "b" * 64)
             return {
+                "disclosure_id": 4,
+                "project": "qemu",
+                "dedupe_key": "sha256:" + "b" * 64,
+                "source_run_id": 7,
+                "source_vuln_id": "H-03",
                 "run_id": 7,
                 "vuln_id": "H-03",
                 "title": "Retest me",
                 "repo_name": "qemu",
-                "commit": "a" * 40,
+                "audited_commit": "a" * 40,
+                "base_commit": "a" * 40,
                 "target": str(tmp_path),
+                "repo_url": "https://example.test/qemu.git",
                 "severity": "high",
                 "cvss_score": 8.1,
                 "wiki_path": str(wiki),
+                "reference_dir": str(reference),
                 "raw_json": json.dumps({"id": "H-03", "title": "Retest me"}),
             }
 
+        def create_reproduction(self, **values):
+            persisted["created"] = values
+
+        def set_reproduction_revision(self, job_key, **values):
+            persisted["revision"] = {"job_key": job_key, **values}
+
+        def finish_reproduction(self, job_key, **values):
+            persisted["finished"] = {"job_key": job_key, **values}
+
     async def fake_create_worktree(repo, commit, destination):
         assert repo == str(tmp_path)
-        assert commit == "a" * 40
+        assert commit == "c" * 40
         Path(destination).mkdir(parents=True)
+
+    async def fake_resolve_latest(repo, expected_url):
+        assert (repo, expected_url) == (
+            str(tmp_path),
+            "https://example.test/qemu.git",
+        )
+        return "refs/heads/main", "c" * 40, expected_url
+
+    async def fake_remove_worktree(repo, destination):
+        persisted["removed"] = (repo, destination)
 
     async def fake_run_stage5(vulnerabilities, config, checkpoint):
         assert len(vulnerabilities) == 1
@@ -1211,6 +1238,13 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
         assert config.sandbox_enabled is True
         assert config.sandbox_network_enabled is False
         assert config.sandbox_runtime == "runsc"
+        assert config.reproduction_reference_dir != str(reference)
+        assert (
+            Path(config.reproduction_reference_dir, "report.md").read_text(
+                encoding="utf-8"
+            )
+            == "# Previous\n"
+        )
         report = Path(config.output_dir) / "stage5-pocs" / "H-03" / "report.md"
         report.parent.mkdir(parents=True)
         report.write_text(
@@ -1218,15 +1252,35 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
         )
         return [str(report)]
 
+    async def fake_review(config, **kwargs):
+        assert kwargs["outcome"] == "reproduced"
+        assert config.poc_source_commit == "c" * 40
+        return {
+            "disposition": "still-vulnerable",
+            "summary": "Still vulnerable on remote HEAD.",
+            "source_analysis": "The guard remains missing.",
+            "disclosure_update": "Refresh the tested commit.",
+            "assessment_path": str(reproduction_root / "output" / "assessment.json"),
+            "retest_report_path": kwargs["retest_report_path"],
+            "draft_path": str(reproduction_root / "output" / "draft"),
+        }
+
     monkeypatch.setattr(job_module, "_create_detached_worktree", fake_create_worktree)
+    monkeypatch.setattr(
+        job_module, "_resolve_latest_remote_commit", fake_resolve_latest
+    )
+    monkeypatch.setattr(
+        job_module, "_remove_reproduction_worktree", fake_remove_worktree
+    )
     monkeypatch.setattr(job_module, "run_stage5", fake_run_stage5)
+    monkeypatch.setattr(job_module, "run_reproduction_review", fake_review)
     manager = AuditJobManager(store=FakeStore())
     reproduction_root = tmp_path / "reproduction"
 
     job = await manager.start_reproduction(
         ReproductionStartParams(
-            run_id=7,
-            vuln_id="H-03",
+            project="qemu",
+            dedupe_key="sha256:" + "b" * 64,
             backend="codex",
             output_dir=str(reproduction_root),
             wikis_dir=str(tmp_path / "wikis"),
@@ -1246,6 +1300,114 @@ async def test_standalone_reproduction_runs_only_stage5_in_isolated_tree(
     assert job.config.sandbox_run_id is None
     assert job.reproduction_candidate["vuln_id"] == "H-03"
     assert len(job.reproduction_reports) == 1
+    assert job.reproduction_candidate["tested_commit"] == "c" * 40
+    assert persisted["revision"]["target_ref"] == "refs/heads/main"
+    assert persisted["finished"]["outcome"] == "reproduced"
+    assert persisted["finished"]["disposition"] == "still-vulnerable"
+    assert persisted["removed"][0] == str(tmp_path)
+
+
+async def test_latest_reproduction_fetches_remote_head_without_moving_checkout(
+    tmp_path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main", str(seed))
+    git("config", "user.email", "test@example.test", cwd=seed)
+    git("config", "user.name", "CodeAuditor Test", cwd=seed)
+    (seed / "tracked.txt").write_text("one\n", encoding="utf-8")
+    git("add", "tracked.txt", cwd=seed)
+    git("commit", "-m", "one", cwd=seed)
+    first = git("rev-parse", "HEAD", cwd=seed)
+    git("remote", "add", "origin", str(remote), cwd=seed)
+    git("push", "-u", "origin", "main", cwd=seed)
+    git("symbolic-ref", "HEAD", "refs/heads/main", cwd=remote)
+    git("clone", str(remote), str(checkout))
+
+    (seed / "tracked.txt").write_text("two\n", encoding="utf-8")
+    git("commit", "-am", "two", cwd=seed)
+    second = git("rev-parse", "HEAD", cwd=seed)
+    git("push", "origin", "main", cwd=seed)
+
+    (
+        target_ref,
+        tested_commit,
+        actual_url,
+    ) = await job_module._resolve_latest_remote_commit(str(checkout), str(remote))
+
+    assert target_ref == "refs/heads/main"
+    assert tested_commit == second
+    assert actual_url == str(remote)
+    assert git("rev-parse", "HEAD", cwd=checkout) == first
+    assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "one\n"
+
+
+async def test_reproduction_git_disables_prompts_and_remote_helpers(
+    tmp_path, monkeypatch
+) -> None:
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok\n", b""
+
+    async def fake_subprocess(*args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+
+    assert await job_module._run_reproduction_git(str(tmp_path), "status") == "ok"
+    assert captured["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert captured["env"]["GIT_PROTOCOL_FROM_USER"] == "0"
+    assert captured["env"]["GIT_ALLOW_PROTOCOL"] == "https:ssh:file"
+
+
+def test_git_worktree_marker_is_accepted_as_checkout(tmp_path) -> None:
+    (tmp_path / ".git").write_text("gitdir: /tmp/example\n", encoding="utf-8")
+
+    assert job_module._is_git_checkout(str(tmp_path)) is True
+
+
+def test_reproduction_reference_snapshot_skips_symlinks_and_preserves_source(
+    tmp_path,
+) -> None:
+    source = tmp_path / "active-disclosure"
+    source.mkdir()
+    (source / "report.md").write_text("active\n", encoding="utf-8")
+    (source / "reproduce.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (source / "reproduce.sh").chmod(0o700)
+    (source / "escape").symlink_to(tmp_path / "outside")
+
+    snapshot = Path(
+        job_module._snapshot_reproduction_reference(
+            str(source),
+            str(tmp_path / "snapshot"),
+            max_file_bytes=1024,
+            max_total_bytes=4096,
+        )
+    )
+
+    assert (snapshot / "report.md").read_text(encoding="utf-8") == "active\n"
+    assert os.access(snapshot / "reproduce.sh", os.X_OK)
+    assert not (snapshot / "escape").exists()
+    assert (source / "report.md").read_text(encoding="utf-8") == "active\n"
+
+
+def test_disclosure_revision_component_cannot_escape_directory() -> None:
+    assert server_module._safe_revision_component("x/../../outside") == "x-outside"
+    assert server_module._safe_revision_component("") == "previous"
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
@@ -1313,9 +1475,7 @@ def _make_output_dir(base) -> str:
 
 
 def _write_web_stage6_retention(output_dir: str) -> Path:
-    disclosure = (
-        Path(output_dir) / "stage6-disclosures" / "H-01" / "disclosure"
-    )
+    disclosure = Path(output_dir) / "stage6-disclosures" / "H-01" / "disclosure"
     reproduce = disclosure / "reproduce.sh"
     reproduce.write_text("#!/bin/sh\nprintf 'reproduced\\n'\n", encoding="utf-8")
     reproduce.chmod(0o700)
@@ -1383,9 +1543,7 @@ def _write_web_stage5_evidence(output_dir: str) -> None:
             }
         ],
     }
-    (poc / "trigger-graph.json").write_text(
-        json.dumps(graph), encoding="utf-8"
-    )
+    (poc / "trigger-graph.json").write_text(json.dumps(graph), encoding="utf-8")
     (poc / "asan-report.txt").write_text(
         "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
         "    #0 0x1 in memcpy src/a.c:2\n"
@@ -1579,9 +1737,7 @@ def test_api_settings_hot_switches_active_jobs(tmp_path, monkeypatch) -> None:
         captured.update(kwargs)
         return ["7", "repro-abc123def456"]
 
-    monkeypatch.setattr(
-        app.state.manager, "hot_switch_agent_settings", fake_hot_switch
-    )
+    monkeypatch.setattr(app.state.manager, "hot_switch_agent_settings", fake_hot_switch)
     response = TestClient(app).put(
         "/api/settings",
         json={
@@ -1621,16 +1777,19 @@ def test_api_audit_snapshots_selected_provider_settings(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(app.state.manager, "start", fake_start)
     client = TestClient(app)
-    assert client.put(
-        "/api/settings",
-        json={
-            "backend": "claude",
-            "mode": "custom",
-            "base_url": "https://claude.example.test",
-            "api_key": "secret-key",
-            "model": "claude-compatible-model",
-        },
-    ).status_code == 200
+    assert (
+        client.put(
+            "/api/settings",
+            json={
+                "backend": "claude",
+                "mode": "custom",
+                "base_url": "https://claude.example.test",
+                "api_key": "secret-key",
+                "model": "claude-compatible-model",
+            },
+        ).status_code
+        == 200
+    )
 
     response = client.post("/api/audit", json={"repository": repository})
 
@@ -1650,14 +1809,16 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert res.status_code == 200
     assert res.headers["cache-control"] == "no-store"
     assert "CodeAuditor" in res.text
-    assert '<link rel="icon" href="/static/icon.svg" type="image/svg+xml" />' in res.text
+    assert (
+        '<link rel="icon" href="/static/icon.svg" type="image/svg+xml" />' in res.text
+    )
     assert '<img class="logo-mark" src="/static/icon.svg"' in res.text
     assert 'data-route="dashboard"' in res.text
     assert 'id="view-dashboard"' in res.text
     assert 'src="/static/code-auditor-8bit.png"' in res.text
     assert 'id="r-target-select"' in res.text
-    assert 'id="r-commit-select"' in res.text
     assert 'id="r-bug-select"' in res.text
+    assert 'id="reproduction-history-table"' in res.text
     assert 'id="f-repo-select"' in res.text
     assert 'id="f-git-url"' in res.text
     assert 'id="f-local-directory-path"' in res.text
@@ -1704,7 +1865,7 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="s-backend"' in res.text
     assert 'id="s-mode"' in res.text
     assert "Active jobs switch on their next agent call" in res.text
-    assert res.text.count('class="table-shell') == 4
+    assert res.text.count('class="table-shell') == 5
     assert 'class="table-shell history-table-shell"' in res.text
     assert 'id="history-search"' in res.text
     assert 'id="history-status"' in res.text
@@ -1712,9 +1873,11 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="history-page-size"' in res.text
     assert 'id="history-prev"' in res.text
     assert 'id="history-next"' in res.text
-    assert 'data-route="reproduction"' not in res.text
-    assert 'href="#/reproduction"' not in res.text
+    assert 'data-route="reproduction"' in res.text
+    assert 'href="#/reproduction"' in res.text
     assert 'id="trash-table"' in res.text
+    assert 'id="trash-select-all"' in res.text
+    assert 'id="trash-purge-selected"' in res.text
     assert 'class="col-disclosure-title"' in res.text
     assert 'class="col-cve-local"' in res.text
     assert "⚡" not in res.text
@@ -1736,8 +1899,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     script = client.get("/static/app.js")
     assert script.status_code == 200
     assert script.headers["cache-control"] == "no-cache"
-    assert "Current reproduction status" in script.text
-    assert "populateReproductionCommits" in script.text
+    assert "Original PoC status" in script.text
+    assert "loadReproductionHistory" in script.text
     assert "openPocTerminal" in script.text
     assert "disclosureTerminalButtonHtml" in script.text
     assert "activatePocTerminal" in script.text
@@ -1752,6 +1915,7 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "moveDisclosureToTrash" in script.text
     assert 'if (e.review_status === "slop")' not in script.text
     assert "restoreDisclosure" in script.text
+    assert "purgeSelectedTrash" in script.text
     assert "refreshTrashCount" in script.text
     assert "duration_known" in script.text
     assert "durationKnownByRun" in script.text
@@ -1816,9 +1980,7 @@ def test_api_cves_imports_only_selected_local_disclosures(tmp_path) -> None:
     app.state.store.import_output_dir(_make_output_dir(tmp_path))
     disclosure = app.state.store.list_disclosed()[0]
     key = disclosure["dedupe_key"]
-    assert app.state.store.set_disclosed_status(
-        disclosure["project"], key, "confirmed"
-    )
+    assert app.state.store.set_disclosed_status(disclosure["project"], key, "confirmed")
 
     res = client.get("/api/cves")
     assert res.status_code == 200
@@ -1849,9 +2011,9 @@ def test_api_cves_imports_only_selected_local_disclosures(tmp_path) -> None:
         {"label": "Upstream advisory", "url": "https://example.com/advisory/12345"}
     ]
     assert client.get("/api/cves").json()["total"] == 1
-    assert client.get(
-        "/api/cves", params={"project": "test-project"}
-    ).json()["total"] == 1
+    assert (
+        client.get("/api/cves", params={"project": "test-project"}).json()["total"] == 1
+    )
 
     updated = client.put(
         "/api/cves/CVE-2026-12345",
@@ -2046,9 +2208,7 @@ def test_slop_disclosure_terminal_starts_from_registered_stage5_artifact(
         }
     )
     with pytest.raises(WebSocketDisconnect) as bad_token:
-        with client.websocket_connect(
-            f"/ws/disclosure-terminal?{bad_token_params}"
-        ):
+        with client.websocket_connect(f"/ws/disclosure-terminal?{bad_token_params}"):
             pass
     assert bad_token.value.code == 1008
 
@@ -2116,9 +2276,7 @@ def test_api_selects_and_starts_audit_for_local_directory(
     app = _make_app(tmp_path)
     captured = {}
 
-    monkeypatch.setattr(
-        server_module, "choose_local_directory", lambda: str(target)
-    )
+    monkeypatch.setattr(server_module, "choose_local_directory", lambda: str(target))
 
     class FakeJob:
         @staticmethod
@@ -2160,9 +2318,7 @@ def test_api_local_directory_picker_handles_cancel_and_rejects_root(
     assert unauthorized.status_code == 403
 
     monkeypatch.setattr(server_module, "choose_local_directory", lambda: None)
-    cancelled = client.post(
-        "/api/local-directories/select", headers=picker_headers
-    )
+    cancelled = client.post("/api/local-directories/select", headers=picker_headers)
     assert cancelled.status_code == 200
     assert cancelled.json() == {"cancelled": True}
 
@@ -2321,9 +2477,7 @@ def test_api_full_job_lifecycle_and_results(tmp_path, monkeypatch) -> None:
         )
         assert res.status_code == 400
 
-        res = client.get(
-            f"/api/history/{run_id}/file", params={"path": "nope.json"}
-        )
+        res = client.get(f"/api/history/{run_id}/file", params={"path": "nope.json"})
         assert res.status_code == 404
 
     # The completed job was recorded in the history database.
@@ -2581,7 +2735,9 @@ def test_api_rejects_resume_of_clean_done_history_run(tmp_path) -> None:
     assert client.post(f"/api/history/{run_id}/resume").status_code == 400
 
 
-async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch) -> None:
+async def test_audit_with_failed_tasks_finishes_as_failed(
+    tmp_path, monkeypatch
+) -> None:
     target = tmp_path / "target"
     target.mkdir()
     params = AuditStartParams(target=str(target))
@@ -2595,8 +2751,12 @@ async def test_audit_with_failed_tasks_finishes_as_failed(tmp_path, monkeypatch)
     async def fake_run_audit(cfg, reporter=None):
         cfg.backends_used.extend(["claude", "codex"])
         cfg.models_used.append("model-x")
-        cfg.usage_stats.update({"agent_calls": 2, "input_tokens": 900, "cost_usd": 0.03})
-        cfg.task_errors.append("stage5:H-03: Agent ended with an error result: API Error: 400")
+        cfg.usage_stats.update(
+            {"agent_calls": 2, "input_tokens": 900, "cost_usd": 0.03}
+        )
+        cfg.task_errors.append(
+            "stage5:H-03: Agent ended with an error result: API Error: 400"
+        )
 
     monkeypatch.setattr(job_module, "run_audit", fake_run_audit)
 
@@ -2747,9 +2907,7 @@ def test_api_history_import_rejects_paths_outside_managed_results(tmp_path) -> N
     outside.mkdir()
     client = TestClient(_make_app(tmp_path))
 
-    res = client.post(
-        "/api/history/import", json={"output_dir": str(outside)}
-    )
+    res = client.post("/api/history/import", json={"output_dir": str(outside)})
     assert res.status_code == 400
     assert "managed results" in res.json()["detail"].lower()
 
@@ -2778,9 +2936,7 @@ def test_api_history_import_rejects_symlink_escape(tmp_path) -> None:
 def test_api_history_run_not_found_returns_404(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
     assert client.get("/api/history/999").status_code == 404
-    assert (
-        client.get("/api/history/999/file", params={"path": "x"}).status_code == 404
-    )
+    assert client.get("/api/history/999/file", params={"path": "x"}).status_code == 404
 
 
 def test_api_history_file_path_traversal_returns_400(tmp_path) -> None:
@@ -2845,9 +3001,7 @@ async def test_start_with_git_url_clone_failure_marks_failed(
     monkeypatch.setattr(job_module, "ensure_repo", fake_ensure_repo)
 
     manager = AuditJobManager()
-    job = await manager.start(
-        AuditStartParams(git_url="https://example.com/x/y.git")
-    )
+    job = await manager.start(AuditStartParams(git_url="https://example.com/x/y.git"))
     await job.task
 
     assert job.state == STATE_FAILED
@@ -2948,6 +3102,109 @@ def test_api_reproduction_rejects_frontend_configuration_fields(tmp_path) -> Non
 def test_api_reproduction_rejects_invalid_candidate_ids(tmp_path, payload) -> None:
     client = TestClient(_make_app(tmp_path))
     assert client.post("/api/reproduction", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"project": "test-project"},
+        {"run_id": 1},
+        {"project": "test-project", "run_id": 1, "vuln_id": "H-01"},
+        {
+            "project": "test-project",
+            "dedupe_key": "sha256:" + "1" * 64,
+            "run_id": 1,
+        },
+    ],
+)
+def test_api_reproduction_requires_one_complete_identity(tmp_path, payload) -> None:
+    client = TestClient(_make_app(tmp_path))
+    assert client.post("/api/reproduction", json=payload).status_code == 422
+
+
+def test_apply_reproduction_draft_archives_previous_disclosure(
+    tmp_path, monkeypatch
+) -> None:
+    out = _make_output_dir(tmp_path)
+    client = TestClient(_make_app(tmp_path))
+    assert (
+        client.post("/api/history/import", json={"output_dir": out}).status_code == 201
+    )
+    store = client.app.state.store
+    public = store.list_reproduction_candidates()[0]
+    candidate = store.get_disclosure_reproduction_candidate(
+        public["project"], public["dedupe_key"]
+    )
+    assert candidate is not None
+
+    job_key = "repro-123456789abc"
+    root = tmp_path / "reproductions" / job_key
+    draft = root / "output" / "reproduction-review" / "disclosure-draft"
+    draft.mkdir(parents=True)
+    for name, content in (
+        ("report.md", "# Refreshed report\n"),
+        ("email.txt", "Subject: Refreshed\n\nBody\n"),
+        ("reproduce.sh", "#!/bin/sh\nexit 0\n"),
+    ):
+        (draft / name).write_text(content, encoding="utf-8")
+    (draft / "disclosure.zip").write_bytes(b"PK\x05\x06")
+    (draft / "reproduce.sh").chmod(0o700)
+    manifest = {
+        "schema_version": 1,
+        "entrypoint": "reproduce.sh",
+        "files": [
+            {"path": "report.md", "role": "report"},
+            {"path": "email.txt", "role": "disclosure"},
+            {"path": "disclosure.zip", "role": "disclosure"},
+            {"path": "reproduce.sh", "role": "entrypoint"},
+        ],
+    }
+    manifest_path = draft / "retain-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_path.chmod(0o600)
+    (draft / "unregistered.txt").write_text("must not be applied\n", encoding="utf-8")
+    store.create_reproduction(
+        job_key=job_key,
+        candidate=candidate,
+        output_dir=str(root),
+        backend="codex",
+        model="test",
+        sandbox_mode="local-worktree",
+        sandbox_runtime="docker-default",
+        started_at=10.0,
+    )
+    store.set_reproduction_revision(
+        job_key, target_ref="refs/heads/main", tested_commit="d" * 40
+    )
+    store.finish_reproduction(
+        job_key,
+        state="done",
+        ended_at=20.0,
+        outcome="reproduced",
+        disposition="still-vulnerable",
+        evidence_level="runtime",
+        draft_path=str(draft),
+    )
+    monkeypatch.setattr(server_module, "validate_stage6_disclosure", lambda path: [])
+
+    response = client.post(f"/api/reproduction/{job_key}/apply")
+
+    assert response.status_code == 200
+    active = Path(candidate["reference_dir"])
+    assert (active / "report.md").read_text(encoding="utf-8") == "# Refreshed report\n"
+    assert not (active / "unregistered.txt").exists()
+    revisions = list((active.parent / "revisions").glob("*/report.md"))
+    assert len(revisions) == 1
+    assert revisions[0].read_text(encoding="utf-8") == "# Local vulnerability report\n"
+    record = store.get_reproduction(job_key)
+    assert record is not None and record["applied_at"] is not None
+    disclosure = next(
+        entry
+        for entry in store.list_disclosed(project=public["project"])
+        if entry["dedupe_key"] == public["dedupe_key"]
+    )
+    assert disclosure["audited_commit"] == "d" * 40
+    assert disclosure["review_status"] == "unreviewed"
 
 
 def test_api_start_with_git_url(tmp_path, monkeypatch) -> None:
@@ -3206,9 +3463,12 @@ def test_api_any_disclosure_moves_to_trash_and_restores(
         "dedupe_key": entry["dedupe_key"],
     }
 
-    assert client.post(
-        "/api/disclosures/status", json={**identity, "status": review_status}
-    ).status_code == 200
+    assert (
+        client.post(
+            "/api/disclosures/status", json={**identity, "status": review_status}
+        ).status_code
+        == 200
+    )
     moved = client.post("/api/disclosures/trash", json=identity)
     assert moved.status_code == 200
     assert moved.json()["retention_days"] == 30
@@ -3220,13 +3480,19 @@ def test_api_any_disclosure_moves_to_trash_and_restores(
     assert trash["projects"] == ["test-project"]
     assert trash["entries"][0]["review_status"] == review_status
     assert trash["entries"][0]["purge_at"] > trash["entries"][0]["deleted_at"]
-    assert client.get(
-        "/api/disclosures/artifact",
-        params={**identity, "artifact": 0},
-    ).status_code == 404
-    assert client.post(
-        "/api/disclosures/status", json={**identity, "status": "reported"}
-    ).status_code == 404
+    assert (
+        client.get(
+            "/api/disclosures/artifact",
+            params={**identity, "artifact": 0},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            "/api/disclosures/status", json={**identity, "status": "reported"}
+        ).status_code
+        == 404
+    )
 
     restored = client.post("/api/disclosures/restore", json=identity)
     assert restored.status_code == 200
@@ -3260,6 +3526,39 @@ def test_api_purge_disclosure_trash(tmp_path) -> None:
     assert client.get("/api/disclosures").json()["entries"] == []
 
 
+def test_api_purge_selected_disclosure_trash_deletes_stage5_and_stage6(
+    tmp_path,
+) -> None:
+    app = _make_app(tmp_path)
+    output = _make_output_dir(tmp_path)
+    app.state.store.import_output_dir(output)
+    client = TestClient(app)
+    entry = client.get("/api/disclosures").json()["entries"][0]
+    identity = {
+        "project": entry["project"],
+        "dedupe_key": entry["dedupe_key"],
+    }
+    assert client.post("/api/disclosures/trash", json=identity).status_code == 200
+
+    response = client.post(
+        "/api/disclosures/trash/purge-selected",
+        json={"entries": [identity]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["removed"] == 1
+    assert client.get("/api/disclosures/trash").json()["total"] == 0
+    output_path = Path(output)
+    assert not (output_path / "stage5-pocs" / "H-01").exists()
+    assert not (output_path / "stage6-disclosures" / "H-01" / "disclosure").exists()
+    assert (
+        client.post(
+            "/api/disclosures/trash/purge-selected", json={"entries": []}
+        ).status_code
+        == 422
+    )
+
+
 def test_api_disclosure_artifact_uses_database_registered_path(tmp_path) -> None:
     app = _make_app(tmp_path)
     app.state.store.import_output_dir(_make_output_dir(tmp_path))
@@ -3282,14 +3581,17 @@ def test_api_disclosure_artifact_uses_database_registered_path(tmp_path) -> None
     )
     assert response.status_code == 200
     assert response.content == b"# Local vulnerability report\n"
-    assert client.get(
-        "/api/disclosures/artifact",
-        params={
-            "project": disclosure["project"],
-            "dedupe_key": disclosure["dedupe_key"],
-            "artifact": 32,
-        },
-    ).status_code == 404
+    assert (
+        client.get(
+            "/api/disclosures/artifact",
+            params={
+                "project": disclosure["project"],
+                "dedupe_key": disclosure["dedupe_key"],
+                "artifact": 32,
+            },
+        ).status_code
+        == 404
+    )
 
 
 def test_api_serves_registered_graph_and_asan_to_disclosure_and_cve(tmp_path) -> None:
@@ -3362,6 +3664,4 @@ def test_api_target_merged(tmp_path, monkeypatch) -> None:
     assert body["vulnerabilities"][0]["vuln_id"] == "H-01"
 
     assert client.get("/api/target/sha256:nope").status_code == 400
-    assert (
-        client.get("/api/target/" + "sha256:" + "2" * 64).status_code == 404
-    )
+    assert client.get("/api/target/" + "sha256:" + "2" * 64).status_code == 404

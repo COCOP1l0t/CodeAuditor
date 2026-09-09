@@ -105,6 +105,10 @@
         <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         <span>Disclosures</span>
       </a>
+      <a href="#/reproduction" class="tab" data-route="reproduction" aria-label="Reproduce" title="Reproduce">
+        <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><polyline points="20 4 20 11 13 11"/><path d="m10 9 5 3-5 3z"/></svg>
+        <span>Reproduce</span>
+      </a>
       <a href="#/trash" class="tab" data-route="trash" aria-label="Recycle Bin" title="Recycle Bin">
         <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M8 6V4h8v2M19 6l-1 15H6L5 6"/><line x1="10" y1="10" x2="10" y2="17"/><line x1="14" y1="10" x2="14" y2="17"/></svg>
         <span>Recycle Bin</span>
@@ -522,11 +526,11 @@
 
     <div id="view-reproduction" hidden>
       <section class="panel">
-        <h2>Standalone Reproduction</h2>
+        <h2>Latest-source Reproduction</h2>
         <p class="dim">
-          Retest one vulnerability whose History PoC status is exactly
-          <code>reproduced</code>. The source commit is checked out in an isolated
-          Git worktree; the original audit output is not modified.
+          Select a Disclosure vulnerability. CodeAuditor fetches the remote default
+          branch, pins its exact commit, retests in the configured sandbox, and asks
+          the Agent to prepare an evidence-bounded Disclosure update.
         </p>
         <form id="reproduction-form">
           <div class="form-grid">
@@ -537,15 +541,9 @@
               </select>
             </label>
             <label>
-              Commit
-              <select id="r-commit-select" required disabled>
-                <option value="">— select a commit —</option>
-              </select>
-            </label>
-            <label>
-              Reproduced vulnerability
+              Disclosure vulnerability
               <select id="r-bug-select" required disabled>
-                <option value="">— select a reproduced bug —</option>
+                <option value="">— select a Disclosure —</option>
               </select>
               <span class="hint" id="r-bug-count">Loading candidates…</span>
             </label>
@@ -566,8 +564,16 @@
             <tr><th>#</th><th>Stage</th><th>Description</th><th>Status</th><th>Progress</th></tr>
           </thead>
           <tbody>
-            <tr id="reproduction-stage-row">
+            <tr id="reproduction-stage-row-0">
+              <td>0</td><td>Resolve</td><td class="stage-desc">Fetch and pin remote HEAD</td>
+              <td class="stage-status">Pending</td><td class="stage-progress"></td>
+            </tr>
+            <tr id="reproduction-stage-row-5">
               <td>5</td><td>PoC</td><td class="stage-desc">Retest the selected vulnerability</td>
+              <td class="stage-status">Pending</td><td class="stage-progress"></td>
+            </tr>
+            <tr id="reproduction-stage-row-6">
+              <td>6</td><td>Review</td><td class="stage-desc">Analyze and prepare Disclosure update</td>
               <td class="stage-status">Pending</td><td class="stage-progress"></td>
             </tr>
           </tbody>
@@ -604,12 +610,26 @@
             <h3>Agent Logs</h3>
             <ul id="reproduction-agent-logs" class="file-list"></ul>
           </div>
+          <div>
+            <h3>Review</h3>
+            <ul id="reproduction-review-files" class="file-list"></ul>
+          </div>
         </div>
       </section>
 
       <section class="panel" id="reproduction-viewer-panel" hidden>
         <h2 id="reproduction-viewer-title">File</h2>
         <pre id="reproduction-viewer-content"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>Reproduction History</h2>
+        <div class="table-shell" tabindex="0" aria-label="Reproduction history">
+          <table id="reproduction-history-table">
+            <thead><tr><th>Started</th><th>Project</th><th>Commit</th><th>Outcome</th><th>Agent disposition</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </section>
     </div><!-- /view-reproduction -->
 
@@ -744,7 +764,7 @@
         <header class="registry-header">
           <div>
             <h2>Disclosure Recycle Bin</h2>
-            <p>Deleted Disclosure records remain recoverable for 30 days. On expiry, the linked Stage 6 disclosure directory is deleted; Stage 5 PoC files are retained.</p>
+            <p>Deleted Disclosure records remain recoverable for 30 days. Permanent cleanup removes the linked Stage 5 PoC and Stage 6 Disclosure artifacts.</p>
           </div>
         </header>
         <div class="registry-toolbar registry-toolbar-trash">
@@ -760,6 +780,9 @@
             </select>
           </label>
           <span id="trash-count" class="record-count" aria-live="polite"></span>
+          <button type="button" id="trash-purge-selected" class="btn btn-delete" disabled>
+            Delete selected
+          </button>
           <button type="button" id="trash-purge-all" class="btn btn-delete" disabled>
             Empty recycle bin
           </button>
@@ -768,12 +791,14 @@
         <div class="table-shell" tabindex="0" aria-label="Deleted Disclosure records">
           <table id="trash-table">
             <colgroup>
+              <col class="col-trash-select">
               <col class="col-trash-deleted"><col class="col-trash-expiry">
               <col class="col-trash-project"><col class="col-trash-title">
               <col class="col-trash-status"><col class="col-trash-actions">
             </colgroup>
             <thead>
               <tr>
+                <th class="selection-cell"><input id="trash-select-all" type="checkbox" aria-label="Select all visible deleted disclosures"></th>
                 <th>Deleted</th><th>Permanent deletion</th><th>Project</th>
                 <th>Title</th><th>Status</th><th>Actions</th>
               </tr>

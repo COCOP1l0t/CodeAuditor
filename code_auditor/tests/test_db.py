@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -135,9 +136,7 @@ def _write_stage5_evidence(out: Path, vuln_id: str = "H-01") -> None:
             }
         ],
     }
-    (poc / "trigger-graph.json").write_text(
-        json.dumps(graph), encoding="utf-8"
-    )
+    (poc / "trigger-graph.json").write_text(json.dumps(graph), encoding="utf-8")
     (poc / "asan-report.txt").write_text(
         "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n"
         "    #0 0x1 in parse src/parser.c:20\n"
@@ -245,6 +244,8 @@ def test_scan_output_dir_normalizes_failed_status_in_fp_directory(
             "asan_report_path": "",
         }
     ]
+
+
 def test_scan_output_dir_indexes_standardized_stage5_evidence(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     _write_stage5_evidence(out)
@@ -485,17 +486,13 @@ def test_scan_output_dir_uses_repo_url_for_vulnerability_dedupe(tmp_path) -> Non
     repo_url = "https://example.com/project.git"
     artifacts = scan_output_dir(str(out), repo_url=repo_url)
     raw = json.loads(
-        (out / "stage4-vulnerabilities" / "H-01.json").read_text(
-            encoding="utf-8"
-        )
+        (out / "stage4-vulnerabilities" / "H-01.json").read_text(encoding="utf-8")
     )
 
     assert artifacts["vulnerabilities"][0]["dedupe_key"] == build_dedupe_key(
         raw, repo_url
     )
-    assert artifacts["vulnerabilities"][0]["dedupe_key"] != build_dedupe_key(
-        raw, ""
-    )
+    assert artifacts["vulnerabilities"][0]["dedupe_key"] != build_dedupe_key(raw, "")
 
 
 # ── AuditStore ───────────────────────────────────────────────────────────────
@@ -635,8 +632,98 @@ def test_get_run_only_returns_reproduced_vulnerabilities(tmp_path) -> None:
     assert [item["vuln_id"] for item in store.list_reproduction_candidates()] == [
         "H-01"
     ]
-    assert store.get_reproduction_candidate(run_id, "H-01") is not None
+    reproduction = store.get_reproduction_candidate(run_id, "H-01")
+    assert reproduction is not None
+    assert reproduction["project"] == tmp_path.name
     assert store.get_reproduction_candidate(run_id, "M-03") is None
+
+
+def test_reproduction_history_is_linked_to_disclosure_without_changing_review_status(
+    tmp_path,
+) -> None:
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"), managed_results_dir=str(tmp_path))
+    store.record_run(_make_config(tmp_path, out), status=RUN_DONE)
+    candidate = store.list_reproduction_candidates()[0]
+    selected = store.get_disclosure_reproduction_candidate(
+        candidate["project"], candidate["dedupe_key"]
+    )
+    assert selected is not None
+    job_key = "repro-123456789abc"
+    store.create_reproduction(
+        job_key=job_key,
+        candidate=selected,
+        output_dir=str(tmp_path / "reproductions" / job_key),
+        backend="codex",
+        model="test-model",
+        sandbox_mode="docker-isolated",
+        sandbox_runtime="runsc",
+        started_at=10.0,
+    )
+    store.set_reproduction_revision(
+        job_key, target_ref="refs/heads/main", tested_commit="c" * 40
+    )
+    store.finish_reproduction(
+        job_key,
+        state="done",
+        ended_at=20.0,
+        outcome="not-reproduced",
+        disposition="likely-fixed",
+        evidence_level="negative-runtime",
+        summary="The old PoC no longer triggers.",
+    )
+
+    record = store.get_reproduction(job_key)
+    assert record is not None
+    assert record["tested_commit"] == "c" * 40
+    assert record["outcome"] == "not-reproduced"
+    disclosure = next(
+        entry
+        for entry in store.list_disclosed()
+        if entry["dedupe_key"] == candidate["dedupe_key"]
+    )
+    assert disclosure["latest_reproduction"]["job_key"] == job_key
+    assert disclosure["review_status"] == "unreviewed"
+
+
+def test_reproduction_source_never_crosses_project_on_legacy_dedupe_collision(
+    tmp_path,
+) -> None:
+    first_out = _make_output_dir(tmp_path / "first")
+    second_out = _make_output_dir(tmp_path / "second")
+    store = AuditStore(str(tmp_path / "history.db"), managed_results_dir=str(tmp_path))
+    first_run = store.record_run(
+        AuditConfig(target=str(tmp_path / "first"), output_dir=str(first_out)),
+        status=RUN_DONE,
+    )
+    second_run = store.record_run(
+        AuditConfig(target=str(tmp_path / "second"), output_dir=str(second_out)),
+        status=RUN_DONE,
+    )
+
+    with store._connect() as conn:
+        first = conn.execute(
+            "SELECT dedupe_key FROM vulnerabilities WHERE run_id = ?", (first_run,)
+        ).fetchone()
+        assert first is not None
+        conn.execute(
+            "UPDATE vulnerabilities SET dedupe_key = ? WHERE run_id = ?",
+            (first["dedupe_key"], second_run),
+        )
+        conn.execute(
+            "UPDATE disclosed_bugs SET dedupe_key = ? WHERE project = 'second'",
+            (first["dedupe_key"],),
+        )
+
+    first_candidate = store.get_disclosure_reproduction_candidate(
+        "first", first["dedupe_key"]
+    )
+    second_candidate = store.get_disclosure_reproduction_candidate(
+        "second", first["dedupe_key"]
+    )
+
+    assert first_candidate is not None and first_candidate["run_id"] == first_run
+    assert second_candidate is not None and second_candidate["run_id"] == second_run
 
 
 def test_finish_run_updates_status_and_scans(tmp_path) -> None:
@@ -656,17 +743,18 @@ def test_finish_run_updates_status_and_scans(tmp_path) -> None:
 def test_resume_cancelled_run_reuses_same_history_row(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))
-    run_id = store.create_run(
-        _make_config(tmp_path, out), started_at=123.0
-    )
+    run_id = store.create_run(_make_config(tmp_path, out), started_at=123.0)
     store.finish_run(run_id, RUN_CANCELLED, "cancelled", ended_at=456.0)
 
-    assert store.resume_cancelled_run(
-        run_id,
-        resumed_at=1000.0,
-        backend="codex",
-        model="new-codex-model",
-    ) is True
+    assert (
+        store.resume_cancelled_run(
+            run_id,
+            resumed_at=1000.0,
+            backend="codex",
+            model="new-codex-model",
+        )
+        is True
+    )
     run = store.get_run(run_id)
     assert run is not None
     assert run["id"] == run_id
@@ -690,18 +778,24 @@ def test_update_running_run_agent_settings_only_changes_active_run(tmp_path) -> 
     store = AuditStore(str(tmp_path / "history.db"))
     run_id = store.create_run(_make_config(tmp_path, out))
 
-    assert store.update_running_run_agent_settings(
-        run_id, backend="codex", model="hot-model"
-    ) is True
+    assert (
+        store.update_running_run_agent_settings(
+            run_id, backend="codex", model="hot-model"
+        )
+        is True
+    )
     running = store.get_run(run_id)
     assert running is not None
     assert running["backend"] == "codex"
     assert running["model"] == "hot-model"
 
     store.finish_run(run_id, RUN_DONE)
-    assert store.update_running_run_agent_settings(
-        run_id, backend="claude", model="late-model"
-    ) is False
+    assert (
+        store.update_running_run_agent_settings(
+            run_id, backend="claude", model="late-model"
+        )
+        is False
+    )
     finished = store.get_run(run_id)
     assert finished is not None
     assert finished["backend"] == "codex"
@@ -713,22 +807,28 @@ def test_update_running_run_agent_history_only_changes_active_run(tmp_path) -> N
     store = AuditStore(str(tmp_path / "history.db"))
     run_id = store.create_run(_make_config(tmp_path, out))
 
-    assert store.update_running_run_agent_history(
-        run_id,
-        backends_used=["codex", "claude"],
-        models_used=["model-a", "model-b"],
-    ) is True
+    assert (
+        store.update_running_run_agent_history(
+            run_id,
+            backends_used=["codex", "claude"],
+            models_used=["model-a", "model-b"],
+        )
+        is True
+    )
     running = store.get_run(run_id)
     assert running is not None
     assert json.loads(running["backends_used"]) == ["codex", "claude"]
     assert json.loads(running["models_used"]) == ["model-a", "model-b"]
 
     store.finish_run(run_id, RUN_DONE)
-    assert store.update_running_run_agent_history(
-        run_id,
-        backends_used=["claude"],
-        models_used=["late-model"],
-    ) is False
+    assert (
+        store.update_running_run_agent_history(
+            run_id,
+            backends_used=["claude"],
+            models_used=["late-model"],
+        )
+        is False
+    )
     finished = store.get_run(run_id)
     assert finished is not None
     assert json.loads(finished["backends_used"]) == ["codex", "claude"]
@@ -755,9 +855,7 @@ def test_resumed_run_duration_excludes_inactive_gap(tmp_path) -> None:
 def test_cancel_running_runs_only_recovers_active_rows(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))
-    interrupted_id = store.create_run(
-        _make_config(tmp_path, out), started_at=100.0
-    )
+    interrupted_id = store.create_run(_make_config(tmp_path, out), started_at=100.0)
     done_id = store.create_run(_make_config(tmp_path, out), started_at=200.0)
     store.finish_run(done_id, RUN_DONE, ended_at=250.0)
     maintenance_id = store.create_run(
@@ -817,9 +915,7 @@ def test_list_runs_pagination(tmp_path) -> None:
 def test_list_runs_filters_status_kind_and_query(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))
-    audit_id = store.create_run(
-        _make_config(tmp_path, out), status=RUN_DONE
-    )
+    audit_id = store.create_run(_make_config(tmp_path, out), status=RUN_DONE)
     maintenance = AuditConfig(
         target=str(tmp_path / "MaintenanceTarget"),
         output_dir=str(tmp_path / "audit-output-maintenance"),
@@ -880,7 +976,7 @@ def test_repair_maintenance_statuses_marks_only_proven_superseded_rows(
     with store._connect() as conn:
         for run_id in (old_id, new_id):
             conn.execute(
-                "UPDATE runs SET target_key = ?, \"commit\" = ? WHERE id = ?",
+                'UPDATE runs SET target_key = ?, "commit" = ? WHERE id = ?',
                 ("target-key", "a" * 40, run_id),
             )
         for run_id in (old_id, new_id):
@@ -1318,9 +1414,7 @@ def test_record_run_populates_disclosure_catalogue_and_summary(tmp_path) -> None
     assert store.list_disclosed(search="some VULN qemu CWE-120")
     assert store.list_disclosed(search="not-present") == []
 
-    candidate = store.get_disclosed_terminal_candidate(
-        "qemu", entry["dedupe_key"]
-    )
+    candidate = store.get_disclosed_terminal_candidate("qemu", entry["dedupe_key"])
     assert candidate is not None
     assert candidate["run_id"] == run_id
     assert candidate["poc_dir"].endswith("stage5-pocs/H-01")
@@ -1420,14 +1514,16 @@ def test_database_disclosures_dedupe_and_preserve_review_status(tmp_path) -> Non
     )
 
     assert len(store.list_disclosed()) == 1
-    assert store.list_disclosed(status="reported")[0]["dedupe_key"] == entry["dedupe_key"]
+    assert (
+        store.list_disclosed(status="reported")[0]["dedupe_key"] == entry["dedupe_key"]
+    )
     assert store.set_disclosed_status("qemu", entry["dedupe_key"], "fixed") is False
-    assert store.set_disclosed_status(
-        "qemu", "sha256:" + "0" * 64, "reported"
-    ) is False
+    assert store.set_disclosed_status("qemu", "sha256:" + "0" * 64, "reported") is False
 
 
-def test_database_updates_disclosure_metadata_without_changing_identity(tmp_path) -> None:
+def test_database_updates_disclosure_metadata_without_changing_identity(
+    tmp_path,
+) -> None:
     out = _make_disclosure_output(tmp_path / "qemu")
     store = AuditStore(str(tmp_path / "history.db"))
     store.record_run(
@@ -1457,9 +1553,110 @@ def test_database_updates_disclosure_metadata_without_changing_identity(tmp_path
     assert updated["review_status"] == "reported"
     for field, value in metadata.items():
         assert updated[field] == value
-    assert store.update_disclosed_entry(
-        "qemu", "sha256:" + "0" * 64, metadata
-    ) is False
+    assert store.update_disclosed_entry("qemu", "sha256:" + "0" * 64, metadata) is False
+
+
+@pytest.mark.parametrize("review_status", ["unreviewed", "reported"])
+@pytest.mark.parametrize(
+    "poc_status",
+    ["partially-reproduced", "not-reproduced", "false-positive", "unknown"],
+)
+def test_disclosure_reconciles_partial_result_without_deleting_review(
+    tmp_path, review_status, poc_status
+) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(out.parent), output_dir=str(out)), status=RUN_DONE
+    )
+    entry = store.list_disclosed()[0]
+    store.set_disclosed_status("qemu", entry["dedupe_key"], review_status)
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE pocs SET status=?, report_path='' WHERE run_id=?",
+            (poc_status, run_id),
+        )
+        conn.execute("UPDATE disclosures SET report_path='' WHERE run_id=?", (run_id,))
+        store._sync_disclosures_from_run(conn, run_id, str(out))
+    current = store.list_disclosed()[0]
+    expected = (
+        "triage"
+        if review_status == "unreviewed" and poc_status != "unknown"
+        else review_status
+    )
+    assert current["review_status"] == expected
+    assert current["id"] == entry["id"]
+
+
+def test_disclosure_negative_run_does_not_override_retained_success(tmp_path) -> None:
+    first = _make_disclosure_output(tmp_path / "one" / "qemu")
+    second = _make_disclosure_output(tmp_path / "two" / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    first_id = store.record_run(
+        AuditConfig(target=str(first.parent), output_dir=str(first)), status=RUN_DONE
+    )
+    store.record_run(
+        AuditConfig(target=str(second.parent), output_dir=str(second)), status=RUN_DONE
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE pocs SET status='false-positive', report_path='' WHERE run_id=?",
+            (first_id,),
+        )
+        store._sync_disclosures_from_run(conn, first_id, str(first))
+    assert store.list_disclosed()[0]["review_status"] == "unreviewed"
+
+
+def test_disclosure_resync_preserves_review_title_and_notes(tmp_path) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(out.parent), output_dir=str(out)), status=RUN_DONE
+    )
+    entry = store.list_disclosed()[0]
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE disclosed_bugs SET title='Reviewed title', summary='Duplicate of primary', review_status='duplicated'"
+        )
+        store._sync_disclosures_from_run(conn, run_id, str(out))
+    current = store.list_disclosed()[0]
+    assert current["title"] == "Reviewed title"
+    assert current["summary"] == "Duplicate of primary"
+    assert current["dedupe_key"] == entry["dedupe_key"]
+
+
+@pytest.mark.parametrize("review_status", ["unreviewed", "duplicated"])
+def test_disclosure_resync_preserves_supplemental_artifacts(
+    tmp_path, review_status
+) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(out.parent), output_dir=str(out)), status=RUN_DONE
+    )
+    entry = store.list_disclosed()[0]
+    attachment = {
+        "label": "Review note",
+        "path": str(out / "review-notes" / "review.md"),
+    }
+    old_generated = {"label": "Stage 6 Zip", "path": str(out / "old.zip")}
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE disclosed_bugs SET review_status=?, artifact_links=?",
+            (review_status, json.dumps([old_generated, attachment])),
+        )
+        store._sync_disclosures_from_run(conn, run_id, str(out))
+        store._sync_disclosures_from_run(conn, run_id, str(out))
+        artifacts = json.loads(
+            conn.execute(
+                "SELECT artifact_links FROM disclosed_bugs WHERE id=?", (entry["id"],)
+            ).fetchone()["artifact_links"]
+        )
+    current = store.list_disclosed()[0]
+    assert current["id"] == entry["id"]
+    assert current["review_status"] == review_status
+    assert artifacts.count(attachment) == 1
+    assert old_generated not in artifacts
 
 
 def test_legacy_file_backed_rows_migrate_to_unique_database_records(tmp_path) -> None:
@@ -1492,8 +1689,19 @@ def test_legacy_file_backed_rows_migrate_to_unique_database_records(tmp_path) ->
             """
         )
         values = (
-            "qemu", key, "Vuln", "loc", "CWE-120", "overflow", "input",
-            "summary", "", "abc", "2026-01-01", "claude", "confirmed",
+            "qemu",
+            key,
+            "Vuln",
+            "loc",
+            "CWE-120",
+            "overflow",
+            "input",
+            "summary",
+            "",
+            "abc",
+            "2026-01-01",
+            "claude",
+            "confirmed",
             "[]",
         )
         conn.execute(
@@ -1531,13 +1739,13 @@ def test_legacy_file_backed_rows_migrate_to_unique_database_records(tmp_path) ->
     store = AuditStore(str(db_path))
 
     with store._connect() as conn:
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(disclosed_bugs)")
-        }
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(disclosed_bugs)")}
         assert "source_html" not in columns
         assert conn.execute("SELECT COUNT(*) FROM disclosed_bugs").fetchone()[0] == 2
     assert store.list_disclosed(project="qemu")[0]["review_status"] == "confirmed"
-    assert store.list_disclosed(project="virtualbox")[0]["review_status"] == "unreviewed"
+    assert (
+        store.list_disclosed(project="virtualbox")[0]["review_status"] == "unreviewed"
+    )
 
 
 def test_manual_cve_import_links_local_disclosure_and_reproduced_poc(tmp_path) -> None:
@@ -1574,8 +1782,7 @@ def test_manual_cve_import_links_local_disclosure_and_reproduced_poc(tmp_path) -
     assert cve["pocs"][0]["run_id"] == run_id
     assert cve["pocs"][0]["vuln_id"] == "H-01"
     assert {
-        artifact["label"]
-        for artifact in cve["local_disclosures"][0]["artifacts"]
+        artifact["label"] for artifact in cve["local_disclosures"][0]["artifacts"]
     } >= {"Stage 5 Trigger Graph", "Stage 5 ASan Report"}
 
     disclosure = store.list_disclosed()[0]
@@ -1680,7 +1887,9 @@ def test_confirmed_disclosure_reassigns_cve_links_atomically(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="Unknown CVE"):
         store.update_disclosed_entry(
-            "qemu", key, {**metadata, "summary": "must roll back"},
+            "qemu",
+            key,
+            {**metadata, "summary": "must roll back"},
             cve_ids=["CVE-2026-99999"],
         )
     rolled_back = store.list_disclosed()[0]
@@ -1694,7 +1903,9 @@ def test_confirmed_disclosure_reassigns_cve_links_atomically(tmp_path) -> None:
         store.update_disclosed_entry("qemu", key, metadata, cve_ids=[])
 
 
-def test_store_startup_removes_cve_links_from_nonconfirmed_disclosures(tmp_path) -> None:
+def test_store_startup_removes_cve_links_from_nonconfirmed_disclosures(
+    tmp_path,
+) -> None:
     out = _make_disclosure_output(tmp_path / "qemu")
     db_path = tmp_path / "history.db"
     store = AuditStore(str(db_path))
@@ -1737,9 +1948,7 @@ def test_cve_import_candidates_only_include_confirmed_disclosures(tmp_path) -> N
     assert store.list_cve_import_candidates() == []
 
     assert store.set_disclosed_status("qemu", key, "confirmed")
-    assert [item["dedupe_key"] for item in store.list_cve_import_candidates()] == [
-        key
-    ]
+    assert [item["dedupe_key"] for item in store.list_cve_import_candidates()] == [key]
 
 
 def test_disclosure_trash_restore_and_expiry(tmp_path) -> None:
@@ -1783,15 +1992,24 @@ def test_disclosure_trash_restore_and_expiry(tmp_path) -> None:
     assert reopened.list_disclosure_trash() == []
     assert not disclosure_dir.exists()
     assert stage6_log.is_file()
-    assert stage5_report.is_file()
+    assert not stage5_report.exists()
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM disclosed_bugs WHERE dedupe_key = ?", (key,)
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM disclosed_bugs WHERE dedupe_key = ?", (key,)
+            ).fetchone()[0]
+            == 0
+        )
         assert conn.execute("SELECT COUNT(*) FROM disclosures").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM pocs WHERE vuln_id = 'H-01'").fetchone()[
+                0
+            ]
+            == 0
+        )
         assert conn.execute(
-            "SELECT disclosures_count FROM runs"
-        ).fetchone()[0] == 0
+            "SELECT pocs_reproduced_count, disclosures_count FROM runs"
+        ).fetchone() == (0, 0)
 
 
 def test_purge_all_trashed_disclosures(tmp_path) -> None:
@@ -1815,11 +2033,87 @@ def test_purge_all_trashed_disclosures(tmp_path) -> None:
     assert store.list_disclosure_trash() == []
     assert store.list_disclosed() == []
     assert not disclosure_dir.exists()
-    assert stage5_report.is_file()
+    assert not stage5_report.exists()
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM disclosed_bugs WHERE dedupe_key = ?", (key,)
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM disclosed_bugs WHERE dedupe_key = ?", (key,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_purge_selected_trashed_disclosures_only_removes_selected_artifacts(
+    tmp_path,
+) -> None:
+    qemu_out = _make_disclosure_output(tmp_path / "qemu")
+    libvirt_out = _make_disclosure_output(tmp_path / "libvirt")
+    store = AuditStore(str(tmp_path / "history.db"))
+    qemu_run = store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(qemu_out)),
+        status=RUN_DONE,
+    )
+    libvirt_run = store.record_run(
+        AuditConfig(target=str(tmp_path / "libvirt"), output_dir=str(libvirt_out)),
+        status=RUN_DONE,
+    )
+    entries = {entry["project"]: entry for entry in store.list_disclosed()}
+    qemu_identity = ("qemu", entries["qemu"]["dedupe_key"])
+    libvirt_identity = ("libvirt", entries["libvirt"]["dedupe_key"])
+    assert store.trash_disclosure(*qemu_identity)
+    assert store.trash_disclosure(*libvirt_identity)
+
+    assert store.purge_trashed_disclosures([qemu_identity]) == 1
+
+    assert [entry["project"] for entry in store.list_disclosure_trash()] == ["libvirt"]
+    assert not (qemu_out / "stage5-pocs" / "H-01").exists()
+    assert not (qemu_out / "stage6-disclosures" / "H-01" / "disclosure").exists()
+    assert (libvirt_out / "stage5-pocs" / "H-01" / "report.md").is_file()
+    assert (
+        libvirt_out / "stage6-disclosures" / "H-01" / "disclosure" / "report.md"
+    ).is_file()
+    with store._connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM pocs WHERE run_id = ? AND vuln_id = 'H-01'",
+                (qemu_run,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM pocs WHERE run_id = ? AND vuln_id = 'H-01'",
+                (libvirt_run,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_purge_restores_all_artifacts_when_cleanup_staging_fails(
+    tmp_path, monkeypatch
+) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    disclosure = store.list_disclosed()[0]
+    identity = ("qemu", disclosure["dedupe_key"])
+    assert store.trash_disclosure(*identity)
+    real_replace = os.replace
+
+    def fail_stage6_rename(source, destination):
+        if "stage6-disclosures" in os.fspath(source):
+            raise OSError("simulated rename failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("code_auditor.db.os.replace", fail_stage6_rename)
+
+    assert store.purge_trashed_disclosures([identity]) == 0
+    assert (out / "stage5-pocs" / "H-01" / "report.md").is_file()
+    assert (out / "stage6-disclosures" / "H-01" / "disclosure" / "report.md").is_file()
+    assert store.list_disclosure_trash()[0]["dedupe_key"] == identity[1]
 
 
 def test_confirmed_disclosure_trash_preserves_cve_link_for_restore(tmp_path) -> None:
@@ -1904,6 +2198,7 @@ def test_expired_disclosure_keeps_stage6_directory_referenced_by_active_row(
     entry = store.list_disclosed()[0]
     key = entry["dedupe_key"]
     disclosure_dir = out / "stage6-disclosures" / "H-01" / "disclosure"
+    poc_dir = out / "stage5-pocs" / "H-01"
 
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -1930,6 +2225,7 @@ def test_expired_disclosure_keeps_stage6_directory_referenced_by_active_row(
     )
     assert store.purge_expired_disclosures() == 1
     assert disclosure_dir.is_dir()
+    assert poc_dir.is_dir()
     assert len(store.list_disclosed()) == 1
     assert store.list_disclosed()[0]["project"] == "shared-project"
 
@@ -2022,7 +2318,9 @@ def test_seed_analysis_units_reuses_previous_run(tmp_path) -> None:
     _write_au_files(out, count=3)
 
     store = AuditStore(str(tmp_path / "history.db"))
-    store.record_run(AuditConfig(target=str(repo), output_dir=str(out)), status=RUN_DONE)
+    store.record_run(
+        AuditConfig(target=str(repo), output_dir=str(out)), status=RUN_DONE
+    )
     target_key = compute_target_key(capture_repo_identity(str(repo)))
 
     aus = store.latest_analysis_units(target_key)
@@ -2136,7 +2434,9 @@ def test_merged_analysis_units_unions_runs_and_collapses_identical(tmp_path) -> 
 
     seeded_out = tmp_path / "seeded"
     assert store.seed_analysis_units(target_key, str(seeded_out)) == 3
-    assert sorted(p.name for p in (seeded_out / "stage2-analysis-units").glob("AU-*.json")) == [
+    assert sorted(
+        p.name for p in (seeded_out / "stage2-analysis-units").glob("AU-*.json")
+    ) == [
         "AU-1.json",
         "AU-2.json",
         "AU-3.json",

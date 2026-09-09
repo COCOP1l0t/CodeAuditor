@@ -8,6 +8,7 @@ share a source checkout (the managed repo mirror) are mutually exclusive —
 stage 0 ``git pull`` / resume ``git checkout`` mutate the shared mirror and
 the commit-stamped output directory would collide.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -16,10 +17,12 @@ import os
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from ..checkpoint import CheckpointManager
@@ -54,6 +57,8 @@ from ..repos import (
     ensure_repo,
     repo_local_path,
 )
+from ..reproduction_review import run_reproduction_review
+from ..reproduction_status import FAILED_STATUSES, read_reproduction_status
 from ..stages.stage5 import run_stage5
 from ..utils import summarize_task_errors
 from ..wikis import DEFAULT_WIKIS_DIR, list_local_wikis
@@ -82,6 +87,7 @@ INTERRUPTED_AUDIT_ERROR = (
     "Audit interrupted because its Web worker exited before recording a terminal "
     "state. Resume this run from History."
 )
+_MAX_REFERENCE_FILES = 4096
 
 
 class JobConflictError(Exception):
@@ -115,8 +121,12 @@ class AuditStartParams:
 
 @dataclass
 class ReproductionStartParams:
-    run_id: int
-    vuln_id: str
+    project: str = ""
+    dedupe_key: str = ""
+    # Legacy operator identity retained for API compatibility. New browser
+    # requests always use the Disclosure identity above.
+    run_id: int | None = None
+    vuln_id: str = ""
     backend: str = "claude"
     model: str | None = None
     provider_mode: ProviderMode = "local"
@@ -125,6 +135,7 @@ class ReproductionStartParams:
     log_level: str = "DEBUG"
     output_dir: str | None = None
     reproductions_dir: str = DEFAULT_REPRODUCTIONS_DIR
+    repos_dir: str = DEFAULT_REPOS_DIR
     wikis_dir: str = DEFAULT_WIKIS_DIR
     sandbox_mode: SandboxMode = DEFAULT_SANDBOX_MODE
     sandbox_runtime: SandboxRuntime = DEFAULT_SANDBOX_RUNTIME
@@ -214,9 +225,7 @@ async def _run_resume_git_command(
             f"Cannot run git while restoring the checkout: {exc}"
         ) from exc
     try:
-        output, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_seconds
-        )
+        output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except TimeoutError as exc:
         await _terminate_resume_git_process(proc)
         raise JobValidationError(
@@ -278,6 +287,212 @@ async def _create_detached_worktree(repo: str, commit: str, destination: str) ->
         raise JobValidationError(str(exc)) from exc
 
 
+def _canonical_remote(value: str) -> str:
+    raw = value.strip()
+    if re.match(r"^[^/@:]+@[^/:]+:", raw):
+        user_host, path = raw.split(":", 1)
+        raw = f"ssh://{user_host}/{path}"
+    parsed = urlsplit(raw)
+    if parsed.scheme and parsed.hostname:
+        port = f":{parsed.port}" if parsed.port else ""
+        path = parsed.path.rstrip("/").removesuffix(".git")
+        return f"{parsed.hostname.lower()}{port}{path}"
+    return os.path.realpath(os.path.expanduser(raw)).removesuffix(".git")
+
+
+def _is_git_checkout(path: str) -> bool:
+    git_entry = os.path.join(path, ".git")
+    return os.path.isdir(path) and (
+        os.path.isdir(git_entry) or os.path.isfile(git_entry)
+    )
+
+
+def _reproduction_git_env() -> dict[str, str]:
+    env = current_audit_subprocess_env()
+    # The origin is stored in a mutable local checkout.  Keep a compromised
+    # config from invoking an arbitrary remote helper and never wait for an
+    # interactive credential prompt in a Web worker.
+    env["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
+    env["GIT_PROTOCOL_FROM_USER"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _snapshot_reproduction_reference(
+    source: str,
+    destination: str,
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> str:
+    """Copy bounded regular context files away from the active Disclosure."""
+    source_entry = Path(source)
+    if source_entry.is_symlink():
+        raise JobValidationError("The active Disclosure reference cannot be a symlink.")
+    source_root = source_entry.resolve()
+    destination_root = Path(destination)
+    if not source_root.is_dir() or source_root.is_symlink():
+        raise JobValidationError(
+            "The active Disclosure reference is not a real directory."
+        )
+    destination_root.mkdir(parents=True, mode=0o700)
+    total_bytes = 0
+    file_count = 0
+    for root, directories, filenames in os.walk(source_root, followlinks=False):
+        root_path = Path(root)
+        directories[:] = [
+            name for name in directories if not (root_path / name).is_symlink()
+        ]
+        relative_root = root_path.relative_to(source_root)
+        copied_root = destination_root / relative_root
+        copied_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for name in filenames:
+            source_file = root_path / name
+            try:
+                path_stat = source_file.lstat()
+            except OSError as exc:
+                raise JobValidationError(
+                    f"Cannot inspect Disclosure reference file {name}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+                continue
+            try:
+                source_fd = os.open(
+                    source_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+            except OSError as exc:
+                raise JobValidationError(
+                    f"Cannot snapshot Disclosure reference file {name}: {exc}"
+                ) from exc
+            try:
+                source_stat = os.fstat(source_fd)
+                if not stat.S_ISREG(source_stat.st_mode):
+                    continue
+                file_count += 1
+                total_bytes += source_stat.st_size
+                if file_count > _MAX_REFERENCE_FILES:
+                    raise JobValidationError(
+                        "The active Disclosure reference contains too many files."
+                    )
+                if (
+                    source_stat.st_size > max_file_bytes
+                    or total_bytes > max_total_bytes
+                ):
+                    raise JobValidationError(
+                        "The active Disclosure reference exceeds retention limits."
+                    )
+                destination_path = copied_root / name
+                with os.fdopen(source_fd, "rb", closefd=False) as source_stream:
+                    with destination_path.open("xb") as destination_stream:
+                        shutil.copyfileobj(
+                            source_stream, destination_stream, length=1024 * 1024
+                        )
+                executable = bool(source_stat.st_mode & stat.S_IXUSR)
+                os.chmod(destination_path, 0o500 if executable else 0o400)
+            finally:
+                os.close(source_fd)
+    for root, directories, _filenames in os.walk(destination_root, topdown=False):
+        for name in directories:
+            os.chmod(Path(root, name), 0o500)
+    os.chmod(destination_root, 0o500)
+    return str(destination_root.resolve())
+
+
+async def _run_reproduction_git(
+    target: str, *args: str, timeout_seconds: float = 300.0
+) -> str:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            target,
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+            env=_reproduction_git_env(),
+        )
+    except OSError as exc:
+        raise JobValidationError(
+            f"Cannot run git for latest-source reproduction: {exc}"
+        ) from exc
+    try:
+        output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+    except TimeoutError as exc:
+        await _terminate_resume_git_process(proc)
+        raise JobValidationError(
+            f"Timed out resolving remote HEAD with `git {' '.join(args)}`."
+        ) from exc
+    except asyncio.CancelledError:
+        await _terminate_resume_git_process(proc)
+        raise
+    text = (output or b"").decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        raise JobValidationError(
+            f"Latest-source git command failed (`git {' '.join(args)}`): "
+            f"{text[-1000:] or 'git failed'}"
+        )
+    return text
+
+
+async def _resolve_latest_remote_commit(
+    target: str, expected_repo_url: str
+) -> tuple[str, str, str]:
+    """Fetch origin and return its immutable HEAD ref/SHA plus actual URL."""
+    actual_url = await _run_reproduction_git(target, "remote", "get-url", "origin")
+    if expected_repo_url and _canonical_remote(actual_url) != _canonical_remote(
+        expected_repo_url
+    ):
+        raise JobValidationError(
+            "The managed checkout origin does not match the selected Disclosure repository."
+        )
+    await _run_reproduction_git(target, "fetch", "--prune", "origin")
+    remote_head = await _run_reproduction_git(
+        target, "ls-remote", "--symref", "origin", "HEAD"
+    )
+    head_ref = ""
+    head_sha = ""
+    for line in remote_head.splitlines():
+        if line.startswith("ref:") and line.endswith("\tHEAD"):
+            head_ref = line[4:].split("\t", 1)[0].strip()
+        else:
+            sha, separator, name = line.partition("\t")
+            if (
+                separator
+                and name == "HEAD"
+                and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha)
+            ):
+                head_sha = sha.lower()
+    if not head_ref or not head_sha:
+        raise JobValidationError(
+            "Cannot resolve the remote default branch and HEAD commit."
+        )
+    try:
+        await _run_reproduction_git(target, "cat-file", "-e", f"{head_sha}^{{commit}}")
+    except JobValidationError:
+        await _run_reproduction_git(target, "fetch", "origin", head_ref)
+        await _run_reproduction_git(target, "cat-file", "-e", f"{head_sha}^{{commit}}")
+    return head_ref, head_sha, actual_url
+
+
+async def _remove_reproduction_worktree(repo: str, destination: str) -> None:
+    if not os.path.lexists(destination):
+        return
+    try:
+        await _run_reproduction_git(
+            repo,
+            "worktree",
+            "remove",
+            "--force",
+            os.path.realpath(destination),
+            timeout_seconds=120,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not remove reproduction worktree %s: %s", destination, exc
+        )
+
+
 class AuditJob:
     """State and lifecycle for one audit or reproduction job."""
 
@@ -306,14 +521,17 @@ class AuditJob:
         self.reproduction_candidate: dict | None = None
         self.reproduction_reports: list[str] = []
         self.history_persist_pending: bool = False
-        self._pending_run_finish: tuple[
-            str,
-            str,
-            float,
-            list[str] | None,
-            list[str] | None,
-            dict[str, float] | None,
-        ] | None = None
+        self._pending_run_finish: (
+            tuple[
+                str,
+                str,
+                float,
+                list[str] | None,
+                list[str] | None,
+                dict[str, float] | None,
+            ]
+            | None
+        ) = None
         self._next_history_retry_at: float = 0.0
 
     # ── events ────────────────────────────────────────────────────────────
@@ -363,7 +581,11 @@ class AuditJob:
         config = self.config
         if config is None:
             return
-        if self.store is not None and self.kind == JOB_AUDIT and self.run_id is not None:
+        if (
+            self.store is not None
+            and self.kind == JOB_AUDIT
+            and self.run_id is not None
+        ):
             try:
                 updated = self.store.update_running_run_agent_history(
                     self.run_id,
@@ -522,9 +744,7 @@ class AuditJob:
             else model
         )
         targets = [
-            target
-            for target in (self.config, self.start_params)
-            if target is not None
+            target for target in (self.config, self.start_params) if target is not None
         ]
         incoming = (
             backend,
@@ -548,7 +768,9 @@ class AuditJob:
         previous_backend = (
             self.config.backend
             if self.config is not None
-            else self.start_params.backend if self.start_params is not None else ""
+            else self.start_params.backend
+            if self.start_params is not None
+            else ""
         )
         if self.config is not None:
             self.config.backend = backend
@@ -563,7 +785,11 @@ class AuditJob:
             self.start_params.provider_base_url = provider_base_url
             self.start_params.provider_api_key = provider_api_key
 
-        if self.store is not None and self.kind == JOB_AUDIT and self.run_id is not None:
+        if (
+            self.store is not None
+            and self.kind == JOB_AUDIT
+            and self.run_id is not None
+        ):
             try:
                 updated = self.store.update_running_run_agent_settings(
                     self.run_id, backend=backend, model=effective_model
@@ -770,9 +996,7 @@ class AuditJob:
                     and prev_output_dir
                     and config.output_dir != prev_output_dir
                 ):
-                    self.store.update_run_output_dir(
-                        self.run_id, config.output_dir
-                    )
+                    self.store.update_run_output_dir(self.run_id, config.output_dir)
             assert config is not None
             # Repository identity collection invokes several synchronous Git
             # commands.  This task is scheduled before the start endpoint has
@@ -887,16 +1111,48 @@ class AuditJob:
     ) -> None:
         worktree = os.path.join(reproduction_root, "source")
         output_dir = os.path.join(reproduction_root, "output")
+        source_repo = str(candidate.get("target") or "")
+        outcome = ""
+        evidence_level = ""
+        result_path = ""
+        assessment: dict = {}
         try:
+            if not _is_git_checkout(source_repo):
+                repo_url = str(candidate.get("repo_url") or "")
+                if not repo_url:
+                    raise JobValidationError(
+                        "The selected Disclosure has no available Git repository."
+                    )
+                source_repo = await ensure_repo(repo_url, params.repos_dir)
+                self.target_path = os.path.realpath(source_repo)
+            self.reporter.begin_stage(0, "Fetching and pinning remote HEAD")
+            target_ref, tested_commit, actual_url = await _resolve_latest_remote_commit(
+                source_repo, str(candidate.get("repo_url") or "")
+            )
+            candidate["target_ref"] = target_ref
+            candidate["tested_commit"] = tested_commit
+            candidate["repo_url"] = actual_url
+            if self.reproduction_candidate is not None:
+                self.reproduction_candidate.update(
+                    {"target_ref": target_ref, "tested_commit": tested_commit}
+                )
+            if self.store is not None:
+                self.store.set_reproduction_revision(
+                    self.job_key,
+                    target_ref=target_ref,
+                    tested_commit=tested_commit,
+                )
+            self.reporter.stage_progress(
+                0, items_done=1, items_total=1, detail=f"Pinned {tested_commit[:12]}"
+            )
+            self.reporter.end_stage(0)
             logger.info(
-                "Preparing isolated reproduction of Run #%s %s at %s.",
-                candidate["run_id"],
+                "Preparing latest-source reproduction of %s/%s at %s.",
+                candidate["project"],
                 candidate["vuln_id"],
-                candidate["commit"],
+                tested_commit,
             )
-            await _create_detached_worktree(
-                candidate["target"], candidate["commit"], worktree
-            )
+            await _create_detached_worktree(source_repo, tested_commit, worktree)
             vuln_dir = Path(output_dir) / "stage4-vulnerabilities"
             vuln_dir.mkdir(parents=True, exist_ok=True)
             vuln_path = vuln_dir / f"{_safe_path_segment(candidate['vuln_id'])}.json"
@@ -923,29 +1179,101 @@ class AuditJob:
                 provider_base_url=params.provider_base_url,
                 provider_api_key=params.provider_api_key,
                 agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
+                poc_source_commit=tested_commit,
+                reproduction_reference_dir=str(candidate.get("reference_dir") or "")
+                or None,
                 sandbox_enabled=sandbox_enabled,
                 sandbox_runtime=params.sandbox_runtime,
                 sandbox_network_enabled=sandbox_network_enabled,
             )
+            if config.reproduction_reference_dir:
+                config.reproduction_reference_dir = _snapshot_reproduction_reference(
+                    config.reproduction_reference_dir,
+                    os.path.join(reproduction_root, "input", "previous-disclosure"),
+                    max_file_bytes=config.retain_max_file_bytes,
+                    max_total_bytes=config.retain_max_total_bytes,
+                )
+                candidate["reference_dir"] = config.reproduction_reference_dir
             self._set_config(config)
             self.reporter.begin_stage(
-                5, f"Retesting Run #{candidate['run_id']} {candidate['vuln_id']}"
+                5,
+                f"Retesting {candidate['project']} {candidate['vuln_id']} at {tested_commit[:12]}",
             )
             checkpoint = CheckpointManager(output_dir, resume=False)
             self.reproduction_reports = await run_stage5(
                 [str(vuln_path)], self.config, checkpoint
             )
+            report_candidates = [Path(path) for path in self.reproduction_reports]
+            for possible in (
+                Path(output_dir, "stage5-pocs", candidate["vuln_id"], "report.md"),
+                Path(
+                    output_dir, "stage5-pocs", candidate["vuln_id"] + "_fp", "report.md"
+                ),
+            ):
+                if possible.is_file() and possible not in report_candidates:
+                    report_candidates.append(possible)
+            if not report_candidates:
+                raise RuntimeError(
+                    f"Stage 5 did not produce a reproduction report for {candidate['vuln_id']}"
+                )
+            retest_report = report_candidates[0]
+            poc_status = read_reproduction_status(str(retest_report)) or "unknown"
+            if poc_status == "reproduced":
+                outcome = "reproduced"
+                evidence_level = "runtime"
+            elif poc_status in FAILED_STATUSES:
+                outcome = "not-reproduced"
+                evidence_level = "negative-runtime"
+            else:
+                outcome = "inconclusive"
+                evidence_level = "unknown"
+
+            result = {
+                "schema_version": 1,
+                "project": candidate["project"],
+                "dedupe_key": candidate["dedupe_key"],
+                "vuln_id": candidate["vuln_id"],
+                "base_commit": candidate.get("base_commit") or "",
+                "target_ref": target_ref,
+                "tested_commit": tested_commit,
+                "fetched_at": time.time(),
+                "poc_status": poc_status,
+                "outcome": outcome,
+                "evidence_level": evidence_level,
+                "report_path": os.path.relpath(retest_report, output_dir),
+            }
+            result_file = Path(output_dir, "reproduction-result.json")
+            result_file.write_text(
+                json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            result_path = str(result_file)
             self.reporter.stage_progress(
                 5,
-                items_done=len(self.reproduction_reports),
+                items_done=1,
                 items_total=1,
-                detail=(
-                    "Reproduced"
-                    if self.reproduction_reports
-                    else "Not reproduced"
-                ),
+                detail=f"Outcome: {outcome}",
             )
             self.reporter.end_stage(5)
+
+            self.reporter.begin_stage(
+                6, "Analyzing current source and preparing Disclosure update"
+            )
+            assessment = await run_reproduction_review(
+                self.config,
+                candidate=candidate,
+                result_path=result_path,
+                retest_report_path=str(retest_report),
+                finding_path=str(vuln_path),
+                outcome=outcome,
+            )
+            self.reporter.stage_progress(
+                6,
+                items_done=1,
+                items_total=1,
+                detail=f"Agent disposition: {assessment['disposition']}",
+            )
+            self.reporter.end_stage(6)
             self.state = STATE_DONE
         except asyncio.CancelledError:
             self.state = STATE_CANCELLED
@@ -960,6 +1288,33 @@ class AuditJob:
                 self.error = self.error or INTERRUPTED_AUDIT_ERROR
             self.ended_at = time.time()
             self._stop_duration_clock(self.ended_at)
+            if self.store is not None:
+                try:
+                    self.store.finish_reproduction(
+                        self.job_key,
+                        state=self.state,
+                        ended_at=self.ended_at,
+                        outcome=outcome,
+                        disposition=str(assessment.get("disposition") or ""),
+                        evidence_level=evidence_level,
+                        summary=str(assessment.get("summary") or ""),
+                        source_analysis=str(assessment.get("source_analysis") or ""),
+                        disclosure_update=str(
+                            assessment.get("disclosure_update") or ""
+                        ),
+                        result_path=result_path,
+                        assessment_path=str(assessment.get("assessment_path") or ""),
+                        retest_report_path=str(
+                            assessment.get("retest_report_path") or ""
+                        ),
+                        draft_path=str(assessment.get("draft_path") or ""),
+                        error=self.error,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist reproduction result %s.", self.job_key
+                    )
+            await _remove_reproduction_worktree(source_repo, worktree)
             self.publish_job_event()
 
 
@@ -1107,10 +1462,18 @@ class AuditJobManager:
         if self._active_jobs():
             return []
         run_ids = self.store.cancel_running_runs(INTERRUPTED_AUDIT_ERROR)
+        reproduction_keys = self.store.cancel_running_reproductions(
+            INTERRUPTED_AUDIT_ERROR
+        )
         if run_ids:
             logger.warning(
                 "Recovered interrupted audit run(s) as cancelled: %s.",
                 ", ".join(f"#{run_id}" for run_id in run_ids),
+            )
+        if reproduction_keys:
+            logger.warning(
+                "Recovered interrupted reproduction job(s) as cancelled: %s.",
+                ", ".join(reproduction_keys),
             )
         return run_ids
 
@@ -1163,9 +1526,7 @@ class AuditJobManager:
         job.state = STATE_RUNNING
         job._create_run_row(config)
         job.job_key = (
-            str(job.run_id)
-            if job.run_id is not None
-            else f"audit-{uuid4().hex[:12]}"
+            str(job.run_id) if job.run_id is not None else f"audit-{uuid4().hex[:12]}"
         )
         self._register(job)
         job.publish_job_event(target=params.target or params.git_url)
@@ -1233,7 +1594,11 @@ class AuditJobManager:
             )
         # Clone never completed: target dir absent and no identity was ever recorded.
         # Re-dispatch as a fresh clone reusing the existing run row.
-        if not os.path.isdir(target) and not run.get("commit") and not run.get("target_key"):
+        if (
+            not os.path.isdir(target)
+            and not run.get("commit")
+            and not run.get("target_key")
+        ):
             repos_root = os.path.realpath(os.path.expanduser(repos_dir))
             rel = os.path.relpath(target, repos_root)
             git_url = "https://" + rel.replace(os.sep, "/")
@@ -1244,7 +1609,9 @@ class AuditJobManager:
             if not isinstance(target_au_count, int) or (
                 target_au_count != -1 and target_au_count < 1
             ):
-                raise JobValidationError("The recorded target analysis-unit count is invalid.")
+                raise JobValidationError(
+                    "The recorded target analysis-unit count is invalid."
+                )
             wiki_path = _recorded_local_wiki(run.get("wiki_path"), wikis_dir)
             clone_params = AuditStartParams(
                 git_url=git_url,
@@ -1295,8 +1662,7 @@ class AuditJobManager:
         recorded_commit = str(run.get("commit") or "")
         recorded_target_key = str(run.get("target_key") or "")
         if (
-            re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", recorded_commit)
-            is None
+            re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", recorded_commit) is None
             or not recorded_target_key
         ):
             raise JobValidationError(
@@ -1310,7 +1676,9 @@ class AuditJobManager:
         if not isinstance(target_au_count, int) or (
             target_au_count != -1 and target_au_count < 1
         ):
-            raise JobValidationError("The recorded target analysis-unit count is invalid.")
+            raise JobValidationError(
+                "The recorded target analysis-unit count is invalid."
+            )
 
         wiki_path = _recorded_local_wiki(run.get("wiki_path"), wikis_dir)
         if run.get("wiki_path") and wiki_path is None:
@@ -1417,25 +1785,40 @@ class AuditJobManager:
         return job
 
     async def start_reproduction(self, params: ReproductionStartParams) -> AuditJob:
-        """Retest one exactly reproduced History vulnerability in isolation."""
+        """Retest one Disclosure against a freshly resolved remote HEAD."""
         self._prune_finished_jobs()
         if self.store is None:
             raise JobValidationError("The history database is unavailable.")
-        candidate = self.store.get_reproduction_candidate(
-            params.run_id, params.vuln_id
-        )
+        candidate = None
+        if params.project and params.dedupe_key:
+            candidate = self.store.get_disclosure_reproduction_candidate(
+                params.project, params.dedupe_key
+            )
+        elif params.run_id is not None and params.vuln_id:
+            historical = self.store.get_reproduction_candidate(
+                params.run_id, params.vuln_id
+            )
+            if historical is not None and historical.get("dedupe_key"):
+                project = historical.get("project") or historical.get("repo_name") or ""
+                candidate = self.store.get_disclosure_reproduction_candidate(
+                    project, historical["dedupe_key"]
+                )
         if candidate is None:
             raise JobValidationError(
-                "The selected vulnerability is missing or is not exactly reproduced."
+                "The selected Disclosure vulnerability is missing or has no linked finding."
             )
-        if not candidate.get("commit"):
-            raise JobValidationError("The selected History run has no source commit.")
-        if not os.path.isdir(candidate["target"]):
+        if not candidate.get("reference_dir"):
             raise JobValidationError(
-                f"Source repository not found: {candidate['target']}"
+                "The selected Disclosure has no retained Stage 5/6 reproduction context."
+            )
+        if not candidate.get("raw_json"):
+            raise JobValidationError(
+                "The selected Disclosure has no linked Stage 4 finding."
             )
 
-        repo_name = _safe_path_segment(candidate.get("repo_name") or "repo")
+        repo_name = _safe_path_segment(
+            candidate.get("project") or candidate.get("repo_name") or "repo"
+        )
         vuln_segment = _safe_path_segment(candidate["vuln_id"])
         stamp = time.strftime("%Y%m%d-%H%M%S")
         unique_suffix = str(time.time_ns())[-6:]
@@ -1445,7 +1828,7 @@ class AuditJobManager:
                 or os.path.join(
                     params.reproductions_dir,
                     repo_name,
-                    candidate["commit"][:12],
+                    _safe_path_segment(candidate["dedupe_key"][-12:]),
                     vuln_segment,
                     f"{stamp}-{unique_suffix}",
                 )
@@ -1456,28 +1839,57 @@ class AuditJobManager:
                 f"Reproduction output already exists: {reproduction_root}"
             )
 
-        self._check_start_allowed(os.path.realpath(candidate["target"]))
+        target = os.path.realpath(str(candidate.get("target") or ""))
+        if not _is_git_checkout(target):
+            repo_url = str(candidate.get("repo_url") or "")
+            if not repo_url:
+                raise JobValidationError(
+                    "The selected Disclosure source checkout is unavailable and has no repository URL."
+                )
+            target = os.path.realpath(repo_local_path(repo_url, params.repos_dir))
+        self._check_start_allowed(target)
+        self._check_history_write_headroom()
         job = AuditJob(self, JOB_REPRODUCTION)
         job.start_params = params
-        job.target_path = os.path.realpath(candidate["target"])
+        job.target_path = target
         job.state = STATE_RUNNING
         job.run_id = None
         job.job_key = f"repro-{uuid4().hex[:12]}"
         job.reproduction_candidate = {
             key: candidate.get(key)
             for key in (
+                "project",
+                "dedupe_key",
                 "run_id",
                 "vuln_id",
                 "title",
                 "repo_name",
-                "commit",
+                "base_commit",
+                "audited_commit",
                 "severity",
                 "cvss_score",
             )
         }
+        selected_model = (
+            local_claude_model() or params.model
+            if params.backend == "claude" and params.provider_mode == "local"
+            else params.model
+        )
+        self.store.create_reproduction(
+            job_key=job.job_key,
+            candidate=candidate,
+            output_dir=reproduction_root,
+            backend=params.backend,
+            model=selected_model,
+            sandbox_mode=params.sandbox_mode,
+            sandbox_runtime=params.sandbox_runtime,
+            started_at=job.started_at,
+        )
         self._register(job)
         job.publish_job_event(
-            target=candidate["target"],
+            target=target,
+            project=candidate["project"],
+            dedupe_key=candidate["dedupe_key"],
             source_run_id=candidate["run_id"],
             vuln_id=candidate["vuln_id"],
         )

@@ -73,6 +73,7 @@ let selectedProcessPid = null;
 let activeReproKey = null;
 let reproEventSource = null;
 let reproductionCandidates = [];
+let pendingReproductionSelection = null;
 let agentSettings = null;
 let managedResultsDir = "";
 let terminalToken = "";
@@ -810,24 +811,32 @@ form.addEventListener("submit", async (e) => {
 // ── Standalone reproduction ────────────────────────────────────────────────
 async function loadReproductionCandidates() {
   const currentTarget = $("r-target-select").value;
-  const currentCommit = $("r-commit-select").value;
   const currentBug = $("r-bug-select").value;
   try {
     const res = await fetch("/api/reproduction/candidates");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     reproductionCandidates = data.candidates || [];
-    populateReproductionTargets(currentTarget, currentCommit, currentBug);
+    populateReproductionTargets(currentTarget, currentBug);
+    if (pendingReproductionSelection) {
+      const index = reproductionCandidates.findIndex(
+        (candidate) =>
+          candidate.project === pendingReproductionSelection.project &&
+          candidate.dedupe_key === pendingReproductionSelection.dedupeKey
+      );
+      if (index >= 0) {
+        $("r-target-select").value = reproductionTargetKey(reproductionCandidates[index]);
+        populateReproductionBugs(String(index));
+      }
+      pendingReproductionSelection = null;
+    }
   } catch (e) {
     reproductionCandidates = [];
     $("r-target-select").innerHTML =
       `<option value="">— targets unavailable —</option>`;
-    $("r-commit-select").innerHTML =
-      `<option value="">— commits unavailable —</option>`;
     $("r-bug-select").innerHTML =
       `<option value="">— candidates unavailable —</option>`;
     $("r-target-select").disabled = true;
-    $("r-commit-select").disabled = true;
     $("r-bug-select").disabled = true;
     $("r-bug-count").textContent = "Could not load candidates.";
     reproductionFormError.textContent = `Failed to load candidates: ${e}`;
@@ -835,15 +844,77 @@ async function loadReproductionCandidates() {
   }
 }
 
-function reproductionTargetKey(candidate) {
-  return candidate.target || candidate.repo_name || "";
+async function loadReproductionHistory() {
+  const tbody = document.querySelector("#reproduction-history-table tbody");
+  tbody.innerHTML = `<tr><td colspan="7" class="dim">Loading…</td></tr>`;
+  try {
+    const res = await fetch("/api/reproduction/history");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const entries = data.entries || [];
+    tbody.innerHTML = "";
+    for (const entry of entries) {
+      const tr = document.createElement("tr");
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "btn btn-compact";
+      action.textContent = "View";
+      action.addEventListener("click", () => {
+        disconnectReproEvents();
+        activeReproKey = entry.job_key;
+        reproductionBtnStop.disabled = true;
+        $("r-btn-download-agent-log").href =
+          `/api/reproduction/${entry.job_key}/agent-log?download=true`;
+        loadReproductionResults();
+      });
+      tr.innerHTML =
+        `<td>${escapeHtml(fmtTime(entry.started_at))}</td>` +
+        `<td>${escapeHtml(entry.project || "—")}</td>` +
+        `<td><code>${escapeHtml((entry.tested_commit || "").slice(0, 12) || "—")}</code></td>` +
+        `<td>${escapeHtml(entry.outcome || "—")}</td>` +
+        `<td>${escapeHtml(entry.disposition || "—")}</td>` +
+        `<td>${escapeHtml(entry.state || "—")}</td><td></td>`;
+      const actions = tr.lastElementChild;
+      actions.appendChild(action);
+      if (entry.draft_path && !entry.applied_at && entry.state === "done") {
+        const apply = document.createElement("button");
+        apply.type = "button";
+        apply.className = "btn btn-compact btn-start";
+        apply.textContent = "Apply draft";
+        apply.addEventListener("click", async () => {
+          if (!window.confirm(
+            "Replace the active local Disclosure package with this validated draft? The current package will be archived as a revision."
+          )) return;
+          apply.disabled = true;
+          try {
+            const response = await fetch(
+              `/api/reproduction/${entry.job_key}/apply`, { method: "POST" }
+            );
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
+            await Promise.all([loadReproductionHistory(), loadDisclosures()]);
+          } catch (error) {
+            reproductionFormError.textContent = `Apply failed: ${error}`;
+            apply.disabled = false;
+          }
+        });
+        actions.appendChild(apply);
+      }
+      tbody.appendChild(tr);
+    }
+    if (!entries.length) {
+      tbody.innerHTML = `<tr><td colspan="7" class="dim">No latest-source reproductions recorded.</td></tr>`;
+    }
+  } catch (error) {
+    tbody.innerHTML = `<tr><td colspan="7" class="error">Failed to load: ${escapeHtml(String(error))}</td></tr>`;
+  }
 }
 
-function populateReproductionTargets(
-  preferredTarget = "",
-  preferredCommit = "",
-  preferredBug = ""
-) {
+function reproductionTargetKey(candidate) {
+  return candidate.project || candidate.repo_name || "";
+}
+
+function populateReproductionTargets(preferredTarget = "", preferredBug = "") {
   const select = $("r-target-select");
   const targets = new Map();
   for (const candidate of reproductionCandidates) {
@@ -867,57 +938,28 @@ function populateReproductionTargets(
   if (preferredTarget && targets.has(preferredTarget)) {
     select.value = preferredTarget;
   }
-  populateReproductionCommits(preferredCommit, preferredBug);
-}
-
-function populateReproductionCommits(preferredCommit = "", preferredBug = "") {
-  const target = $("r-target-select").value;
-  const select = $("r-commit-select");
-  const candidates = reproductionCandidates.filter(
-    (candidate) => reproductionTargetKey(candidate) === target
-  );
-  const commits = new Map();
-  for (const candidate of candidates) {
-    const commit = candidate.commit || "";
-    commits.set(commit, (commits.get(commit) || 0) + 1);
-  }
-  select.innerHTML = `<option value="">— select a commit —</option>`;
-  for (const [commit, count] of commits) {
-    const opt = document.createElement("option");
-    opt.value = commit;
-    opt.textContent =
-      `${commit.slice(0, 12) || "unknown"} · ${count} reproduced bug` +
-      (count === 1 ? "" : "s");
-    opt.title = commit;
-    select.appendChild(opt);
-  }
-  select.disabled = !target || commits.size === 0;
-  if (preferredCommit && commits.has(preferredCommit)) {
-    select.value = preferredCommit;
-  }
   populateReproductionBugs(preferredBug);
 }
 
 function populateReproductionBugs(preferredBug = "") {
   const target = $("r-target-select").value;
-  const commit = $("r-commit-select").value;
   const select = $("r-bug-select");
-  select.innerHTML = `<option value="">— select a reproduced bug —</option>`;
+  select.innerHTML = `<option value="">— select a Disclosure —</option>`;
   reproductionCandidates.forEach((candidate, index) => {
-    if (
-      reproductionTargetKey(candidate) !== target ||
-      candidate.commit !== commit
-    ) {
+    if (reproductionTargetKey(candidate) !== target) {
       return;
     }
     const opt = document.createElement("option");
     opt.value = String(index);
     opt.textContent =
-      `Run #${candidate.run_id} / ${candidate.vuln_id}: ` +
-      `${candidate.title || "Untitled vulnerability"}`;
+      `${candidate.vuln_id || "Disclosure"}: ` +
+      `${candidate.title || "Untitled vulnerability"}` +
+      (candidate.can_reproduce ? "" : " · unavailable");
+    opt.disabled = !candidate.can_reproduce;
+    opt.title = (candidate.unavailable_reasons || []).join(" ");
     select.appendChild(opt);
   });
-  select.disabled = !target || !commit || select.options.length === 1;
+  select.disabled = !target || select.options.length === 1;
   if (
     preferredBug &&
     [...select.options].some((option) => option.value === preferredBug)
@@ -926,16 +968,11 @@ function populateReproductionBugs(preferredBug = "") {
   }
   const count = reproductionCandidates.filter(
     (candidate) =>
-      (!target || reproductionTargetKey(candidate) === target) &&
-      (!commit || candidate.commit === commit)
+      (!target || reproductionTargetKey(candidate) === target)
   ).length;
-  const scope = commit
-    ? " at this commit"
-    : target
-      ? " in this project"
-      : " available";
+  const scope = target ? " in this project" : " available";
   $("r-bug-count").textContent =
-    `${count} exactly reproduced bug${count === 1 ? "" : "s"}${scope}`;
+    `${count} Disclosure record${count === 1 ? "" : "s"}${scope}`;
   renderReproductionCandidate();
 }
 
@@ -955,12 +992,14 @@ function renderReproductionCandidate() {
     return;
   }
   const values = [
-    ["Run", `#${candidate.run_id}`],
+    ["Disclosure status", candidate.review_status || "unreviewed"],
     ["Vulnerability", candidate.vuln_id],
-    ["Current reproduction status", candidate.poc_status || "unknown"],
+    ["Original PoC status", candidate.poc_status || "unknown"],
     ["Severity", candidate.severity || "—"],
     ["CVSS", candidate.cvss_score ?? "—"],
-    ["Commit", candidate.commit || "—"],
+    ["Original audited commit", candidate.audited_commit || candidate.commit || "—"],
+    ["Latest tested commit", candidate.latest_reproduction?.tested_commit || "not tested"],
+    ["Latest outcome", candidate.latest_reproduction?.outcome || "not tested"],
     ["Location", candidate.location || "—"],
   ];
   meta.innerHTML = values
@@ -975,9 +1014,6 @@ function renderReproductionCandidate() {
 }
 
 $("r-target-select").addEventListener("change", () => {
-  populateReproductionCommits();
-});
-$("r-commit-select").addEventListener("change", () => {
   populateReproductionBugs();
 });
 $("r-bug-select").addEventListener("change", renderReproductionCandidate);
@@ -985,7 +1021,9 @@ $("r-bug-select").addEventListener("change", renderReproductionCandidate);
 function updateReproductionStartAvailability() {
   // The Reproduction view can follow one reproduction job at a time.
   reproductionBtnStart.disabled =
-    busyReproductionJob() !== null || selectedReproductionCandidate() === null;
+    busyReproductionJob() !== null ||
+    selectedReproductionCandidate() === null ||
+    !selectedReproductionCandidate().can_reproduce;
 }
 
 reproductionForm.addEventListener("submit", async (e) => {
@@ -993,12 +1031,12 @@ reproductionForm.addEventListener("submit", async (e) => {
   reproductionFormError.textContent = "";
   const candidate = selectedReproductionCandidate();
   if (!candidate) {
-    reproductionFormError.textContent = "Select a reproduced vulnerability.";
+    reproductionFormError.textContent = "Select an available Disclosure vulnerability.";
     return;
   }
   const body = {
-    run_id: candidate.run_id,
-    vuln_id: candidate.vuln_id,
+    project: candidate.project,
+    dedupe_key: candidate.dedupe_key,
   };
   try {
     const res = await fetch("/api/reproduction", {
@@ -1200,8 +1238,8 @@ function attachReproductionJob(status) {
   reproductionResultsPanel.hidden = true;
   reproductionViewerPanel.hidden = true;
   for (const s of status.stages || []) {
-    updateReproductionStage(s.status, s.detail);
-    updateReproductionProgress(s.items_done, s.items_total);
+    updateReproductionStage(s.stage, s.status, s.detail);
+    updateReproductionProgress(s.stage, s.items_done, s.items_total);
   }
   reproductionBtnStop.disabled = !BUSY_JOB_STATES.has(status.state);
   updateReproductionStartAvailability();
@@ -1213,12 +1251,18 @@ function attachReproductionJob(status) {
 function finishReproductionJob(ev) {
   reproductionBtnStop.disabled = true;
   if (ev.status && ev.status !== "running") {
+    const activeRow = [0, 5, 6].find((stage) =>
+      $(`reproduction-stage-row-${stage}`).classList.contains("stage-running")
+    ) ?? 6;
     updateReproductionStage(
+      activeRow,
       ev.status === "done" ? "done" : ev.status,
       ev.error || undefined
     );
   }
   loadReproductionResults();
+  loadReproductionCandidates();
+  loadReproductionHistory();
   updateReproductionStartAvailability();
 }
 
@@ -1247,13 +1291,15 @@ function connectReproEvents(jobKey) {
       }
       appendLogToPane(reproductionLogPane, ev.message);
     } else if (ev.type === "stage") {
-      if (ev.stage === 5) updateReproductionStage(ev.status, ev.detail);
+      if ([0, 5, 6].includes(ev.stage)) {
+        updateReproductionStage(ev.stage, ev.status, ev.detail);
+      }
       if (ev.status === "done") {
         notifyStageCompleted("reproduction", ev.stage, ev.detail, jobKey);
       }
     } else if (ev.type === "progress") {
-      if (ev.stage === 5) {
-        updateReproductionProgress(ev.items_done, ev.items_total, ev.detail);
+      if ([0, 5, 6].includes(ev.stage)) {
+        updateReproductionProgress(ev.stage, ev.items_done, ev.items_total, ev.detail);
       }
     } else if (ev.type === "job") {
       handleJobLifecycleEvent(ev);
@@ -1294,24 +1340,32 @@ function updateProgress(n, done, total, detail) {
 }
 
 function resetReproductionStage() {
-  const row = $("reproduction-stage-row");
-  row.className = "";
-  row.querySelector(".stage-desc").textContent =
-    "Retest the selected vulnerability";
-  row.querySelector(".stage-status").textContent = STATUS_LABEL.pending;
-  row.querySelector(".stage-progress").textContent = "";
+  const descriptions = {
+    0: "Fetch and pin remote HEAD",
+    5: "Retest the selected vulnerability",
+    6: "Analyze and prepare Disclosure update",
+  };
+  for (const stage of [0, 5, 6]) {
+    const row = $(`reproduction-stage-row-${stage}`);
+    row.className = "";
+    row.querySelector(".stage-desc").textContent = descriptions[stage];
+    row.querySelector(".stage-status").textContent = STATUS_LABEL.pending;
+    row.querySelector(".stage-progress").textContent = "";
+  }
 }
 
-function updateReproductionStage(status, detail) {
-  const row = $("reproduction-stage-row");
+function updateReproductionStage(stage, status, detail) {
+  const row = $(`reproduction-stage-row-${stage}`);
+  if (!row) return;
   row.querySelector(".stage-status").textContent =
     STATUS_LABEL[status] || status;
   row.className = `stage-${status}`;
   if (detail) row.querySelector(".stage-desc").textContent = detail;
 }
 
-function updateReproductionProgress(done, total, detail) {
-  const row = $("reproduction-stage-row");
+function updateReproductionProgress(stage, done, total, detail) {
+  const row = $(`reproduction-stage-row-${stage}`);
+  if (!row) return;
   row.querySelector(".stage-progress").textContent =
     total > 0 ? `${done}/${total}` : "";
   if (detail) row.querySelector(".stage-desc").textContent = detail;
@@ -1850,6 +1904,11 @@ async function loadReproductionResults() {
     fillFileList(
       "reproduction-agent-logs",
       data.agent_logs,
+      viewReproductionFile
+    );
+    fillFileList(
+      "reproduction-review-files",
+      [...(data.reproduction_result || []), ...(data.reproduction_review || [])],
       viewReproductionFile
     );
     reproductionResultsPanel.hidden = false;
@@ -3234,6 +3293,8 @@ let disclosureLoadSequence = 0;
 let disclosureSearchTimer = null;
 let trashLoadSequence = 0;
 let trashSearchTimer = null;
+let trashVisibleEntries = [];
+const trashSelectedEntries = new Map();
 
 async function loadDisclosures() {
   const sequence = ++disclosureLoadSequence;
@@ -3307,6 +3368,19 @@ async function loadDisclosures() {
         [e],
         e.title || e.dedupe_key
       );
+      const reproduceButton = document.createElement("button");
+      reproduceButton.type = "button";
+      reproduceButton.className = "btn btn-reproduce";
+      reproduceButton.textContent = "Reproduce";
+      reproduceButton.addEventListener("click", () => {
+        pendingReproductionSelection = {
+          project: e.project,
+          dedupeKey: e.dedupe_key,
+        };
+        location.hash = "#/reproduction";
+        if (location.hash === "#/reproduction") route();
+      });
+      actionContainer.appendChild(reproduceButton);
       const editButton = document.createElement("button");
       editButton.type = "button";
       editButton.className = "btn btn-edit";
@@ -3338,6 +3412,11 @@ async function loadDisclosures() {
       const unavailable = unavailableReasons.length
         ? `<div class="kv evidence-unavailable">Unavailable actions: ${escapeHtml(unavailableReasons.join(" · "))}</div>`
         : "";
+      const latestReproduction = e.latest_reproduction
+        ? `<div class="kv">Latest retest: ${escapeHtml(e.latest_reproduction.outcome || e.latest_reproduction.state || "unknown")} at ` +
+          `<code>${escapeHtml((e.latest_reproduction.tested_commit || "").slice(0, 12) || "unresolved")}</code>` +
+          `${e.latest_reproduction.disposition ? ` · Agent: ${escapeHtml(e.latest_reproduction.disposition)}` : ""}</div>`
+        : `<div class="kv">Latest retest: not tested</div>`;
       details.innerHTML =
         `<td colspan="8"><details><summary>details</summary>` +
         `<div class="kv">${escapeHtml(e.summary) || "—"}</div>` +
@@ -3346,6 +3425,7 @@ async function loadDisclosures() {
         `<div class="kv">Repo: ${externalLinkHtml(e.repo_url, e.repo_url) || "—"} · ` +
         `backend: ${escapeHtml(e.model_backend) || "legacy record (not recorded)"}</div>` +
         `<div class="kv">Artifacts: ${artifacts || "—"}</div>` +
+        latestReproduction +
         unavailable +
         `</details></td>`;
       tbody.appendChild(details);
@@ -3439,7 +3519,7 @@ async function changeDisclosureStatus(project, dedupeKey, status) {
 async function moveDisclosureToTrash(entry, button) {
   const title = entry.title || entry.dedupe_key;
   if (!window.confirm(
-    `Move “${title}” to the recycle bin? After 30 days, the record and its linked Stage 6 disclosure artifacts will be permanently deleted. Stage 5 PoC files will be retained.`
+    `Move “${title}” to the recycle bin? After 30 days, its linked Stage 5 PoC and Stage 6 Disclosure artifacts will be permanently deleted.`
   )) return;
   button.disabled = true;
   try {
@@ -3489,6 +3569,31 @@ function trashDeadline(entry) {
   return `${fmtTime(entry.purge_at)} · ${days} day${days === 1 ? "" : "s"} left`;
 }
 
+function trashSelectionKey(entry) {
+  return `${entry.project}\n${entry.dedupe_key}`;
+}
+
+function clearTrashSelection() {
+  trashVisibleEntries = [];
+  trashSelectedEntries.clear();
+  updateTrashSelectionControls();
+}
+
+function updateTrashSelectionControls() {
+  const selected = trashSelectedEntries.size;
+  const button = $("trash-purge-selected");
+  button.disabled = selected === 0;
+  button.textContent = selected ? `Delete selected (${selected})` : "Delete selected";
+  const selectAll = $("trash-select-all");
+  const selectedVisible = trashVisibleEntries.filter((entry) =>
+    trashSelectedEntries.has(trashSelectionKey(entry))
+  ).length;
+  selectAll.disabled = trashVisibleEntries.length === 0;
+  selectAll.checked =
+    trashVisibleEntries.length > 0 && selectedVisible === trashVisibleEntries.length;
+  selectAll.indeterminate = selectedVisible > 0 && selectedVisible < trashVisibleEntries.length;
+}
+
 async function loadTrash() {
   const sequence = ++trashLoadSequence;
   const project = $("trash-project").value;
@@ -3498,12 +3603,14 @@ async function loadTrash() {
   if (search) params.set("q", search);
   const tbody = document.querySelector("#trash-table tbody");
   tbody.innerHTML = "";
+  clearTrashSelection();
   try {
     const res = await fetch(`/api/disclosures/trash?${params}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (sequence !== trashLoadSequence) return;
     const entries = data.entries || [];
+    trashVisibleEntries = entries;
     updateTrashNavigation(data.total || 0);
     renderTrashProjectOptions(data.projects || []);
     $("trash-purge-all").disabled = !(data.total || 0);
@@ -3514,6 +3621,7 @@ async function loadTrash() {
       const row = document.createElement("tr");
       row.className = "record-row";
       row.innerHTML =
+        `<td class="selection-cell"></td>` +
         `<td class="date-cell">${escapeHtml(fmtTime(entry.deleted_at))}</td>` +
         `<td class="date-cell">${escapeHtml(trashDeadline(entry))}</td>` +
         `<td class="project-cell">${escapeHtml(entry.project)}</td>` +
@@ -3521,6 +3629,20 @@ async function loadTrash() {
         `<td><span class="badge badge-disc-${escapeHtml(entry.review_status)}">` +
         `${escapeHtml(entry.review_status)}</span></td>` +
         `<td class="action-cell"><div class="row-actions"></div></td>`;
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "trash-row-select";
+      checkbox.setAttribute(
+        "aria-label",
+        `Select ${entry.title || entry.dedupe_key} for permanent deletion`
+      );
+      checkbox.addEventListener("change", () => {
+        const key = trashSelectionKey(entry);
+        if (checkbox.checked) trashSelectedEntries.set(key, entry);
+        else trashSelectedEntries.delete(key);
+        updateTrashSelectionControls();
+      });
+      row.querySelector(".selection-cell").appendChild(checkbox);
       const restore = document.createElement("button");
       restore.type = "button";
       restore.className = "btn btn-restore";
@@ -3535,14 +3657,15 @@ async function loadTrash() {
     }
     if (entries.length === 0) {
       tbody.innerHTML = search || project
-        ? `<tr><td colspan="6" class="dim">No deleted disclosures match the selected filters.</td></tr>`
-        : `<tr><td colspan="6" class="dim">The recycle bin is empty.</td></tr>`;
+        ? `<tr><td colspan="7" class="dim">No deleted disclosures match the selected filters.</td></tr>`
+        : `<tr><td colspan="7" class="dim">The recycle bin is empty.</td></tr>`;
     }
+    updateTrashSelectionControls();
   } catch (error) {
     if (sequence !== trashLoadSequence) return;
     $("trash-count").textContent = "Unavailable";
     tbody.innerHTML =
-      `<tr><td colspan="6" class="error">Failed to load: ` +
+      `<tr><td colspan="7" class="error">Failed to load: ` +
       `${escapeHtml(String(error))}</td></tr>`;
   }
 }
@@ -3575,7 +3698,7 @@ async function purgeAllTrash() {
   if (!total) return;
   if (!window.confirm(
     `Permanently delete all ${total} record${total === 1 ? "" : "s"} in the recycle bin? ` +
-    `Their linked Stage 6 disclosure artifacts will be deleted as well. Stage 5 PoC files are retained. This cannot be undone.`
+    `Their linked Stage 5 PoC and Stage 6 Disclosure artifacts will also be deleted. This cannot be undone.`
   )) return;
   button.disabled = true;
   try {
@@ -3583,6 +3706,7 @@ async function purgeAllTrash() {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
     const removed = data.removed || 0;
+    clearTrashSelection();
     $("trash-msg").textContent =
       `Permanently deleted ${removed} record${removed === 1 ? "" : "s"}.`;
     await Promise.all([loadTrash(), loadDisclosures()]);
@@ -3590,6 +3714,40 @@ async function purgeAllTrash() {
     $("trash-msg").textContent =
       `Empty recycle bin failed: ${error.message || error}`;
     button.disabled = false;
+  }
+}
+
+async function purgeSelectedTrash() {
+  const entries = [...trashSelectedEntries.values()];
+  if (!entries.length) return;
+  if (!window.confirm(
+    `Permanently delete ${entries.length} selected record${entries.length === 1 ? "" : "s"}? ` +
+    `Their linked Stage 5 PoC and Stage 6 Disclosure artifacts will also be deleted. This cannot be undone.`
+  )) return;
+  const button = $("trash-purge-selected");
+  button.disabled = true;
+  try {
+    const res = await fetch("/api/disclosures/trash/purge-selected", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        entries: entries.map((entry) => ({
+          project: entry.project,
+          dedupe_key: entry.dedupe_key,
+        })),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    const removed = data.removed || 0;
+    clearTrashSelection();
+    $("trash-msg").textContent =
+      `Permanently deleted ${removed} selected record${removed === 1 ? "" : "s"}.`;
+    await Promise.all([loadTrash(), loadDisclosures()]);
+  } catch (error) {
+    $("trash-msg").textContent =
+      `Delete selected failed: ${error.message || error}`;
+    updateTrashSelectionControls();
   }
 }
 
@@ -3605,6 +3763,19 @@ async function refreshTrashCount() {
 }
 
 $("trash-project").addEventListener("change", loadTrash);
+$("trash-select-all").addEventListener("change", (event) => {
+  const checked = event.currentTarget.checked;
+  for (const entry of trashVisibleEntries) {
+    const key = trashSelectionKey(entry);
+    if (checked) trashSelectedEntries.set(key, entry);
+    else trashSelectedEntries.delete(key);
+  }
+  document.querySelectorAll("#trash-table .trash-row-select").forEach((checkbox) => {
+    checkbox.checked = checked;
+  });
+  updateTrashSelectionControls();
+});
+$("trash-purge-selected").addEventListener("click", purgeSelectedTrash);
 $("trash-purge-all").addEventListener("click", purgeAllTrash);
 $("trash-search").addEventListener("input", () => {
   clearTimeout(trashSearchTimer);
@@ -4436,10 +4607,18 @@ function route() {
     });
     loadTargetView(decodeURIComponent(targetMatch[1]));
   } else if (hash.startsWith("#/reproduction")) {
-    // Standalone reproduction remains available to the backend for operators,
-    // but is no longer a normal-user navigation surface.
-    location.hash = "#/";
-    return;
+    views.reproduction.hidden = false;
+    tabs.forEach((t) => {
+      if (t.dataset.route === "reproduction") t.classList.add("tab-active");
+    });
+    loadReproductionCandidates();
+    loadReproductionHistory();
+    const repro = busyReproductionJob();
+    if (repro && repro.job_key !== activeReproKey) {
+      attachReproductionJob(repro);
+    } else if (!repro) {
+      updateReproductionStartAvailability();
+    }
   } else if (hash.startsWith("#/disclosures")) {
     views.disclosures.hidden = false;
     tabs.forEach((t) => {

@@ -27,6 +27,10 @@ and never retain an artifact outside `__POC_DIR__`.
 
 Start by reading the vulnerability JSON file to understand the finding details, then proceed to designing the reproduction strategy.
 
+## Reproduction Context
+
+__REPRODUCTION_CONTEXT__
+
 ## Wiki Knowledge Base
 
 __WIKI_CONTEXT__

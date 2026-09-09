@@ -9,6 +9,7 @@ Only stdlib ``sqlite3`` is used. A fresh connection is opened per operation,
 which keeps the store safe to share between the web server's thread pool and
 the asyncio event loop.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -20,7 +21,8 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from uuid import uuid4
 
 from .config import AuditConfig
 from .disclosures import build_dedupe_key, extract_email_subject
@@ -33,7 +35,11 @@ from .poc_artifacts import (
 )
 from .repos import DEFAULT_REPOS_DIR, capture_repo_identity, list_cloned_repos
 from .retention import RetentionError, load_retain_manifest
-from .reproduction_status import REPRODUCED_STATUSES, read_reproduction_status
+from .reproduction_status import (
+    FAILED_STATUSES,
+    REPRODUCED_STATUSES,
+    read_reproduction_status,
+)
 from .utils import natural_sort_key
 
 DEFAULT_DB_PATH = os.path.join("~", ".code_auditor", "audits.db")
@@ -180,6 +186,43 @@ CREATE TABLE IF NOT EXISTS disclosed_bugs (
 );
 CREATE INDEX IF NOT EXISTS idx_disclosed_status ON disclosed_bugs(review_status);
 CREATE INDEX IF NOT EXISTS idx_disclosed_project ON disclosed_bugs(project);
+CREATE TABLE IF NOT EXISTS reproduction_runs (
+    job_key TEXT PRIMARY KEY,
+    disclosure_id INTEGER REFERENCES disclosed_bugs(id) ON DELETE SET NULL,
+    project TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    source_run_id INTEGER,
+    source_vuln_id TEXT,
+    repo_url TEXT,
+    base_commit TEXT,
+    target_ref TEXT,
+    tested_commit TEXT,
+    state TEXT NOT NULL,
+    outcome TEXT,
+    disposition TEXT,
+    evidence_level TEXT,
+    summary TEXT,
+    source_analysis TEXT,
+    disclosure_update TEXT,
+    backend TEXT,
+    model TEXT,
+    sandbox_mode TEXT,
+    sandbox_runtime TEXT,
+    output_dir TEXT NOT NULL,
+    result_path TEXT,
+    assessment_path TEXT,
+    retest_report_path TEXT,
+    draft_path TEXT,
+    error TEXT DEFAULT '',
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    applied_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reproduction_disclosure
+    ON reproduction_runs(project, dedupe_key, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reproduction_state
+    ON reproduction_runs(state, started_at DESC);
 CREATE TABLE IF NOT EXISTS cves (
     cve_id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
@@ -274,24 +317,24 @@ def _parse_output_dir_date(name: str) -> float | None:
 # Extra run columns added after the initial schema; migrated via
 # ALTER TABLE in AuditStore._init_schema for existing databases.
 _RUN_EXTRA_COLUMNS = {
-    "repo_name": '"repo_name" TEXT DEFAULT \'\'',
-    "repo_url": '"repo_url" TEXT DEFAULT \'\'',
-    "branch": '"branch" TEXT DEFAULT \'\'',
-    "commit": '"commit" TEXT DEFAULT \'\'',
+    "repo_name": "\"repo_name\" TEXT DEFAULT ''",
+    "repo_url": "\"repo_url\" TEXT DEFAULT ''",
+    "branch": "\"branch\" TEXT DEFAULT ''",
+    "commit": "\"commit\" TEXT DEFAULT ''",
     "dirty": '"dirty" INTEGER DEFAULT 0',
-    "submodules": '"submodules" TEXT DEFAULT \'[]\'',
-    "target_key": '"target_key" TEXT DEFAULT \'\'',
-    "backends_used": '"backends_used" TEXT DEFAULT \'[]\'',
-    "models_used": '"models_used" TEXT DEFAULT \'[]\'',
-    "usage_stats": '"usage_stats" TEXT DEFAULT \'{}\'',
+    "submodules": "\"submodules\" TEXT DEFAULT '[]'",
+    "target_key": "\"target_key\" TEXT DEFAULT ''",
+    "backends_used": "\"backends_used\" TEXT DEFAULT '[]'",
+    "models_used": "\"models_used\" TEXT DEFAULT '[]'",
+    "usage_stats": "\"usage_stats\" TEXT DEFAULT '{}'",
     "duration_seconds": '"duration_seconds" REAL NOT NULL DEFAULT 0',
     "active_started_at": '"active_started_at" REAL',
     "duration_known": '"duration_known" INTEGER NOT NULL DEFAULT 1',
-    "run_kind": '"run_kind" TEXT NOT NULL DEFAULT \'audit\'',
+    "run_kind": "\"run_kind\" TEXT NOT NULL DEFAULT 'audit'",
     # A terminal maintenance run may carry a non-fatal cleanup note. Keep it
     # separate from ``error`` so the History badge does not report a completed
     # batch as ``done ⚠`` while retaining the diagnostic for the detail view.
-    "warning": '"warning" TEXT DEFAULT \'\'',
+    "warning": "\"warning\" TEXT DEFAULT ''",
 }
 
 _DISCLOSED_BUGS_V2_SCHEMA = """
@@ -316,6 +359,8 @@ CREATE TABLE disclosed_bugs_v2 (
     UNIQUE(project, dedupe_key)
 )
 """
+
+
 def compute_target_key(identity: dict) -> str:
     """Stable key for (repo name, commit, submodule commits)."""
     commit = identity.get("commit") or ""
@@ -380,10 +425,7 @@ def _stage5_terminal_paths(
 ) -> tuple[str, str, str, str] | None:
     """Resolve a registered Stage 5 report to its output and PoC directories."""
     for artifact in artifacts:
-        if (
-            not isinstance(artifact, dict)
-            or artifact.get("label") != "Stage 5 Report"
-        ):
+        if not isinstance(artifact, dict) or artifact.get("label") != "Stage 5 Report":
             continue
         path = artifact.get("path")
         if not isinstance(path, str) or not path:
@@ -402,9 +444,7 @@ def _stage5_terminal_paths(
     return None
 
 
-def _registered_stage5_report(
-    output_dir: str, report_value: object
-) -> str | None:
+def _registered_stage5_report(output_dir: str, report_value: object) -> str | None:
     """Resolve a reproduced PoC report only when it is still on disk."""
     if not output_dir:
         return None
@@ -414,7 +454,9 @@ def _registered_stage5_report(
     if not root:
         return None
     resolved = os.path.realpath(
-        report_value if os.path.isabs(report_value) else os.path.join(root, report_value)
+        report_value
+        if os.path.isabs(report_value)
+        else os.path.join(root, report_value)
     )
     if not resolved.startswith(root + os.sep) or not os.path.isfile(resolved):
         return None
@@ -434,10 +476,7 @@ def _stage6_terminal_paths(
 ) -> tuple[str, str, str, str] | None:
     """Resolve a retained Stage 6 reproducer to its disclosure directory."""
     for artifact in artifacts:
-        if (
-            not isinstance(artifact, dict)
-            or artifact.get("label") != "Stage 6 Report"
-        ):
+        if not isinstance(artifact, dict) or artifact.get("label") != "Stage 6 Report":
             continue
         path = artifact.get("path")
         if not isinstance(path, str) or not path:
@@ -462,12 +501,9 @@ def _stage6_terminal_paths(
             )
         except RetentionError:
             continue
-        entrypoint = os.path.realpath(
-            os.path.join(disclosure_dir, manifest.entrypoint)
-        )
-        if (
-            not entrypoint.startswith(disclosure_dir + os.sep)
-            or not os.path.isfile(entrypoint)
+        entrypoint = os.path.realpath(os.path.join(disclosure_dir, manifest.entrypoint))
+        if not entrypoint.startswith(disclosure_dir + os.sep) or not os.path.isfile(
+            entrypoint
         ):
             continue
         return os.path.dirname(stage6_dir), disclosure_dir, report_file, vuln_id
@@ -498,9 +534,7 @@ def _retained_stage6_evidence(
     trigger_graph_path = ""
     if TRIGGER_GRAPH_FILENAME in evidence_paths:
         graph = disclosure_dir / TRIGGER_GRAPH_FILENAME
-        _, graph_errors = load_trigger_graph(
-            str(graph), expected_finding_id=vuln_id
-        )
+        _, graph_errors = load_trigger_graph(str(graph), expected_finding_id=vuln_id)
         if graph_errors:
             logger.warning(
                 "Ignoring invalid retained Stage 6 trigger graph %s: %s",
@@ -617,7 +651,11 @@ def scan_output_dir(
                 }
             )
 
-    for path in sorted((base / "stage3-findings").glob("*.json")) if (base / "stage3-findings").is_dir() else []:
+    for path in (
+        sorted((base / "stage3-findings").glob("*.json"))
+        if (base / "stage3-findings").is_dir()
+        else []
+    ):
         finding = _parse_finding(path, base)
         if finding:
             result["findings"].append(finding)
@@ -903,7 +941,9 @@ class AuditStore:
                 )
         return self._public_user(row) if row is not None else None
 
-    def revoke_auth_session(self, token_digest: str, *, now: float | None = None) -> None:
+    def revoke_auth_session(
+        self, token_digest: str, *, now: float | None = None
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE sessions SET revoked_at = ? "
@@ -1002,9 +1042,7 @@ class AuditStore:
                     "ALTER TABLE disclosures ADD COLUMN trigger_graph_path TEXT"
                 )
             if "asan_report_path" not in disclosure_existing:
-                conn.execute(
-                    "ALTER TABLE disclosures ADD COLUMN asan_report_path TEXT"
-                )
+                conn.execute("ALTER TABLE disclosures ADD COLUMN asan_report_path TEXT")
             if "discovered_path" in existing:
                 conn.execute("ALTER TABLE runs DROP COLUMN discovered_path")
             disclosed_existing = {
@@ -1081,10 +1119,9 @@ class AuditStore:
 
         result: set[str] = set()
         for artifact in artifacts:
-            if (
-                not isinstance(artifact, dict)
-                or not str(artifact.get("label") or "").startswith("Stage 6 ")
-            ):
+            if not isinstance(artifact, dict) or not str(
+                artifact.get("label") or ""
+            ).startswith("Stage 6 "):
                 continue
             path = artifact.get("path")
             if not isinstance(path, str) or not path or "\x00" in path:
@@ -1110,9 +1147,56 @@ class AuditStore:
                 result.add(disclosure_dir)
         return result
 
+    def _stage5_poc_dirs(
+        self,
+        artifacts_json: str,
+        registered_stage5_dirs: set[str],
+    ) -> set[str]:
+        """Resolve only registered Stage 5 ``<vuln>`` PoC directories."""
+        try:
+            artifacts = json.loads(artifacts_json or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return set()
+        if not isinstance(artifacts, list):
+            return set()
+
+        result: set[str] = set()
+        for artifact in artifacts:
+            if (
+                not isinstance(artifact, dict)
+                or artifact.get("label") != "Stage 5 Report"
+            ):
+                continue
+            path = artifact.get("path")
+            if not isinstance(path, str) or not path or "\x00" in path:
+                continue
+            artifact_path = os.path.realpath(os.path.expanduser(path))
+            poc_dir = os.path.dirname(artifact_path)
+            stage5_dir = os.path.dirname(poc_dir)
+            vuln_id = os.path.basename(poc_dir)
+            if (
+                os.path.basename(stage5_dir) != "stage5-pocs"
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", vuln_id) is None
+                or not self._path_is_within(artifact_path, poc_dir)
+            ):
+                continue
+
+            below_managed_results = bool(
+                self.managed_results_dir
+                and self._path_is_within(stage5_dir, self.managed_results_dir)
+            )
+            if below_managed_results or stage5_dir in registered_stage5_dirs:
+                result.add(poc_dir)
+        return result
+
     def _purge_expired_disclosures(
-        self, conn: sqlite3.Connection, now: float
+        self,
+        conn: sqlite3.Connection,
+        now: float,
+        identities: set[tuple[str, str]] | None = None,
     ) -> int:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         cutoff = now - DISCLOSURE_TRASH_RETENTION_SECONDS
         expired = conn.execute(
             """
@@ -1121,10 +1205,17 @@ class AuditStore:
             """,
             (cutoff,),
         ).fetchall()
+        if identities is not None:
+            expired = [
+                row
+                for row in expired
+                if (str(row["project"]), str(row["dedupe_key"])) in identities
+            ]
         if not expired:
             return 0
 
         registered_stage6_runs: dict[str, list[int]] = {}
+        registered_stage5_runs: dict[str, list[int]] = {}
         for row in conn.execute(
             """
             SELECT id, output_dir FROM runs
@@ -1135,80 +1226,165 @@ class AuditStore:
                 os.path.realpath(os.path.expanduser(str(row["output_dir"]))),
                 "stage6-disclosures",
             )
+            stage5_dir = os.path.join(
+                os.path.realpath(os.path.expanduser(str(row["output_dir"]))),
+                "stage5-pocs",
+            )
             registered_stage6_runs.setdefault(stage6_dir, []).append(int(row["id"]))
+            registered_stage5_runs.setdefault(stage5_dir, []).append(int(row["id"]))
         registered_stage6_dirs = set(registered_stage6_runs)
-        protected_dirs: set[str] = set()
+        registered_stage5_dirs = set(registered_stage5_runs)
+        protected_disclosure_dirs: set[str] = set()
+        protected_poc_dirs: set[str] = set()
+        purge_identities = {
+            (str(row["project"]), str(row["dedupe_key"])) for row in expired
+        }
         for row in conn.execute(
             """
-            SELECT artifact_links FROM disclosed_bugs
-            WHERE deleted_at IS NULL OR deleted_at > ?
+            SELECT project, dedupe_key, artifact_links FROM disclosed_bugs
             """,
-            (cutoff,),
         ).fetchall():
-            protected_dirs.update(
+            if (str(row["project"]), str(row["dedupe_key"])) in purge_identities:
+                continue
+            protected_disclosure_dirs.update(
                 self._stage6_disclosure_dirs(
                     row["artifact_links"] or "[]", registered_stage6_dirs
                 )
             )
+            protected_poc_dirs.update(
+                self._stage5_poc_dirs(
+                    row["artifact_links"] or "[]", registered_stage5_dirs
+                )
+            )
 
-        purgeable: list[tuple[str, str]] = []
         deleted_disclosure_dirs: set[str] = set()
+        deleted_poc_dirs: set[str] = set()
         for row in expired:
-            disclosure_dirs = self._stage6_disclosure_dirs(
-                row["artifact_links"] or "[]", registered_stage6_dirs
-            ) - protected_dirs
-            try:
-                for disclosure_dir in disclosure_dirs:
-                    if os.path.lexists(disclosure_dir):
-                        shutil.rmtree(disclosure_dir)
-            except OSError as exc:
-                logger.warning(
-                    "Retaining expired Disclosure %s/%s because Stage 6 "
-                    "cleanup failed: %s",
-                    row["project"],
-                    row["dedupe_key"],
-                    exc,
+            deleted_disclosure_dirs.update(
+                self._stage6_disclosure_dirs(
+                    row["artifact_links"] or "[]", registered_stage6_dirs
                 )
-                continue
-            deleted_disclosure_dirs.update(disclosure_dirs)
-            purgeable.append((str(row["project"]), str(row["dedupe_key"])))
+                - protected_disclosure_dirs
+            )
+            deleted_poc_dirs.update(
+                self._stage5_poc_dirs(
+                    row["artifact_links"] or "[]", registered_stage5_dirs
+                )
+                - protected_poc_dirs
+            )
 
-        if not purgeable:
+        # Stage every managed artifact directory with same-filesystem renames
+        # before changing SQLite. A failure restores the entire batch, avoiding
+        # a record whose Stage 5 directory vanished while Stage 6 remained.
+        quarantined: list[tuple[str, str]] = []
+        try:
+            for artifact_dir in sorted(deleted_disclosure_dirs | deleted_poc_dirs):
+                if not os.path.lexists(artifact_dir):
+                    continue
+                quarantine = os.path.join(
+                    os.path.dirname(artifact_dir),
+                    f".{os.path.basename(artifact_dir)}.purge-{uuid4().hex}",
+                )
+                os.replace(artifact_dir, quarantine)
+                quarantined.append((artifact_dir, quarantine))
+        except OSError as exc:
+            for artifact_dir, quarantine in reversed(quarantined):
+                try:
+                    if os.path.lexists(quarantine) and not os.path.lexists(
+                        artifact_dir
+                    ):
+                        os.replace(quarantine, artifact_dir)
+                except OSError:
+                    logger.exception(
+                        "Could not restore Disclosure artifact after cleanup staging "
+                        "failed: %s",
+                        artifact_dir,
+                    )
+            logger.warning(
+                "Retaining %d expired Disclosure record(s) because artifact cleanup "
+                "could not be staged: %s",
+                len(expired),
+                exc,
+            )
             return 0
-        removed = 0
-        for project, dedupe_key in purgeable:
-            cursor = conn.execute(
-                """
-                DELETE FROM disclosed_bugs
-                WHERE project = ? AND dedupe_key = ?
-                  AND deleted_at IS NOT NULL AND deleted_at <= ?
-                """,
-                (project, dedupe_key, cutoff),
-            )
-            removed += cursor.rowcount
 
-        affected_run_ids: set[int] = set()
-        for disclosure_dir in deleted_disclosure_dirs:
-            vuln_dir = os.path.dirname(disclosure_dir)
-            stage6_dir = os.path.dirname(vuln_dir)
-            vuln_id = os.path.basename(vuln_dir)
-            for run_id in registered_stage6_runs.get(stage6_dir, []):
+        removed = 0
+        try:
+            for row in expired:
                 cursor = conn.execute(
-                    "DELETE FROM disclosures WHERE run_id = ? AND vuln_id = ?",
-                    (run_id, vuln_id),
+                    """
+                    DELETE FROM disclosed_bugs
+                    WHERE project = ? AND dedupe_key = ?
+                      AND deleted_at IS NOT NULL AND deleted_at <= ?
+                    """,
+                    (row["project"], row["dedupe_key"], cutoff),
                 )
-                if cursor.rowcount:
-                    affected_run_ids.add(run_id)
-        for run_id in affected_run_ids:
-            conn.execute(
-                """
-                UPDATE runs SET disclosures_count = (
-                    SELECT COUNT(*) FROM disclosures WHERE disclosures.run_id = runs.id
-                ) WHERE id = ?
-                """,
-                (run_id,),
-            )
-        self._clear_nonconfirmed_cve_links(conn)
+                removed += cursor.rowcount
+
+            affected_run_ids: set[int] = set()
+            for disclosure_dir in deleted_disclosure_dirs:
+                vuln_dir = os.path.dirname(disclosure_dir)
+                stage6_dir = os.path.dirname(vuln_dir)
+                vuln_id = os.path.basename(vuln_dir)
+                for run_id in registered_stage6_runs.get(stage6_dir, []):
+                    cursor = conn.execute(
+                        "DELETE FROM disclosures WHERE run_id = ? AND vuln_id = ?",
+                        (run_id, vuln_id),
+                    )
+                    if cursor.rowcount:
+                        affected_run_ids.add(run_id)
+            for poc_dir in deleted_poc_dirs:
+                stage5_dir = os.path.dirname(poc_dir)
+                vuln_id = os.path.basename(poc_dir)
+                for run_id in registered_stage5_runs.get(stage5_dir, []):
+                    cursor = conn.execute(
+                        "DELETE FROM pocs WHERE run_id = ? AND vuln_id = ?",
+                        (run_id, vuln_id),
+                    )
+                    if cursor.rowcount:
+                        affected_run_ids.add(run_id)
+            reproduced_statuses = sorted(REPRODUCED_STATUSES)
+            reproduced_placeholders = ",".join("?" * len(reproduced_statuses))
+            for run_id in affected_run_ids:
+                conn.execute(
+                    f"""
+                    UPDATE runs SET pocs_reproduced_count = (
+                        SELECT COUNT(*) FROM pocs
+                        WHERE pocs.run_id = runs.id
+                          AND pocs.status IN ({reproduced_placeholders})
+                    ), disclosures_count = (
+                        SELECT COUNT(*) FROM disclosures WHERE disclosures.run_id = runs.id
+                    ) WHERE id = ?
+                    """,
+                    (*reproduced_statuses, run_id),
+                )
+            self._clear_nonconfirmed_cve_links(conn)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            for artifact_dir, quarantine in reversed(quarantined):
+                try:
+                    if os.path.lexists(quarantine) and not os.path.lexists(
+                        artifact_dir
+                    ):
+                        os.replace(quarantine, artifact_dir)
+                except OSError:
+                    logger.exception(
+                        "Could not restore Disclosure artifact after database cleanup "
+                        "failed: %s",
+                        artifact_dir,
+                    )
+            raise
+
+        for _artifact_dir, quarantine in quarantined:
+            try:
+                shutil.rmtree(quarantine)
+            except OSError:
+                logger.exception(
+                    "Disclosure metadata was removed but quarantined artifacts could "
+                    "not be erased: %s",
+                    quarantine,
+                )
         return removed
 
     @staticmethod
@@ -1288,9 +1464,7 @@ class AuditStore:
         conn.execute(
             "CREATE INDEX idx_disclosed_status ON disclosed_bugs(review_status)"
         )
-        conn.execute(
-            "CREATE INDEX idx_disclosed_project ON disclosed_bugs(project)"
-        )
+        conn.execute("CREATE INDEX idx_disclosed_project ON disclosed_bugs(project)")
 
     def _backfill_identities(self) -> None:
         """Best-effort identity capture for rows recorded before it existed."""
@@ -1456,8 +1630,7 @@ class AuditStore:
                     label = artifact.get("label")
                     path = artifact.get("path")
                     if (
-                        label
-                        in {"Stage 5 Trigger Graph", "Stage 5 ASan Report"}
+                        label in {"Stage 5 Trigger Graph", "Stage 5 ASan Report"}
                         and isinstance(path, str)
                         and any(
                             self._path_is_within(
@@ -1704,8 +1877,7 @@ class AuditStore:
                     "row": row,
                     "vuln_ids": vuln_ids,
                     "pocs": {
-                        str(item["vuln_id"]): item["report_path"]
-                        for item in poc_rows
+                        str(item["vuln_id"]): item["report_path"] for item in poc_rows
                     },
                 }
 
@@ -1719,7 +1891,8 @@ class AuditStore:
                 }:
                     continue
                 identity = str(row["target_key"] or "") or (
-                    str(row["target"] or ""), str(row["commit"] or "")
+                    str(row["target"] or ""),
+                    str(row["commit"] or ""),
                 )
                 for later_id, later in run_data.items():
                     if later_id <= run_id:
@@ -1731,9 +1904,10 @@ class AuditStore:
                     )
                     if later_identity != identity:
                         continue
-                    if later_row["status"] != RUN_DONE or str(
-                        later_row["error"] or ""
-                    ).strip():
+                    if (
+                        later_row["status"] != RUN_DONE
+                        or str(later_row["error"] or "").strip()
+                    ):
                         continue
                     clean_later.setdefault(run_id, []).append(
                         (later_id, set(later["pocs"]))
@@ -2160,11 +2334,22 @@ class AuditStore:
                         vulnerability_class, root_cause, preliminary_severity, raw_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (run_id, *[finding[k] for k in (
-                        "finding_key", "au_id", "title", "location",
-                        "vulnerability_class", "root_cause",
-                        "preliminary_severity", "raw_json",
-                    )]),
+                    (
+                        run_id,
+                        *[
+                            finding[k]
+                            for k in (
+                                "finding_key",
+                                "au_id",
+                                "title",
+                                "location",
+                                "vulnerability_class",
+                                "root_cause",
+                                "preliminary_severity",
+                                "raw_json",
+                            )
+                        ],
+                    ),
                 )
             for vuln in artifacts["vulnerabilities"]:
                 conn.execute(
@@ -2176,13 +2361,31 @@ class AuditStore:
                         impact, code_snippet, dedupe_key, raw_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (run_id, *[vuln[k] for k in (
-                        "vuln_id", "severity", "cvss_score", "title", "location",
-                        "trigger", "cwe_ids", "vulnerability_class", "entry_point",
-                        "sink", "propagation_chain", "neutralizing_checks",
-                        "prerequisites", "impact", "code_snippet", "dedupe_key",
-                        "raw_json",
-                    )]),
+                    (
+                        run_id,
+                        *[
+                            vuln[k]
+                            for k in (
+                                "vuln_id",
+                                "severity",
+                                "cvss_score",
+                                "title",
+                                "location",
+                                "trigger",
+                                "cwe_ids",
+                                "vulnerability_class",
+                                "entry_point",
+                                "sink",
+                                "propagation_chain",
+                                "neutralizing_checks",
+                                "prerequisites",
+                                "impact",
+                                "code_snippet",
+                                "dedupe_key",
+                                "raw_json",
+                            )
+                        ],
+                    ),
                 )
             for poc in artifacts["pocs"]:
                 conn.execute(
@@ -2232,11 +2435,7 @@ class AuditStore:
                     len(artifacts["findings"]),
                     len(artifacts["vulnerabilities"]),
                     reproduced,
-                    sum(
-                        1
-                        for d in artifacts["disclosures"]
-                        if d["report_path"]
-                    ),
+                    sum(1 for d in artifacts["disclosures"] if d["report_path"]),
                     run_id,
                 ),
             )
@@ -2258,6 +2457,59 @@ class AuditStore:
             if not candidate.startswith(output_root + os.sep):
                 return None
             return candidate if os.path.isfile(candidate) else None
+
+        # A cleared report path must not hide a later negative/partial result.
+        # Keep the evidence and human decisions: only unreviewed records move
+        # to triage, and another retained successful run takes precedence.
+        bad_rows = conn.execute(
+            """
+            SELECT b.id, b.dedupe_key, b.summary, p.status
+            FROM disclosed_bugs b
+            JOIN vulnerabilities v ON v.dedupe_key = b.dedupe_key
+            JOIN pocs p ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+            WHERE v.run_id = ? AND b.deleted_at IS NULL
+              AND b.review_status = 'unreviewed'
+              AND p.status != 'reproduced'
+            """,
+            (run_id,),
+        ).fetchall()
+        for bad in bad_rows:
+            if bad["status"] not in FAILED_STATUSES:
+                # Unknown/in-progress evidence is not a completed negative review.
+                continue
+            alternatives = conn.execute(
+                """
+                SELECT r.output_dir, p.report_path, d.report_path AS disclosure_report
+                FROM vulnerabilities v JOIN runs r ON r.id = v.run_id
+                JOIN pocs p ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+                LEFT JOIN disclosures d ON d.run_id = v.run_id AND d.vuln_id = v.vuln_id
+                WHERE v.dedupe_key = ? AND p.status = 'reproduced'
+                """,
+                (bad["dedupe_key"],),
+            ).fetchall()
+            retained_success = False
+            for alternative in alternatives:
+                root = Path(alternative["output_dir"]).resolve()
+                for name in ("report_path", "disclosure_report"):
+                    raw = alternative[name]
+                    if not raw:
+                        continue
+                    path = Path(raw)
+                    path = (path if path.is_absolute() else root / path).resolve()
+                    if path.is_relative_to(root) and path.is_file():
+                        retained_success = True
+            if retained_success:
+                continue
+            note = (
+                f"Evidence review required: run {run_id} records Stage 5 "
+                f"status {bad['status']}; no retained successful run was found."
+            )
+            summary = "\n\n".join(value for value in (bad["summary"], note) if value)
+            conn.execute(
+                """UPDATE disclosed_bugs SET review_status = 'triage',
+                   summary = ?, updated_at = ? WHERE id = ? AND review_status = 'unreviewed'""",
+                (summary, time.time(), bad["id"]),
+            )
 
         rows = conn.execute(
             """
@@ -2283,19 +2535,6 @@ class AuditStore:
             (run_id,),
         ).fetchall()
         reproduced = REPRODUCED_STATUSES
-        # Remove any previously-synced entries for this run whose PoC is no
-        # longer reproduced (e.g. re-runs that flipped to false-positive).
-        non_reproduced_keys = [
-            row["dedupe_key"]
-            for row in rows
-            if row["dedupe_key"] and (row["p_status"] not in reproduced)
-        ]
-        if non_reproduced_keys:
-            placeholders = ",".join("?" * len(non_reproduced_keys))
-            conn.execute(
-                f"DELETE FROM disclosed_bugs WHERE dedupe_key IN ({placeholders})",
-                non_reproduced_keys,
-            )
         now = time.time()
         for row in rows:
             if row["p_status"] not in reproduced:
@@ -2313,12 +2552,9 @@ class AuditStore:
                 row["disclosure_asan_report_path"]
             ) or resolved_file(row["poc_asan_report_path"])
             finding_path = resolved_file(
-                os.path.join(
-                    "stage4-vulnerabilities", f"{row['vuln_id']}.json"
-                )
+                os.path.join("stage4-vulnerabilities", f"{row['vuln_id']}.json")
             )
-            artifacts = []
-            for label, path in (
+            stage_artifacts = (
                 ("Stage 4 Finding", finding_path),
                 ("Stage 5 Report", poc_path),
                 ("Stage 5 Trigger Graph", trigger_graph_path),
@@ -2326,7 +2562,9 @@ class AuditStore:
                 ("Stage 6 Report", report_path),
                 ("Stage 6 Email", email_path),
                 ("Stage 6 Zip", zip_path),
-            ):
+            )
+            artifacts = []
+            for label, path in stage_artifacts:
                 if path:
                     artifacts.append({"label": label, "path": path})
             try:
@@ -2349,6 +2587,32 @@ class AuditStore:
             project = _project_name_from_repo_url(
                 row["repo_url"] or "", project_fallback
             )
+            # Refresh generated links while retaining registered review notes
+            # and other supplemental attachments across future run syncs.
+            previous = conn.execute(
+                "SELECT artifact_links FROM disclosed_bugs WHERE project = ? AND dedupe_key = ?",
+                (project, row["dedupe_key"]),
+            ).fetchone()
+            try:
+                supplements = (
+                    json.loads(previous["artifact_links"] or "[]") if previous else []
+                )
+            except (json.JSONDecodeError, TypeError):
+                supplements = []
+            stage_labels = {label for label, _ in stage_artifacts}
+            known_paths = {artifact["path"] for artifact in artifacts}
+            for attachment in supplements if isinstance(supplements, list) else []:
+                if (
+                    not isinstance(attachment, dict)
+                    or not isinstance(attachment.get("label"), str)
+                    or not isinstance(attachment.get("path"), str)
+                    or not attachment["path"]
+                    or attachment["label"] in stage_labels
+                    or attachment["path"] in known_paths
+                ):
+                    continue
+                artifacts.append(attachment)
+                known_paths.add(attachment["path"])
             finished_at = row["ended_at"] or row["started_at"] or row["created_at"]
             audit_date = (
                 datetime.fromtimestamp(float(finished_at)).date().isoformat()
@@ -2365,6 +2629,7 @@ class AuditStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project, dedupe_key) DO UPDATE SET
                     title = CASE WHEN excluded.title != ''
+                        AND disclosed_bugs.review_status = 'unreviewed'
                         THEN excluded.title ELSE disclosed_bugs.title END,
                     location = CASE WHEN excluded.location != ''
                         THEN excluded.location ELSE disclosed_bugs.location END,
@@ -2376,7 +2641,7 @@ class AuditStore:
                         ELSE disclosed_bugs.vulnerability_class END,
                     trigger = CASE WHEN excluded.trigger != ''
                         THEN excluded.trigger ELSE disclosed_bugs.trigger END,
-                    summary = CASE WHEN excluded.summary != ''
+                    summary = CASE WHEN COALESCE(disclosed_bugs.summary, '') = ''
                         THEN excluded.summary ELSE disclosed_bugs.summary END,
                     repo_url = CASE WHEN excluded.repo_url != ''
                         THEN excluded.repo_url ELSE disclosed_bugs.repo_url END,
@@ -2458,7 +2723,9 @@ class AuditStore:
                 "COALESCE(r.models_used, '')",
             )
             clauses.append(
-                "(" + " OR ".join(f"instr(lower({field}), ?) > 0" for field in searchable) + ")"
+                "("
+                + " OR ".join(f"instr(lower({field}), ?) > 0" for field in searchable)
+                + ")"
             )
             args.extend([needle] * len(searchable))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -2487,9 +2754,7 @@ class AuditStore:
             ).fetchall()
         result = [dict(row) for row in rows]
         for run in result:
-            if str(run.get("output_dir") or "").endswith(
-                _POC_BACKFILL_OUTPUT_SUFFIX
-            ):
+            if str(run.get("output_dir") or "").endswith(_POC_BACKFILL_OUTPUT_SUFFIX):
                 run["run_kind"] = RUN_KIND_MAINTENANCE
         return result, total
 
@@ -2571,9 +2836,7 @@ class AuditStore:
             if row is None:
                 return None
             run = dict(row)
-            if str(run.get("output_dir") or "").endswith(
-                _POC_BACKFILL_OUTPUT_SUFFIX
-            ):
+            if str(run.get("output_dir") or "").endswith(_POC_BACKFILL_OUTPUT_SUFFIX):
                 run["run_kind"] = RUN_KIND_MAINTENANCE
             statuses = sorted(REPRODUCED_STATUSES)
             status_placeholders = ",".join("?" * len(statuses))
@@ -2633,13 +2896,8 @@ class AuditStore:
                 run["related_run_ids"] = []
         return run
 
-    def list_reproduction_candidates(self) -> list[dict]:
-        """List vulnerabilities with an exactly reproduced PoC.
-
-        ``partially-reproduced`` is intentionally excluded: it is treated as
-        an unsuccessful reproduction throughout the Web UI and disclosure
-        pipeline.
-        """
+    def list_history_reproduction_candidates(self) -> list[dict]:
+        """List historical vulnerabilities with an exactly reproduced PoC."""
         with self._connect() as conn:
             rows = [
                 dict(row)
@@ -2669,6 +2927,387 @@ class AuditStore:
         )
         return rows
 
+    def _disclosure_reproduction_source(
+        self,
+        conn: sqlite3.Connection,
+        dedupe_key: str,
+        project: str,
+    ) -> dict | None:
+        rows = conn.execute(
+            """
+            SELECT v.run_id, v.vuln_id, v.severity, v.cvss_score, v.title,
+                   v.location, v.raw_json, r.repo_name, r.repo_url, r.branch,
+                   r."commit", r.target, r.output_dir, r.wiki_path,
+                   p.status AS poc_status, p.report_path AS poc_report_path
+            FROM vulnerabilities v
+            JOIN runs r ON r.id = v.run_id
+            LEFT JOIN pocs p
+              ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+            WHERE v.dedupe_key = ?
+            ORDER BY CASE WHEN p.status = 'reproduced' THEN 0 ELSE 1 END,
+                     r.id DESC
+            """,
+            (dedupe_key,),
+        ).fetchall()
+        rows = [
+            row
+            for row in rows
+            if _project_name_from_repo_url(
+                str(row["repo_url"] or ""),
+                str(row["repo_name"] or "")
+                or os.path.basename(
+                    os.path.realpath(str(row["target"] or row["output_dir"] or ""))
+                ),
+            )
+            == project
+        ]
+        if not rows:
+            return None
+        # Prefer a still-present source checkout, while retaining a database
+        # source row when the checkout can be reacquired from repo_url.
+        for row in rows:
+            if os.path.isdir(str(row["target"] or "")):
+                return dict(row)
+        return dict(rows[0])
+
+    def _registered_disclosure_reference(self, artifact_links: str) -> str:
+        try:
+            artifacts = json.loads(artifact_links or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        if not isinstance(artifacts, list):
+            return ""
+        preferred = ("Stage 6 Report", "Stage 5 Report")
+        for label in preferred:
+            for artifact in artifacts:
+                if not isinstance(artifact, dict) or artifact.get("label") != label:
+                    continue
+                raw = artifact.get("path")
+                if not isinstance(raw, str) or not raw or "\x00" in raw:
+                    continue
+                path = os.path.realpath(raw)
+                if not os.path.isfile(path):
+                    continue
+                if self.managed_results_dir and not self._path_is_within(
+                    path, self.managed_results_dir
+                ):
+                    continue
+                return os.path.dirname(path)
+        return ""
+
+    def list_reproduction_candidates(self) -> list[dict]:
+        """List active Disclosure records that can be retested on remote HEAD."""
+        latest: dict[tuple[str, str], dict] = {}
+        for row in self.list_reproductions():
+            latest.setdefault((row["project"], row["dedupe_key"]), row)
+        candidates: list[dict] = []
+        with self._connect() as conn:
+            disclosures = conn.execute(
+                """
+                SELECT * FROM disclosed_bugs
+                WHERE deleted_at IS NULL
+                ORDER BY project, audit_finished_date DESC, id
+                """
+            ).fetchall()
+            for disclosure in disclosures:
+                item = dict(disclosure)
+                source = self._disclosure_reproduction_source(
+                    conn,
+                    str(item.get("dedupe_key") or ""),
+                    str(item.get("project") or ""),
+                )
+                if source:
+                    item.update(source)
+                item["source_run_id"] = source.get("run_id") if source else None
+                item["source_vuln_id"] = source.get("vuln_id") if source else ""
+                # Preserve the public candidate names used by the existing UI
+                # and operator API while making Disclosure identity canonical.
+                item["run_id"] = item["source_run_id"]
+                item["vuln_id"] = item["source_vuln_id"]
+                item["commit"] = item.get("audited_commit") or item.get("commit") or ""
+                item["reference_dir"] = self._registered_disclosure_reference(
+                    str(item.get("artifact_links") or "[]")
+                )
+                reasons: list[str] = []
+                if source is None or not item.get("raw_json"):
+                    reasons.append(
+                        "No linked Stage 4 vulnerability record is available."
+                    )
+                target = str(item.get("target") or "")
+                repo_url = str(item.get("repo_url") or "")
+                if not (os.path.isdir(os.path.join(target, ".git")) or repo_url):
+                    reasons.append("No Git checkout or repository URL is available.")
+                if not item.get("reference_dir"):
+                    reasons.append(
+                        "No retained Stage 5/6 reproduction context is registered."
+                    )
+                item["can_reproduce"] = not reasons
+                item["unavailable_reasons"] = reasons
+                item["latest_reproduction"] = latest.get(
+                    (str(item.get("project") or ""), str(item.get("dedupe_key") or ""))
+                )
+                item.pop("artifact_links", None)
+                item.pop("deleted_at", None)
+                item.pop("updated_at", None)
+                item.pop("raw_json", None)
+                candidates.append(item)
+        return candidates
+
+    def get_disclosure_reproduction_candidate(
+        self, project: str, dedupe_key: str
+    ) -> dict | None:
+        """Return one active Disclosure plus the source finding used to retest it."""
+        with self._connect() as conn:
+            disclosure = conn.execute(
+                """
+                SELECT * FROM disclosed_bugs
+                WHERE project = ? AND dedupe_key = ? AND deleted_at IS NULL
+                """,
+                (project, dedupe_key),
+            ).fetchone()
+            if disclosure is None:
+                return None
+            item = dict(disclosure)
+            source = self._disclosure_reproduction_source(conn, dedupe_key, project)
+        if source is None:
+            return None
+        item.update(source)
+        item["disclosure_id"] = int(disclosure["id"])
+        item["project"] = project
+        item["dedupe_key"] = dedupe_key
+        item["source_run_id"] = source["run_id"]
+        item["source_vuln_id"] = source["vuln_id"]
+        item["run_id"] = source["run_id"]
+        item["vuln_id"] = source["vuln_id"]
+        item["base_commit"] = item.get("audited_commit") or source.get("commit") or ""
+        item["reference_dir"] = self._registered_disclosure_reference(
+            str(disclosure["artifact_links"] or "[]")
+        )
+        return item
+
+    def create_reproduction(
+        self,
+        *,
+        job_key: str,
+        candidate: dict,
+        output_dir: str,
+        backend: str,
+        model: str | None,
+        sandbox_mode: str,
+        sandbox_runtime: str,
+        started_at: float,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO reproduction_runs (
+                    job_key, disclosure_id, project, dedupe_key,
+                    source_run_id, source_vuln_id, repo_url, base_commit,
+                    state, backend, model, sandbox_mode, sandbox_runtime,
+                    output_dir, started_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_key,
+                    candidate.get("disclosure_id"),
+                    candidate.get("project") or "",
+                    candidate.get("dedupe_key") or "",
+                    candidate.get("source_run_id") or candidate.get("run_id"),
+                    candidate.get("source_vuln_id") or candidate.get("vuln_id"),
+                    candidate.get("repo_url") or "",
+                    candidate.get("base_commit")
+                    or candidate.get("audited_commit")
+                    or "",
+                    backend,
+                    model,
+                    sandbox_mode,
+                    sandbox_runtime,
+                    output_dir,
+                    started_at,
+                    time.time(),
+                ),
+            )
+
+    def set_reproduction_revision(
+        self, job_key: str, *, target_ref: str, tested_commit: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE reproduction_runs SET target_ref = ?, tested_commit = ?
+                WHERE job_key = ? AND state = 'running'
+                """,
+                (target_ref, tested_commit, job_key),
+            )
+
+    def finish_reproduction(
+        self,
+        job_key: str,
+        *,
+        state: str,
+        ended_at: float,
+        outcome: str = "",
+        disposition: str = "",
+        evidence_level: str = "",
+        summary: str = "",
+        source_analysis: str = "",
+        disclosure_update: str = "",
+        result_path: str = "",
+        assessment_path: str = "",
+        retest_report_path: str = "",
+        draft_path: str = "",
+        error: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE reproduction_runs
+                SET state = ?, ended_at = ?, outcome = ?, disposition = ?,
+                    evidence_level = ?, summary = ?, source_analysis = ?,
+                    disclosure_update = ?, result_path = ?, assessment_path = ?,
+                    retest_report_path = ?, draft_path = ?, error = ?
+                WHERE job_key = ?
+                """,
+                (
+                    state,
+                    ended_at,
+                    outcome,
+                    disposition,
+                    evidence_level,
+                    summary,
+                    source_analysis,
+                    disclosure_update,
+                    result_path,
+                    assessment_path,
+                    retest_report_path,
+                    draft_path,
+                    error,
+                    job_key,
+                ),
+            )
+
+    def cancel_running_reproductions(self, error: str) -> list[str]:
+        ended_at = time.time()
+        with self._connect() as conn:
+            keys = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT job_key FROM reproduction_runs WHERE state = 'running'"
+                ).fetchall()
+            ]
+            if keys:
+                conn.execute(
+                    """
+                    UPDATE reproduction_runs
+                    SET state = 'cancelled', error = ?, ended_at = ?
+                    WHERE state = 'running'
+                    """,
+                    (error, ended_at),
+                )
+        return keys
+
+    def get_reproduction(self, job_key: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM reproduction_runs WHERE job_key = ?", (job_key,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_reproductions(
+        self, *, project: str | None = None, dedupe_key: str | None = None
+    ) -> list[dict]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if project:
+            clauses.append("project = ?")
+            values.append(project)
+        if dedupe_key:
+            clauses.append("dedupe_key = ?")
+            values.append(dedupe_key)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM reproduction_runs"
+                + where
+                + " ORDER BY started_at DESC, job_key DESC",
+                values,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_reproduction_applied(self, job_key: str, disclosure_dir: str) -> bool:
+        """Make a validated local draft the active Disclosure artifact set."""
+        active = Path(disclosure_dir).resolve()
+        files = {
+            "Stage 6 Report": active / "report.md",
+            "Stage 6 Email": active / "email.txt",
+            "Stage 6 Zip": active / "disclosure.zip",
+            "Stage 5 Trigger Graph": active / TRIGGER_GRAPH_FILENAME,
+            "Stage 5 ASan Report": active / ASAN_REPORT_FILENAME,
+        }
+        with self._connect() as conn:
+            # Serialize the eligibility check with the metadata update so two
+            # concurrent Apply requests cannot both replace the active row.
+            conn.execute("BEGIN IMMEDIATE")
+            reproduction = conn.execute(
+                """
+                SELECT * FROM reproduction_runs
+                WHERE job_key = ? AND state = 'done' AND outcome = 'reproduced'
+                  AND applied_at IS NULL
+                """,
+                (job_key,),
+            ).fetchone()
+            if reproduction is None:
+                return False
+            disclosure = conn.execute(
+                """
+                SELECT artifact_links FROM disclosed_bugs
+                WHERE project = ? AND dedupe_key = ? AND deleted_at IS NULL
+                """,
+                (reproduction["project"], reproduction["dedupe_key"]),
+            ).fetchone()
+            if disclosure is None:
+                return False
+            try:
+                previous = json.loads(disclosure["artifact_links"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                previous = []
+            replaced_labels = set(files)
+            artifacts = [
+                artifact
+                for artifact in previous
+                if isinstance(artifact, dict)
+                and artifact.get("label") not in replaced_labels
+            ]
+            artifacts.extend(
+                {"label": label, "path": str(path)}
+                for label, path in files.items()
+                if path.is_file()
+            )
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE disclosed_bugs
+                SET audited_commit = ?, audit_finished_date = ?, model_backend = ?,
+                    artifact_links = ?, updated_at = ?
+                WHERE project = ? AND dedupe_key = ? AND deleted_at IS NULL
+                """,
+                (
+                    reproduction["tested_commit"] or "",
+                    datetime.fromtimestamp(now).date().isoformat(),
+                    reproduction["backend"] or "",
+                    json.dumps(artifacts, ensure_ascii=False),
+                    now,
+                    reproduction["project"],
+                    reproduction["dedupe_key"],
+                ),
+            )
+            cursor = conn.execute(
+                "UPDATE reproduction_runs SET applied_at = ? "
+                "WHERE job_key = ? AND applied_at IS NULL",
+                (now, job_key),
+            )
+        return cursor.rowcount == 1
+
     def get_reproduction_candidate(self, run_id: int, vuln_id: str) -> dict | None:
         """Return one exactly reproduced vulnerability and its source run."""
         with self._connect() as conn:
@@ -2687,11 +3326,20 @@ class AuditStore:
                 """,
                 (run_id, vuln_id),
             ).fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        candidate = dict(row)
+        fallback = candidate.get("repo_name") or os.path.basename(
+            os.path.realpath(
+                candidate.get("target") or candidate.get("output_dir") or ""
+            )
+        )
+        candidate["project"] = _project_name_from_repo_url(
+            str(candidate.get("repo_url") or ""), str(fallback or "")
+        )
+        return candidate
 
-    def get_poc_terminal_candidate(
-        self, run_id: int, vuln_id: str
-    ) -> dict | None:
+    def get_poc_terminal_candidate(self, run_id: int, vuln_id: str) -> dict | None:
         """Resolve one reproduced PoC to its server-owned working directory."""
         with self._connect() as conn:
             row = conn.execute(
@@ -2979,8 +3627,7 @@ class AuditStore:
     def list_cves(self, project: str | None = None) -> list[dict]:
         """Return manually imported CVEs backed by local disclosure reports."""
         local_disclosures = {
-            entry["dedupe_key"]: entry
-            for entry in self.list_cve_import_candidates()
+            entry["dedupe_key"]: entry for entry in self.list_cve_import_candidates()
         }
         with self._connect() as conn:
             if project:
@@ -2990,9 +3637,7 @@ class AuditStore:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM cves").fetchall()
-            links = conn.execute(
-                "SELECT cve_id, dedupe_key FROM cve_links"
-            ).fetchall()
+            links = conn.execute("SELECT cve_id, dedupe_key FROM cve_links").fetchall()
             candidates = conn.execute(
                 """
                 SELECT l.cve_id, v.run_id, v.vuln_id, v.title, v.dedupe_key,
@@ -3066,7 +3711,7 @@ class AuditStore:
             entries = [
                 dict(row)
                 for row in conn.execute(
-                f"""
+                    f"""
                 SELECT * FROM disclosed_bugs
                 WHERE {deletion_filter}
                 ORDER BY project, audit_finished_date DESC, id
@@ -3113,6 +3758,12 @@ class AuditStore:
             item = dict(poc)
             item.pop("output_dir", None)
             poc_by_key.setdefault(poc["dedupe_key"], item)
+        latest_reproductions: dict[tuple[str, str], dict] = {}
+        for reproduction in self.list_reproductions():
+            latest_reproductions.setdefault(
+                (reproduction["project"], reproduction["dedupe_key"]),
+                reproduction,
+            )
         for row in entries:
             try:
                 artifacts = json.loads(row.pop("artifact_links") or "[]")
@@ -3139,6 +3790,9 @@ class AuditStore:
                 else []
             )
             row["poc"] = poc_by_key.get(row.get("dedupe_key") or "")
+            row["latest_reproduction"] = latest_reproductions.get(
+                (str(row.get("project") or ""), str(row.get("dedupe_key") or ""))
+            )
             if row["poc"] is None:
                 for cve in row["cves"]:
                     row["poc"] = next(
@@ -3180,9 +3834,7 @@ class AuditStore:
                     for value in (cve.get("cve_id"), cve.get("cve_url"))
                 )
                 poc = row.get("terminal") or row.get("poc") or {}
-                values.extend(
-                    (poc.get("run_id"), poc.get("vuln_id"), poc.get("title"))
-                )
+                values.extend((poc.get("run_id"), poc.get("vuln_id"), poc.get("title")))
                 values.extend(
                     artifact.get("label") for artifact in row.get("artifacts") or []
                 )
@@ -3218,6 +3870,22 @@ class AuditStore:
         with self._connect() as conn:
             return self._purge_expired_disclosures(
                 conn, time.time() + DISCLOSURE_TRASH_RETENTION_SECONDS + 1
+            )
+
+    def purge_trashed_disclosures(self, identities: Iterable[tuple[str, str]]) -> int:
+        """Permanently remove selected Disclosure records from the trash."""
+        selected = {
+            (str(project), str(dedupe_key))
+            for project, dedupe_key in identities
+            if project and dedupe_key
+        }
+        if not selected:
+            return 0
+        with self._connect() as conn:
+            return self._purge_expired_disclosures(
+                conn,
+                time.time() + DISCLOSURE_TRASH_RETENTION_SECONDS + 1,
+                selected,
             )
 
     def trash_disclosure(
@@ -3366,9 +4034,7 @@ class AuditStore:
         projects = sorted({entry["project"] for entry in entries})
         return {"counts": counts, "projects": projects}
 
-    def set_disclosed_status(
-        self, project: str, dedupe_key: str, status: str
-    ) -> bool:
+    def set_disclosed_status(self, project: str, dedupe_key: str, status: str) -> bool:
         """Persist one disclosure review status exclusively in SQLite."""
         if status not in DISCLOSURE_REVIEW_STATUSES:
             return False
@@ -3448,7 +4114,9 @@ class AuditStore:
                     else []
                 )
                 found = {row["cve_id"]: row["project"] for row in cve_rows}
-                missing = [cve_id for cve_id in normalized_cve_ids if cve_id not in found]
+                missing = [
+                    cve_id for cve_id in normalized_cve_ids if cve_id not in found
+                ]
                 if missing:
                     raise ValueError(f"Unknown CVE: {', '.join(missing)}")
                 wrong_project = [

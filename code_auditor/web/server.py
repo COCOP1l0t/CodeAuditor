@@ -1,4 +1,5 @@
 """FastAPI application for the CodeAuditor web UI."""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +8,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import stat
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import date
@@ -16,9 +19,14 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config import SandboxRuntime
 from ..sandbox_records import list_sandbox_executions
@@ -31,7 +39,9 @@ from ..db import (
 )
 from ..logger import configure_logging, get_logger
 from ..repos import RepoError, list_cloned_repos, validate_remote_repo_url
+from ..retention import RetentionError, export_retained_artifacts
 from ..sandbox import inspect_docker_sandbox_environment
+from ..validation.stage6 import validate_stage6_disclosure
 from ..wikis import list_local_wikis
 from .job import (
     JOB_AUDIT,
@@ -78,6 +88,7 @@ _AGENT_LOG_PATTERNS = (
     "stage3-findings/logs/*.log",
     "stage5-pocs/*/agent.log",
     "stage6-disclosures/*/agent.log",
+    "reproduction-review/agent.log",
     ".sandbox-executions/*/agent-*.log",
 )
 
@@ -96,9 +107,7 @@ DisclosureStatus = Literal[
     "bug",
     "slop",
 ]
-RunStatus = Literal[
-    "running", "done", "failed", "cancelled", "imported", "superseded"
-]
+RunStatus = Literal["running", "done", "failed", "cancelled", "imported", "superseded"]
 RunKind = Literal["audit", "maintenance"]
 
 
@@ -144,8 +153,31 @@ class AuditStartRequest(StrictRequest):
 
 
 class ReproductionStartRequest(StrictRequest):
-    run_id: int = Field(ge=1, le=9_223_372_036_854_775_807)
-    vuln_id: str = Field(min_length=1, max_length=64, pattern=_VULN_ID_PATTERN)
+    project: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"
+    )
+    dedupe_key: str | None = Field(
+        default=None, min_length=71, max_length=71, pattern=_DEDUPE_KEY_PATTERN
+    )
+    run_id: int | None = Field(default=None, ge=1, le=9_223_372_036_854_775_807)
+    vuln_id: str | None = Field(
+        default=None, min_length=1, max_length=64, pattern=_VULN_ID_PATTERN
+    )
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "ReproductionStartRequest":
+        disclosure = bool(self.project and self.dedupe_key)
+        legacy = bool(self.run_id is not None and self.vuln_id)
+        has_disclosure_fields = self.project is not None or self.dedupe_key is not None
+        has_legacy_fields = self.run_id is not None or self.vuln_id is not None
+        if not (
+            (disclosure and not has_legacy_fields)
+            or (legacy and not has_disclosure_fields)
+        ):
+            raise ValueError(
+                "select exactly one Disclosure identity or one legacy History identity"
+            )
+        return self
 
 
 class AgentSettingsRequest(StrictRequest):
@@ -155,9 +187,9 @@ class AgentSettingsRequest(StrictRequest):
     model: str = Field(default="", max_length=256)
     api_key: str | None = Field(default=None, max_length=8192)
     clear_api_key: bool = False
-    sandbox_mode: Literal[
-        "docker-networked", "docker-isolated", "local-worktree"
-    ] | None = None
+    sandbox_mode: (
+        Literal["docker-networked", "docker-isolated", "local-worktree"] | None
+    ) = None
     sandbox_runtime: SandboxRuntime | None = None
 
 
@@ -204,6 +236,8 @@ def _scan_results(output_dir: str) -> dict:
         "vulnerabilities": rel("stage4-vulnerabilities/*.json"),
         "poc_reports": rel("stage5-pocs/*/report.md"),
         "disclosures": rel("stage6-disclosures/*/disclosure/*"),
+        "reproduction_review": rel("reproduction-review/**/*"),
+        "reproduction_result": rel("reproduction-result.json"),
         "agent_logs": [
             str(path.relative_to(base)) for path in _agent_log_paths(output_dir)
         ],
@@ -301,7 +335,9 @@ def _run_stage_summary(run: dict) -> list[dict]:
         entry(0, base.is_dir()),
         entry(
             1,
-            (base / "stage1-security-context" / "stage-1-security-context.json").is_file(),
+            (
+                base / "stage1-security-context" / "stage-1-security-context.json"
+            ).is_file(),
         ),
         entry(2, "stage2" in markers or au_total > 0, au_total, au_total),
         entry(3, s3_done, min(s3_count, au_total), au_total),
@@ -322,7 +358,9 @@ def _resolve_output_file(output_dir: str, rel_path: str) -> str:
     base = os.path.realpath(output_dir)
     full = os.path.realpath(os.path.join(base, rel_path))
     if full != base and not full.startswith(base + os.sep):
-        raise HTTPException(status_code=400, detail="Path escapes the output directory.")
+        raise HTTPException(
+            status_code=400, detail="Path escapes the output directory."
+        )
     if not os.path.isfile(full):
         raise HTTPException(status_code=404, detail=f"File not found: {rel_path}")
     return full
@@ -371,15 +409,21 @@ def _is_managed_path(path: str, root: str) -> bool:
     return resolved == managed_root or resolved.startswith(managed_root + os.sep)
 
 
+def _safe_revision_component(value: object) -> str:
+    component = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value or ""))
+    return component.strip("-")[:40] or "previous"
+
+
 def _websocket_origin_allowed(websocket: WebSocket) -> bool:
     """Reject browser WebSockets initiated by a different web origin."""
     origin = websocket.headers.get("origin")
     if not origin:
         return True
     parsed = urlsplit(origin)
-    return parsed.scheme in {"http", "https"} and parsed.netloc == websocket.headers.get(
-        "host", ""
-    )
+    return parsed.scheme in {
+        "http",
+        "https",
+    } and parsed.netloc == websocket.headers.get("host", "")
 
 
 def _validate_http_url(value: str) -> str:
@@ -396,12 +440,12 @@ class ImportRequest(StrictRequest):
 
 
 class DisclosureIdentityRequest(StrictRequest):
-    project: str = Field(
-        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"
-    )
-    dedupe_key: str = Field(
-        min_length=71, max_length=71, pattern=_DEDUPE_KEY_PATTERN
-    )
+    project: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    dedupe_key: str = Field(min_length=71, max_length=71, pattern=_DEDUPE_KEY_PATTERN)
+
+
+class DisclosurePurgeRequest(StrictRequest):
+    entries: list[DisclosureIdentityRequest] = Field(min_length=1, max_length=4096)
 
 
 class DisclosureStatusRequest(DisclosureIdentityRequest):
@@ -536,7 +580,7 @@ def create_app(
                 if purged:
                     logger.info(
                         "Permanently removed %d expired Disclosure records and "
-                        "linked Stage 6 artifacts.",
+                        "linked Stage 5/6 artifacts.",
                         purged,
                     )
             except Exception:
@@ -707,13 +751,20 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
-        elif request.url.path.startswith("/api/auth/") or request.url.path in {
-            "/api/config",
-            "/api/dashboard",
-            "/api/settings",
-            "/api/sandbox/capability",
-        } or re.fullmatch(r"/api/audit/\d+/processes", request.url.path) or (
-            request.url.path.startswith("/api/") and request.url.path.endswith("/sandbox-executions")
+        elif (
+            request.url.path.startswith("/api/auth/")
+            or request.url.path
+            in {
+                "/api/config",
+                "/api/dashboard",
+                "/api/settings",
+                "/api/sandbox/capability",
+            }
+            or re.fullmatch(r"/api/audit/\d+/processes", request.url.path)
+            or (
+                request.url.path.startswith("/api/")
+                and request.url.path.endswith("/sandbox-executions")
+            )
         ):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -925,9 +976,7 @@ def create_app(
             else None
         )
         if request.repository:
-            target = _resolve_managed_repository(
-                request.repository, settings.repos_dir
-            )
+            target = _resolve_managed_repository(request.repository, settings.repos_dir)
         elif request.local_directory:
             selection = app.state.local_directory_selections.pop(
                 request.local_directory, None
@@ -946,7 +995,9 @@ def create_app(
                 git_url = validate_remote_repo_url(request.git_url or "")
             except RepoError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await require_sandbox_environment(settings.backend, settings.sandbox_mode, settings.sandbox_runtime)
+        await require_sandbox_environment(
+            settings.backend, settings.sandbox_mode, settings.sandbox_runtime
+        )
         provider = settings.provider()
         try:
             job = await manager.start(
@@ -1026,6 +1077,125 @@ def create_app(
         candidates = store.list_reproduction_candidates()
         return {"candidates": candidates, "total": len(candidates)}
 
+    @app.get("/api/reproduction/history")
+    def reproduction_history(
+        project: str | None = Query(
+            default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"
+        ),
+    ) -> dict:
+        entries = store.list_reproductions(project=project)
+        return {"entries": entries, "total": len(entries)}
+
+    @app.post("/api/reproduction/{job_key}/apply")
+    def apply_reproduction_draft(job_key: str) -> dict:
+        record = _reproduction_record_or_404(job_key)
+        if record.get("state") != "done" or record.get("outcome") != "reproduced":
+            raise HTTPException(
+                status_code=409,
+                detail="Only a completed successful reproduction draft can be applied.",
+            )
+        if record.get("applied_at"):
+            raise HTTPException(status_code=409, detail="That draft is already active.")
+        draft = os.path.realpath(str(record.get("draft_path") or ""))
+        if not _is_managed_path(draft, settings.reproductions_dir) or not os.path.isdir(
+            draft
+        ):
+            raise HTTPException(status_code=404, detail="Disclosure draft not found.")
+        issues = validate_stage6_disclosure(draft)
+        if issues:
+            raise HTTPException(
+                status_code=400,
+                detail="Disclosure draft validation failed: "
+                + "; ".join(issue.description for issue in issues),
+            )
+        candidate = store.get_disclosure_reproduction_candidate(
+            str(record["project"]), str(record["dedupe_key"])
+        )
+        active = os.path.realpath(
+            str(candidate.get("reference_dir") if candidate else "")
+        )
+        if (
+            not active
+            or os.path.basename(active) != "disclosure"
+            or not _is_managed_path(active, settings.results_dir)
+            or not os.path.isdir(active)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The active managed Disclosure directory cannot be resolved.",
+            )
+        parent = os.path.dirname(active)
+        revisions = os.path.join(parent, "revisions")
+        try:
+            revisions_stat = os.lstat(revisions)
+        except FileNotFoundError:
+            try:
+                os.mkdir(revisions, mode=0o700)
+                revisions_stat = os.lstat(revisions)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Could not prepare Disclosure revision directory: {exc}",
+                ) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Could not inspect Disclosure revision directory: {exc}",
+            ) from exc
+        if not stat.S_ISDIR(revisions_stat.st_mode) or not _is_managed_path(
+            revisions, settings.results_dir
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Disclosure revision path must be a managed real directory.",
+            )
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = os.path.join(
+            revisions,
+            f"{stamp}-{_safe_revision_component(record.get('base_commit'))}",
+        )
+        staging = os.path.join(parent, f".disclosure-update-{secrets.token_hex(6)}")
+        if os.path.exists(backup) or os.path.exists(staging):
+            raise HTTPException(
+                status_code=409, detail="Disclosure revision path collision."
+            )
+        moved_old = False
+        installed_new = False
+        try:
+            export_retained_artifacts(
+                draft,
+                staging,
+                required_paths=(
+                    "report.md",
+                    "email.txt",
+                    "disclosure.zip",
+                    "reproduce.sh",
+                ),
+            )
+            os.replace(active, backup)
+            moved_old = True
+            os.replace(staging, active)
+            installed_new = True
+            if not store.mark_reproduction_applied(job_key, active):
+                raise RuntimeError(
+                    "reproduction record changed before the draft was applied"
+                )
+        except (OSError, RetentionError, RuntimeError) as exc:
+            if installed_new and os.path.isdir(active):
+                shutil.rmtree(active)
+            if moved_old and os.path.isdir(backup):
+                os.replace(backup, active)
+            if os.path.isdir(staging):
+                shutil.rmtree(staging)
+            raise HTTPException(
+                status_code=409, detail=f"Could not apply draft: {exc}"
+            ) from exc
+        return {
+            "ok": True,
+            "backup_dir": backup,
+            "entry": store.get_reproduction(job_key),
+        }
+
     # ── CVE catalogue and interactive PoC terminals ───────────────────────
 
     @app.get("/api/cves")
@@ -1101,16 +1271,12 @@ def create_app(
         vuln_id: str,
         token: str = Query(default="", max_length=128),
     ) -> None:
-        if (
-            not hmac.compare_digest(token, app.state.terminal_token)
-            or not _websocket_origin_allowed(websocket)
-        ):
+        if not hmac.compare_digest(
+            token, app.state.terminal_token
+        ) or not _websocket_origin_allowed(websocket):
             await websocket.close(code=1008, reason="Terminal authorization failed.")
             return
-        if (
-            run_id < 1
-            or re.fullmatch(_VULN_ID_PATTERN, vuln_id) is None
-        ):
+        if run_id < 1 or re.fullmatch(_VULN_ID_PATTERN, vuln_id) is None:
             # The token and origin are valid, so complete the handshake before
             # closing to let the browser receive this diagnostic reason.
             await websocket.accept()
@@ -1145,10 +1311,9 @@ def create_app(
         ),
         token: str = Query(default="", max_length=128),
     ) -> None:
-        if (
-            not hmac.compare_digest(token, app.state.terminal_token)
-            or not _websocket_origin_allowed(websocket)
-        ):
+        if not hmac.compare_digest(
+            token, app.state.terminal_token
+        ) or not _websocket_origin_allowed(websocket):
             await websocket.close(code=1008, reason="Terminal authorization failed.")
             return
         if app.state.active_terminals >= 16:
@@ -1173,13 +1338,17 @@ def create_app(
 
     @app.post("/api/reproduction", status_code=202)
     async def start_reproduction(request: ReproductionStartRequest) -> dict:
-        await require_sandbox_environment(settings.backend, settings.sandbox_mode, settings.sandbox_runtime)
+        await require_sandbox_environment(
+            settings.backend, settings.sandbox_mode, settings.sandbox_runtime
+        )
         provider = settings.provider()
         try:
             job = await manager.start_reproduction(
                 ReproductionStartParams(
+                    project=request.project or "",
+                    dedupe_key=request.dedupe_key or "",
                     run_id=request.run_id,
-                    vuln_id=request.vuln_id,
+                    vuln_id=request.vuln_id or "",
                     backend=settings.backend,
                     model=provider.model if provider.mode == "custom" else None,
                     provider_mode=provider.mode,
@@ -1187,6 +1356,7 @@ def create_app(
                     provider_api_key=provider.api_key or None,
                     log_level=settings.log_level,
                     reproductions_dir=settings.reproductions_dir,
+                    repos_dir=settings.repos_dir,
                     wikis_dir=settings.wikis_dir,
                     sandbox_mode=settings.sandbox_mode,
                     sandbox_runtime=settings.sandbox_runtime,
@@ -1209,6 +1379,32 @@ def create_app(
             )
         return job
 
+    def _reproduction_record_or_404(job_key: str) -> dict:
+        if re.fullmatch(r"repro-[0-9a-f]{12}", job_key) is None:
+            raise HTTPException(status_code=404, detail="Reproduction job not found.")
+        record = store.get_reproduction(job_key)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Reproduction job not found.")
+        return record
+
+    def _reproduction_output_or_404(job_key: str) -> str:
+        job = manager.get_job(job_key)
+        if job is not None and job.kind == JOB_REPRODUCTION and job.config is not None:
+            output_dir = job.config.output_dir
+        else:
+            record = _reproduction_record_or_404(job_key)
+            root = os.path.realpath(str(record.get("output_dir") or ""))
+            if not _is_managed_path(root, settings.reproductions_dir):
+                raise HTTPException(
+                    status_code=404, detail="Reproduction output not found."
+                )
+            output_dir = os.path.join(root, "output")
+        if not os.path.isdir(output_dir):
+            raise HTTPException(
+                status_code=404, detail="The reproduction has no output yet."
+            )
+        return output_dir
+
     @app.post("/api/reproduction/{job_key}/stop")
     async def stop_reproduction(job_key: str) -> dict:
         job = _reproduction_job_or_404(job_key)
@@ -1220,7 +1416,10 @@ def create_app(
 
     @app.get("/api/reproduction/{job_key}/status")
     async def reproduction_status(job_key: str) -> dict:
-        return _reproduction_job_or_404(job_key).status()
+        job = manager.get_job(job_key)
+        if job is not None and job.kind == JOB_REPRODUCTION:
+            return job.status()
+        return _reproduction_record_or_404(job_key)
 
     @app.get("/api/reproduction/{job_key}/events")
     async def reproduction_events(job_key: str) -> StreamingResponse:
@@ -1228,26 +1427,19 @@ def create_app(
 
     @app.get("/api/reproduction/{job_key}/results")
     async def reproduction_results(job_key: str) -> dict:
-        job = _reproduction_job_or_404(job_key)
-        if job.config is None:
-            raise HTTPException(
-                status_code=404, detail="The reproduction has no output yet."
-            )
-        return _scan_results(job.config.output_dir)
+        return _scan_results(_reproduction_output_or_404(job_key))
 
     @app.get("/api/reproduction/{job_key}/agent-log")
     async def reproduction_agent_log(
         job_key: str,
         download: bool = Query(default=False),
     ):
-        job = _reproduction_job_or_404(job_key)
-        if job.config is None:
-            raise HTTPException(
-                status_code=404, detail="The reproduction has no output yet."
-            )
-        latest = _latest_agent_log(job.config.output_dir)
+        output_dir = _reproduction_output_or_404(job_key)
+        latest = _latest_agent_log(output_dir)
         if latest is None:
-            raise HTTPException(status_code=404, detail="No Agent log is available yet.")
+            raise HTTPException(
+                status_code=404, detail="No Agent log is available yet."
+            )
         path, relative_path = latest
         if download:
             return FileResponse(
@@ -1269,12 +1461,8 @@ def create_app(
         job_key: str,
         path: str = Query(min_length=1, max_length=4096),
     ) -> PlainTextResponse:
-        job = _reproduction_job_or_404(job_key)
-        if job.config is None:
-            raise HTTPException(
-                status_code=404, detail="The reproduction has no output yet."
-            )
-        full = _resolve_output_file(job.config.output_dir, path)
+        output_dir = _reproduction_output_or_404(job_key)
+        full = _resolve_output_file(output_dir, path)
         try:
             content = Path(full).read_text(encoding="utf-8", errors="replace")
         except OSError as e:
@@ -1296,8 +1484,7 @@ def create_app(
         return {
             "repos_dir": settings.repos_dir,
             "repos": [
-                {"name": repo["name"]}
-                for repo in list_cloned_repos(settings.repos_dir)
+                {"name": repo["name"]} for repo in list_cloned_repos(settings.repos_dir)
             ],
         }
 
@@ -1342,8 +1529,7 @@ def create_app(
         return {
             "wikis_dir": settings.wikis_dir,
             "wikis": [
-                {"name": wiki["name"]}
-                for wiki in list_local_wikis(settings.wikis_dir)
+                {"name": wiki["name"]} for wiki in list_local_wikis(settings.wikis_dir)
             ],
         }
 
@@ -1398,25 +1584,40 @@ def create_app(
 
     @app.get("/api/history/{run_id}/sandbox-executions")
     def history_sandbox_executions(
-        run_id: int, limit: int = Query(100, ge=1, le=500),
+        run_id: int,
+        limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> dict:
         run = _get_history_run(run_id)
         records = list_sandbox_executions(run["output_dir"], run_id=run_id)
-        return {"executions": records[offset:offset + limit], "total": len(records),
-                "coverage": "recorded-container-launches", "limit": limit, "offset": offset}
+        return {
+            "executions": records[offset : offset + limit],
+            "total": len(records),
+            "coverage": "recorded-container-launches",
+            "limit": limit,
+            "offset": offset,
+        }
 
     @app.get("/api/reproduction/{job_key}/sandbox-executions")
     def reproduction_sandbox_executions(job_key: str) -> dict:
         job = _reproduction_job_or_404(job_key)
-        records = list_sandbox_executions(job.config.output_dir, job_key=job_key) if job.config else []
-        return {"executions": records, "total": len(records),
-                "coverage": "recorded-container-launches"}
+        records = (
+            list_sandbox_executions(job.config.output_dir, job_key=job_key)
+            if job.config
+            else []
+        )
+        return {
+            "executions": records,
+            "total": len(records),
+            "coverage": "recorded-container-launches",
+        }
 
     @app.post("/api/history/{run_id}/resume", status_code=202)
     async def resume_history_run(run_id: int) -> dict:
         _get_history_run(run_id)
-        await require_sandbox_environment(settings.backend, settings.sandbox_mode, settings.sandbox_runtime)
+        await require_sandbox_environment(
+            settings.backend, settings.sandbox_mode, settings.sandbox_runtime
+        )
         provider = settings.provider()
         try:
             job = await manager.resume_cancelled(
@@ -1462,7 +1663,9 @@ def create_app(
         run = _get_history_run(run_id)
         latest = _latest_agent_log(run["output_dir"])
         if latest is None:
-            raise HTTPException(status_code=404, detail="No Agent log is available yet.")
+            raise HTTPException(
+                status_code=404, detail="No Agent log is available yet."
+            )
         path, relative_path = latest
         if download:
             return FileResponse(
@@ -1501,9 +1704,7 @@ def create_app(
 
     @app.post("/api/history/import", status_code=201)
     def import_history(request: ImportRequest) -> dict:
-        path = _resolve_managed_import_path(
-            request.output_dir, settings.results_dir
-        )
+        path = _resolve_managed_import_path(request.output_dir, settings.results_dir)
         try:
             if _looks_like_output_dir(path):
                 run_ids = [store.import_output_dir(path)]
@@ -1547,10 +1748,14 @@ def create_app(
     ) -> FileResponse:
         resolved = store.get_disclosed_artifact(project, dedupe_key, artifact)
         if resolved is None:
-            raise HTTPException(status_code=404, detail="Disclosure artifact not found.")
+            raise HTTPException(
+                status_code=404, detail="Disclosure artifact not found."
+            )
         path = resolved["path"]
         if not _is_managed_path(path, settings.results_dir) or not os.path.isfile(path):
-            raise HTTPException(status_code=404, detail="Disclosure artifact not found.")
+            raise HTTPException(
+                status_code=404, detail="Disclosure artifact not found."
+            )
         return FileResponse(path, filename=os.path.basename(path))
 
     @app.post("/api/disclosures/status")
@@ -1607,6 +1812,13 @@ def create_app(
     @app.post("/api/disclosures/trash/purge")
     def purge_all_disclosure_trash() -> dict:
         removed = store.purge_all_trashed_disclosures()
+        return {"ok": True, "removed": removed, **store.disclosed_summary()}
+
+    @app.post("/api/disclosures/trash/purge-selected")
+    def purge_selected_disclosure_trash(request: DisclosurePurgeRequest) -> dict:
+        removed = store.purge_trashed_disclosures(
+            (entry.project, entry.dedupe_key) for entry in request.entries
+        )
         return {"ok": True, "removed": removed, **store.disclosed_summary()}
 
     @app.put("/api/disclosures")

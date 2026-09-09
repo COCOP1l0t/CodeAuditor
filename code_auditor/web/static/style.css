@@ -2595,6 +2595,21 @@ th[aria-sort="descending"] .sort-button::after {
   white-space: normal;
 }
 
+#trash-table .col-trash-select {
+  width: 3.2rem;
+}
+
+#trash-table .selection-cell {
+  text-align: center;
+}
+
+#trash-table .selection-cell input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 .numeric-cell {
   font-variant-numeric: tabular-nums;
 }

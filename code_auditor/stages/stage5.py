@@ -35,7 +35,9 @@ def _task_key(vuln_id: str) -> str:
 
 
 def _is_fp_report(report_path: str | None) -> bool:
-    return report_path is not None and os.path.basename(os.path.dirname(report_path)).endswith("_fp")
+    return report_path is not None and os.path.basename(
+        os.path.dirname(report_path)
+    ).endswith("_fp")
 
 
 def _read_vuln_id(file_path: str) -> str | None:
@@ -91,7 +93,9 @@ async def _run_reproduce(
     """Reproduce a single verified vulnerability and develop a PoC."""
     vuln_id = _read_vuln_id(vuln_file_path)
     if not vuln_id:
-        logger.warning("Stage 5: Cannot read vulnerability ID from %s, skipping.", vuln_file_path)
+        logger.warning(
+            "Stage 5: Cannot read vulnerability ID from %s, skipping.", vuln_file_path
+        )
         return None
 
     key = _task_key(vuln_id)
@@ -109,6 +113,10 @@ async def _run_reproduce(
     sandbox: DockerScratch | None = None
     work_config = config
     work_vuln_file = vuln_file_path
+    reproduction_context = (
+        "This is a fresh audit reproduction. No earlier Disclosure package "
+        "was supplied; develop and verify the PoC from the finding."
+    )
     if config.sandbox_enabled:
         identity = capture_repo_identity(config.target)
         source_commit = config.poc_source_commit or identity.get("commit") or ""
@@ -116,9 +124,20 @@ async def _run_reproduce(
         try:
             await sandbox.prepare(config.target, source_commit)
             work_config = sandbox.audit_config(config)
-            work_vuln_file = str(
-                sandbox.copy_input(vuln_file_path, "finding.json")
-            )
+            work_vuln_file = str(sandbox.copy_input(vuln_file_path, "finding.json"))
+            if config.reproduction_reference_dir:
+                reference = sandbox.copy_input_tree(
+                    config.reproduction_reference_dir,
+                    "previous-disclosure",
+                )
+                reproduction_context = (
+                    "This is a latest-source retest. The prior retained "
+                    f"Disclosure/PoC is available read-only at `{reference}`. "
+                    "Run its portable reproducer first when present, then make "
+                    "only compatibility changes needed to test the same root "
+                    "cause on the pinned source revision. Do not treat an old "
+                    "harness failure as proof that the vulnerability was fixed."
+                )
         except Exception:
             await sandbox.close()
             raise
@@ -127,13 +146,27 @@ async def _run_reproduce(
     poc_dir = os.path.join(work_config.output_dir, "stage5-pocs", vuln_id)
     os.makedirs(poc_dir, exist_ok=True)
 
-    prompt = load_prompt("stage5.md", {
-        "finding_file_path": work_vuln_file,
-        "target_path": poc_target,
-        "poc_dir": poc_dir,
-        "finding_id": vuln_id,
-        "wiki_context": build_wiki_context(config, stage=5),
-    })
+    if config.reproduction_reference_dir and sandbox is None:
+        reproduction_context = (
+            "This is a latest-source retest. The prior retained Disclosure/PoC "
+            f"is available read-only at `{config.reproduction_reference_dir}`. "
+            "Run its portable reproducer first when present, then make only "
+            "compatibility changes needed to test the same root cause on the "
+            "pinned source revision. Do not treat an old harness failure as "
+            "proof that the vulnerability was fixed."
+        )
+
+    prompt = load_prompt(
+        "stage5.md",
+        {
+            "finding_file_path": work_vuln_file,
+            "target_path": poc_target,
+            "poc_dir": poc_dir,
+            "finding_id": vuln_id,
+            "reproduction_context": reproduction_context,
+            "wiki_context": build_wiki_context(config, stage=5),
+        },
+    )
 
     log_file = os.path.join(poc_dir, "agent.log")
     resolved_report: str | None = None
@@ -193,9 +226,7 @@ async def _run_reproduce(
 
         if sandbox is not None:
             if resolved_report is None:
-                raise RuntimeError(
-                    f"Stage 5 did not produce report.md for {vuln_id}"
-                )
+                raise RuntimeError(f"Stage 5 did not produce report.md for {vuln_id}")
             retained_source = os.path.dirname(resolved_report)
             persistent_destination = persistent_poc_dir
             if os.path.basename(retained_source).endswith("_fp"):
@@ -210,9 +241,7 @@ async def _run_reproduce(
                     max_total_bytes=config.retain_max_total_bytes,
                 )
             except RetentionError as exc:
-                manifest_path = os.path.join(
-                    retained_source, "retain-manifest.json"
-                )
+                manifest_path = os.path.join(retained_source, "retain-manifest.json")
                 logger.warning(
                     "Stage 5: Retain manifest validation failed for %s: %s. "
                     "Requesting one bounded repair.",
@@ -284,9 +313,7 @@ async def _run_reproduce(
     has_graph = bool(
         reproduced
         and resolved_report
-        and not validate_stage5_trigger_graph(
-            os.path.dirname(resolved_report), vuln_id
-        )
+        and not validate_stage5_trigger_graph(os.path.dirname(resolved_report), vuln_id)
     )
     has_asan = bool(
         resolved_report
@@ -327,7 +354,9 @@ async def run_stage5(
         if i >= len(vuln_files):
             continue
         if status == "rejected":
-            logger.error("Stage 5: %s failed: %s", os.path.basename(vuln_files[i]), error)
+            logger.error(
+                "Stage 5: %s failed: %s", os.path.basename(vuln_files[i]), error
+            )
             record_task_error(
                 config,
                 "stage5",
@@ -338,5 +367,9 @@ async def run_stage5(
         if value:
             reports.append(value)
 
-    logger.info("Stage 5 complete. %d reports generated (from %d vulnerabilities).", len(reports), len(vuln_files))
+    logger.info(
+        "Stage 5 complete. %d reports generated (from %d vulnerabilities).",
+        len(reports),
+        len(vuln_files),
+    )
     return reports

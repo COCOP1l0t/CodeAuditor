@@ -92,6 +92,11 @@ docker build -f docker/code-auditor-sandbox.Dockerfile \
 
 每次新容器启动都会固定镜像 ID，并在 `.sandbox-executions/` 中记录实际检查到的 runtime、资源设置、退出状态及清理验证结果。Agent 日志由宿主机写入，位于容器挂载范围之外，在临时沙箱清理后保留。**History → Container executions** 可查看记录；没有记录的旧产物仍标记为环境未知。详见[沙箱运行与可选 gVisor 验证](docs/sandbox.md)。
 
+**Reproduce** 标签页可选择当前 Disclosure，并在拉取远端默认分支 HEAD 后重新测试。系统会固定并记录不可变的测试 SHA，在 Stage 5/6 配置的沙箱中运行已保留的复现材料，再由 Agent 分析当前源码并提出 Disclosure 更新建议。运行结果、证据等级和 Agent 判断分别保存。成功复现只生成本地草稿；点击 **Apply Draft** 才会归档旧版本并安装已校验的草稿，不会自动发送或公开披露。
+
+披露条目的去重、静态质量检查和证据状态处理见[Disclosure 审核说明](docs/disclosure-review.md)。
+Disclosure 回收站支持勾选一个或多个条目永久清理；清理仅删除这些条目已登记且未被共享的 Stage 5 PoC 与 Stage 6 Disclosure 产物。
+
 ## Wiki 知识库
 
 Web 界面会发现 `~/.code_auditor/wiki/` 下的知识库。CodeAuditor 将所选 Wiki 视为只读辅助背景，而不是漏洞证据。

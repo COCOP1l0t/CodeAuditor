@@ -64,6 +64,9 @@ Tests are under `code_auditor/tests/`; they do not make real agent calls.
 - **Web layout**: audits are created from the "New Audit" sidebar dialog; `#/` lands on History and every run row opens a detail page (`#/run/{id}`) with Stages, Logs, and Results — live via the run's own SSE stream when it has a running job, otherwise reconstructed from checkpoint markers (`server._run_stage_summary`) and `/api/history/{id}/results`
 - **Web Wiki discovery**: optional Wikis are discovered from `~/.code_auditor/wiki/` and selected by opaque local name; `wiki_path` is not a Web config field
 - **Disclosure storage boundary**: SQLite owns Disclosure metadata, review status, dedupe identity, and artifact indexes; Stage 5/6 reports remain filesystem artifacts and there is no registry-path setting
+- **Disclosure quality**: Stage 6 compares each candidate with historical and same-batch retained metadata. Static document/CVSS/ZIP validation gates export and completion, including resumed checkpoints; failures do not trigger an automatic repair agent. Partial/negative Stage 5 results move only unreviewed stale records to triage, preserving other retained successful runs and human review metadata. See `docs/disclosure-review.md`.
+- **Latest-source Reproduce**: the Web Reproduce tab selects an active Disclosure by stable identity, fetches and pins remote HEAD without switching the shared checkout, retests in the configured Stage 5/6 sandbox, and persists runtime outcome separately from Agent disposition. Successful runs produce a bounded local draft; Apply archives the active revision and updates local Disclosure artifacts without sending or publishing anything.
+- **Disclosure recycle bin**: moving an entry to trash is recoverable for 30 days. Selected, all, and automatic permanent purge remove only registered, unshared Stage 5 PoC and Stage 6 `disclosure/` directories and synchronize their database indexes; Stage 4 and non-disclosure logs remain.
 
 ## Project layout
 
@@ -72,6 +75,7 @@ code_auditor/
 ├── __main__.py          # Web server and maintenance-command entry point
 ├── config.py            # AuditConfig, AnalysisUnit, ValidationIssue dataclasses
 ├── disclosures.py       # Stable Disclosure identity + email metadata helpers
+├── reproduction_review.py # Latest-source retest analysis + bounded local draft
 ├── db.py                # SQLite audit history: AuditStore, schema, output-dir scanner,
 │                        #   AU persistence/reuse (seed_analysis_units)
 ├── orchestrator.py      # Sequential stage runner

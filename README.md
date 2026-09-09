@@ -92,6 +92,11 @@ In **Settings → Stage 5/6 execution**, select `docker-default` (the default), 
 
 Each new container launch pins the image ID and records the inspected runtime, resource settings, exit status, and verified cleanup under `.sandbox-executions/`. Its Agent logs are written by the host outside the container's mounts and survive scratch cleanup. **History → Container executions** shows these records; older artifacts without records retain an unknown environment. See [sandbox operation and optional gVisor checks](docs/sandbox.md).
 
+The **Reproduce** tab retests an active Disclosure against the fetched remote default-branch HEAD. It records the immutable tested SHA, runs the retained reproducer in the configured Stage 5/6 sandbox, and then asks an Agent to analyze the current source and propose a Disclosure update. Runtime outcome, evidence level, and Agent disposition are stored separately. A successful retest creates a local draft only; **Apply Draft** archives the previous Disclosure revision and installs the validated draft without sending or publishing it.
+
+Disclosure deduplication, static quality checks, and evidence-state handling are described in [Disclosure review](docs/disclosure-review.md).
+The Disclosure recycle bin supports permanent cleanup of one or more selected records; cleanup removes only their registered, unshared Stage 5 PoC and Stage 6 Disclosure artifacts.
+
 ## Wiki knowledge base
 
 The Web UI discovers knowledge bases under `~/.code_auditor/wiki/`. CodeAuditor treats the selected Wiki as read-only and uses available pages as supporting context rather than vulnerability evidence.

@@ -411,6 +411,14 @@ def _project_name_from_repo_url(repo_url: str, fallback: str) -> str:
     return fallback
 
 
+def _run_project(run: dict) -> str:
+    """Return the Disclosure project identity used when a Run was synced."""
+    fallback = str(run.get("repo_name") or "") or os.path.basename(
+        os.path.realpath(str(run.get("target") or run.get("output_dir") or ""))
+    )
+    return _project_name_from_repo_url(str(run.get("repo_url") or ""), fallback)
+
+
 def _has_local_disclosure_report(artifacts: list[dict[str, Any]]) -> bool:
     return any(
         isinstance(artifact, dict)
@@ -2443,7 +2451,8 @@ class AuditStore:
 
     @staticmethod
     def _sync_disclosures_from_run(
-        conn: sqlite3.Connection, run_id: int, output_dir: str
+        conn: sqlite3.Connection, run_id: int, output_dir: str,
+        *, vuln_id: str | None = None,
     ) -> None:
         """Upsert Stage 6 records directly into the Web Disclosure catalogue."""
         output_root = os.path.realpath(output_dir)
@@ -2467,11 +2476,12 @@ class AuditStore:
             FROM disclosed_bugs b
             JOIN vulnerabilities v ON v.dedupe_key = b.dedupe_key
             JOIN pocs p ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
-            WHERE v.run_id = ? AND b.deleted_at IS NULL
+            WHERE v.run_id = ? AND (? IS NULL OR v.vuln_id = ?)
+              AND b.deleted_at IS NULL
               AND b.review_status = 'unreviewed'
               AND p.status != 'reproduced'
             """,
-            (run_id,),
+            (run_id, vuln_id, vuln_id),
         ).fetchall()
         for bad in bad_rows:
             if bad["status"] not in FAILED_STATUSES:
@@ -2530,9 +2540,10 @@ class AuditStore:
             JOIN runs r ON r.id = d.run_id
             LEFT JOIN pocs p
               ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
-            WHERE d.run_id = ? AND d.report_path != ''
+            WHERE d.run_id = ? AND (? IS NULL OR v.vuln_id = ?)
+              AND d.report_path != ''
             """,
-            (run_id,),
+            (run_id, vuln_id, vuln_id),
         ).fetchall()
         reproduced = REPRODUCED_STATUSES
         now = time.time()
@@ -2752,7 +2763,41 @@ class AuditStore:
                 """,
                 (*statuses, *args, limit, offset),
             ).fetchall()
+            link_rows = []
+            registry_rows = []
+            if rows:
+                run_ids = [row["id"] for row in rows]
+                placeholders = ",".join("?" * len(run_ids))
+                link_rows = conn.execute(
+                    f"""
+                    SELECT v.run_id, v.vuln_id, v.dedupe_key
+                    FROM vulnerabilities v
+                    JOIN pocs p
+                      ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+                    WHERE v.run_id IN ({placeholders})
+                      AND p.status IN ({status_placeholders})
+                    """,
+                    (*run_ids, *statuses),
+                ).fetchall()
+                registry_rows = conn.execute(
+                    """SELECT project, dedupe_key, deleted_at
+                    FROM disclosed_bugs"""
+                ).fetchall()
         result = [dict(row) for row in rows]
+        by_run = {run["id"]: run for run in result}
+        registry = {
+            (row["project"], row["dedupe_key"]): row for row in registry_rows
+        }
+        for run in result:
+            run["disclosure_counts"] = {"active": 0, "trashed": 0, "missing": 0}
+        for link in link_rows:
+            run = by_run[link["run_id"]]
+            entry = registry.get((_run_project(run), link["dedupe_key"]))
+            state = (
+                "trashed" if entry and entry["deleted_at"] is not None
+                else "active" if entry else "missing"
+            )
+            run["disclosure_counts"][state] += 1
         for run in result:
             if str(run.get("output_dir") or "").endswith(_POC_BACKFILL_OUTPUT_SUFFIX):
                 run["run_kind"] = RUN_KIND_MAINTENANCE
@@ -2857,6 +2902,39 @@ class AuditStore:
                     (run_id, *statuses),
                 ).fetchall()
             ]
+            project = _run_project(run)
+            registry = {}
+            for raw in conn.execute(
+                """
+                SELECT * FROM disclosed_bugs
+                WHERE project = ?
+                """,
+                (project,),
+            ).fetchall():
+                entry = dict(raw)
+                entry.pop("artifact_links", None)
+                registry[entry["dedupe_key"]] = entry
+            disclosure_counts = {"active": 0, "trashed": 0, "missing": 0}
+            for vuln in run["vulnerabilities"]:
+                entry = registry.get(vuln.get("dedupe_key") or "")
+                if entry is None:
+                    state = "missing"
+                    reason = (
+                        "not_registered"
+                        if vuln.get("disclosure_report_path")
+                        else "no_stage6"
+                    )
+                else:
+                    state = (
+                        "trashed" if entry.get("deleted_at") is not None else "active"
+                    )
+                    reason = None
+                vuln["disclosure_project"] = project
+                vuln["disclosure_state"] = state
+                vuln["disclosure_missing_reason"] = reason
+                vuln["disclosure"] = entry
+                disclosure_counts[state] += 1
+            run["disclosure_counts"] = disclosure_counts
             run["reproduced_vulns_count"] = len(run["vulnerabilities"])
             # Non-reproduced PoC outcomes (error/false-positive/not-reproduced)
             # so the detail view can show which tasks did not produce a PoC.
@@ -2895,6 +2973,51 @@ class AuditStore:
             else:
                 run["related_run_ids"] = []
         return run
+
+    def register_history_disclosure(self, run_id: int, vuln_id: str) -> dict:
+        """Create the catalogue link from one retained reproduced Run finding."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT r.*, v.dedupe_key, d.report_path
+                FROM runs r
+                JOIN vulnerabilities v ON v.run_id = r.id
+                JOIN pocs p
+                  ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+                JOIN disclosures d
+                  ON d.run_id = v.run_id AND d.vuln_id = v.vuln_id
+                WHERE r.id = ? AND v.vuln_id = ? AND p.status = 'reproduced'
+                """,
+                (run_id, vuln_id),
+            ).fetchone()
+            if row is None or not row["dedupe_key"] or not row["report_path"]:
+                raise ValueError(
+                    "No reproduced finding with a retained Stage 6 report."
+                )
+            project = _run_project(dict(row))
+            identity = (project, row["dedupe_key"])
+            existing = conn.execute(
+                """SELECT deleted_at FROM disclosed_bugs
+                WHERE project = ? AND dedupe_key = ?""",
+                identity,
+            ).fetchone()
+            if existing is not None:
+                if existing["deleted_at"] is not None:
+                    raise ValueError(
+                        "Disclosure is in the recycle bin; restore that entry instead."
+                    )
+                return {"project": project, "dedupe_key": row["dedupe_key"]}
+            self._sync_disclosures_from_run(
+                conn, run_id, row["output_dir"], vuln_id=vuln_id
+            )
+            linked = conn.execute(
+                """SELECT 1 FROM disclosed_bugs
+                WHERE project = ? AND dedupe_key = ? AND deleted_at IS NULL""",
+                identity,
+            ).fetchone()
+            if linked is None:
+                raise ValueError("The retained Stage 6 report is no longer available.")
+        return {"project": project, "dedupe_key": row["dedupe_key"]}
 
     def list_history_reproduction_candidates(self) -> list[dict]:
         """List historical vulnerabilities with an exactly reproduced PoC."""
@@ -3729,13 +3852,27 @@ class AuditStore:
             poc_rows = conn.execute(
                 """
                 SELECT v.dedupe_key, v.run_id, v.vuln_id, v.title,
-                       p.report_path AS poc_report_path, r.output_dir
+                       p.report_path AS poc_report_path, r.output_dir,
+                       r.repo_name, r.repo_url, r.target
                 FROM vulnerabilities v
                 JOIN runs r ON r.id = v.run_id
                 JOIN pocs p
                   ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
                 WHERE p.status = 'reproduced'
                 ORDER BY v.run_id DESC
+                """
+            ).fetchall()
+            history_rows = conn.execute(
+                """
+                SELECT v.dedupe_key, v.run_id, v.vuln_id, v.title,
+                       r."commit", r.repo_name, r.repo_url, r.target, r.output_dir,
+                       p.status AS poc_status
+                FROM vulnerabilities v
+                JOIN runs r ON r.id = v.run_id
+                JOIN pocs p
+                  ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
+                WHERE p.status = 'reproduced'
+                ORDER BY v.run_id DESC, v.vuln_id
                 """
             ).fetchall()
         cves_by_key: dict[str, list[dict[str, str]]] = {}
@@ -3745,7 +3882,14 @@ class AuditStore:
                 {"cve_id": cve["cve_id"], "cve_url": cve["cve_url"]}
             )
             keys_by_cve.setdefault(cve["cve_id"], []).append(cve["dedupe_key"])
-        poc_by_key: dict[str, dict] = {}
+        history_by_identity: dict[tuple[str, str], list[dict]] = {}
+        for raw in history_rows:
+            source = dict(raw)
+            identity = (_run_project(source), source["dedupe_key"])
+            for field in ("repo_name", "repo_url", "target", "output_dir"):
+                source.pop(field, None)
+            history_by_identity.setdefault(identity, []).append(source)
+        poc_by_key: dict[tuple[str, str], dict] = {}
         for poc in poc_rows:
             report_path = _registered_stage5_report(
                 str(poc["output_dir"] or ""), poc["poc_report_path"]
@@ -3756,8 +3900,10 @@ class AuditStore:
                 # the Disclosure view can show the explicit missing reason.
                 continue
             item = dict(poc)
-            item.pop("output_dir", None)
-            poc_by_key.setdefault(poc["dedupe_key"], item)
+            identity = (_run_project(item), poc["dedupe_key"])
+            for field in ("repo_name", "repo_url", "target", "output_dir"):
+                item.pop(field, None)
+            poc_by_key.setdefault(identity, item)
         latest_reproductions: dict[tuple[str, str], dict] = {}
         for reproduction in self.list_reproductions():
             latest_reproductions.setdefault(
@@ -3765,6 +3911,8 @@ class AuditStore:
                 reproduction,
             )
         for row in entries:
+            identity = (row["project"], row["dedupe_key"])
+            row["history_sources"] = history_by_identity.get(identity, [])
             try:
                 artifacts = json.loads(row.pop("artifact_links") or "[]")
             except (json.JSONDecodeError, TypeError):
@@ -3789,7 +3937,7 @@ class AuditStore:
                 if row.get("review_status") == "confirmed"
                 else []
             )
-            row["poc"] = poc_by_key.get(row.get("dedupe_key") or "")
+            row["poc"] = poc_by_key.get(identity)
             row["latest_reproduction"] = latest_reproductions.get(
                 (str(row.get("project") or ""), str(row.get("dedupe_key") or ""))
             )
@@ -3797,9 +3945,9 @@ class AuditStore:
                 for cve in row["cves"]:
                     row["poc"] = next(
                         (
-                            poc_by_key[key]
+                            poc_by_key[(row["project"], key)]
                             for key in keys_by_cve.get(cve["cve_id"], [])
-                            if key in poc_by_key
+                            if (row["project"], key) in poc_by_key
                         ),
                         None,
                     )
@@ -3832,6 +3980,11 @@ class AuditStore:
                     value
                     for cve in row.get("cves") or []
                     for value in (cve.get("cve_id"), cve.get("cve_url"))
+                )
+                values.extend(
+                    value
+                    for source in row.get("history_sources") or []
+                    for value in (f"Run #{source['run_id']}", source["vuln_id"], source["title"])
                 )
                 poc = row.get("terminal") or row.get("poc") or {}
                 values.extend((poc.get("run_id"), poc.get("vuln_id"), poc.get("title")))

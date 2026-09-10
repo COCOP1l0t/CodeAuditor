@@ -1556,6 +1556,76 @@ def test_database_updates_disclosure_metadata_without_changing_identity(
     assert store.update_disclosed_entry("qemu", "sha256:" + "0" * 64, metadata) is False
 
 
+def test_history_disclosure_link_tracks_registry_lifecycle(tmp_path) -> None:
+    out = _make_disclosure_output(tmp_path / "qemu")
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(out.parent), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+
+    run = store.get_run(run_id)
+    assert run is not None
+    vuln = run["vulnerabilities"][0]
+    dedupe_key = vuln["dedupe_key"]
+    assert run["disclosure_counts"] == {
+        "active": 1,
+        "trashed": 0,
+        "missing": 0,
+    }
+    assert vuln["disclosure_state"] == "active"
+    assert vuln["disclosure"]["review_status"] == "unreviewed"
+    listed, _total = store.list_runs()
+    assert listed[0]["disclosure_counts"]["active"] == 1
+
+    assert store.set_disclosed_status("qemu", dedupe_key, "reported")
+    assert store.update_disclosed_entry(
+        "qemu", dedupe_key, {"title": "Reviewed history title"}
+    )
+    updated = store.get_run(run_id)["vulnerabilities"][0]
+    assert updated["disclosure"]["review_status"] == "reported"
+    assert updated["disclosure"]["title"] == "Reviewed history title"
+    source = store.list_disclosed()[0]["history_sources"][0]
+    assert (source["run_id"], source["vuln_id"]) == (run_id, "H-01")
+
+    assert store.trash_disclosure("qemu", dedupe_key)
+    trashed = store.get_run(run_id)
+    assert trashed["disclosure_counts"]["trashed"] == 1
+    assert trashed["vulnerabilities"][0]["disclosure_state"] == "trashed"
+    assert store.restore_disclosure("qemu", dedupe_key)
+    assert store.get_run(run_id)["vulnerabilities"][0]["disclosure_state"] == "active"
+
+    with store._connect() as conn:
+        conn.execute(
+            "DELETE FROM disclosed_bugs WHERE project = ? AND dedupe_key = ?",
+            ("qemu", dedupe_key),
+        )
+    missing = store.get_run(run_id)["vulnerabilities"][0]
+    assert missing["disclosure_state"] == "missing"
+    assert missing["disclosure_missing_reason"] == "not_registered"
+    assert store.register_history_disclosure(run_id, "H-01") == {
+        "project": "qemu",
+        "dedupe_key": dedupe_key,
+    }
+    assert store.get_run(run_id)["vulnerabilities"][0]["disclosure_state"] == "active"
+
+
+def test_history_disclosure_link_distinguishes_missing_stage6(tmp_path) -> None:
+    out = _make_output_dir(tmp_path / "legacy")
+    shutil.rmtree(out / "stage6-disclosures")
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(
+        AuditConfig(target=str(out.parent), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+
+    vuln = store.get_run(run_id)["vulnerabilities"][0]
+    assert vuln["disclosure_state"] == "missing"
+    assert vuln["disclosure_missing_reason"] == "no_stage6"
+    with pytest.raises(ValueError, match="retained Stage 6"):
+        store.register_history_disclosure(run_id, "H-01")
+
+
 @pytest.mark.parametrize("review_status", ["unreviewed", "reported"])
 @pytest.mark.parametrize(
     "poc_status",

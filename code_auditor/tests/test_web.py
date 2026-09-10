@@ -2828,7 +2828,8 @@ def test_run_stage_summary_marks_partial_failed_run(tmp_path) -> None:
 
 def test_api_history_import_and_detail(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
-    client = TestClient(_make_app(tmp_path))
+    app = _make_app(tmp_path)
+    client = TestClient(app)
 
     res = client.post("/api/history/import", json={"output_dir": out})
     assert res.status_code == 201
@@ -2845,6 +2846,46 @@ def test_api_history_import_and_detail(tmp_path) -> None:
     assert detail["vulnerabilities"][0]["vuln_id"] == "H-01"
     assert detail["vulnerabilities"][0]["cvss_score"] == 8.1
     assert detail["vulnerabilities"][0]["poc_status"] == "reproduced"
+    linked = detail["vulnerabilities"][0]["disclosure"]
+    assert detail["vulnerabilities"][0]["disclosure_state"] == "active"
+    assert linked["review_status"] == "unreviewed"
+
+    disclosures = client.get("/api/disclosures").json()["entries"]
+    assert disclosures[0]["history_sources"][0]["run_id"] == run_id
+    identity = {
+        "project": linked["project"],
+        "dedupe_key": linked["dedupe_key"],
+    }
+    assert client.post(
+        "/api/disclosures/status", json={**identity, "status": "reported"}
+    ).status_code == 200
+    assert client.get(f"/api/history/{run_id}").json()["vulnerabilities"][0][
+        "disclosure"
+    ]["review_status"] == "reported"
+
+    assert client.post("/api/disclosures/trash", json=identity).status_code == 200
+    assert client.get(f"/api/history/{run_id}").json()["vulnerabilities"][0][
+        "disclosure_state"
+    ] == "trashed"
+    assert client.post("/api/disclosures/restore", json=identity).status_code == 200
+
+    with app.state.store._connect() as conn:
+        conn.execute(
+            "DELETE FROM disclosed_bugs WHERE project = ? AND dedupe_key = ?",
+            (identity["project"], identity["dedupe_key"]),
+        )
+    missing = client.get(f"/api/history/{run_id}").json()["vulnerabilities"][0]
+    assert missing["disclosure_state"] == "missing"
+    assert missing["disclosure_missing_reason"] == "not_registered"
+    response = client.post(
+        "/api/disclosures/from-history",
+        json={"run_id": run_id, "vuln_id": "H-01"},
+    )
+    assert response.status_code == 201
+    assert response.json()["dedupe_key"] == identity["dedupe_key"]
+    assert client.get(f"/api/history/{run_id}").json()["vulnerabilities"][0][
+        "disclosure_state"
+    ] == "active"
 
     # No checkpoint markers: stage summary falls back to artifact presence.
     stages = {s["stage"]: s for s in detail["stages"]}

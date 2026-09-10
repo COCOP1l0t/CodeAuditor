@@ -2049,7 +2049,6 @@ tr.run-row:hover {
 #cves-table,
 #trash-table {
   width: 100%;
-  min-width: 1160px;
   table-layout: fixed;
   border-collapse: collapse;
   font-size: 0.85rem;
@@ -2673,6 +2672,23 @@ th[aria-sort="descending"] .sort-button::after {
   white-space: nowrap;
 }
 
+.btn-reproduce {
+  min-height: 28px;
+  padding: 0.16rem 0.52rem;
+  font-size: 0.72rem;
+}
+
+.disclosure-history .table-link-list {
+  display: inline-flex;
+  margin-left: 0.25rem;
+}
+
+.run-disclosure-files {
+  margin-top: 0.32rem;
+  color: var(--dim);
+  font-size: 0.75rem;
+}
+
 .row-actions .btn-terminal {
   margin-left: 0;
 }
@@ -2753,14 +2769,73 @@ th[aria-sort="descending"] .sort-button::after {
   padding: 0.15rem 0.35rem;
 }
 
-.col-disclosure-status { width: 140px; }
-.col-disclosure-project { width: 110px; }
-.col-disclosure-title { width: 300px; }
-.col-disclosure-cve { width: 135px; }
-.col-disclosure-cwe { width: 155px; }
-.col-disclosure-commit { width: 90px; }
-.col-disclosure-date { width: 115px; }
-.col-disclosure-actions { width: 330px; }
+/* Proportional defaults keep the eight columns inside the shell at any width, so
+   the table never forces the bottom scrollbar. The Actions column stays auto and
+   absorbs the remainder plus any sub-pixel rounding. Dragging a header divider
+   (see .column-resizer) rewrites these inline; double-click restores them. */
+.col-disclosure-status { width: 10%; }
+.col-disclosure-project { width: 8%; }
+.col-disclosure-title { width: 22%; }
+.col-disclosure-cve { width: 10%; }
+.col-disclosure-cwe { width: 11%; }
+.col-disclosure-commit { width: 7%; }
+.col-disclosure-date { width: 8%; }
+.col-disclosure-actions { width: auto; }
+
+/* Column resizing for the Disclosure table. Each header except the last carries
+   an invisible divider hit area straddling its right border; the adjacent-column
+   logic in app.js:wireResizableTable keeps the total at 100%, so dragging never
+   introduces a scrollbar. */
+#disclosures-table th {
+  position: relative;
+}
+
+.column-resizer {
+  position: absolute;
+  top: 0;
+  right: -5px;
+  width: 10px;
+  height: 100%;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.column-resizer::after {
+  content: "";
+  position: absolute;
+  top: 18%;
+  bottom: 18%;
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.column-resizer:hover::after,
+.column-resizer:focus-visible::after,
+body.column-resizing .column-resizer::after {
+  background: var(--accent);
+}
+
+.column-resizer:focus-visible {
+  outline: none;
+}
+
+body.column-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+/* Narrow shells wrap the action buttons instead of widening the table. */
+#disclosures-table .row-actions {
+  flex-wrap: wrap;
+  white-space: normal;
+  row-gap: 0.3rem;
+}
 
 .col-cve-id { width: 160px; }
 .col-cve-project { width: 125px; }

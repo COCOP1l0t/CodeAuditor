@@ -2278,7 +2278,7 @@ async function loadHistory() {
         { kind: "status" },
         backendsUsedDisplay(liveJob || run) || "—",
         usageStatsDisplay(run) || "—",
-        run.reproduced_vulns_count,
+        { kind: "reproduced" },
       ];
       for (const c of cells) {
         const td = document.createElement("td");
@@ -2304,6 +2304,17 @@ async function loadHistory() {
             warn.title = run.error;
             td.appendChild(warn);
           }
+        } else if (c && c.kind === "reproduced") {
+          const counts = run.disclosure_counts || {};
+          const reproduced = Number(run.reproduced_vulns_count || 0);
+          const linked = Number(counts.active || 0);
+          const trashed = Number(counts.trashed || 0);
+          const missing = Number(counts.missing || 0);
+          td.textContent = `${reproduced} · ${linked} linked`;
+          td.title =
+            `${reproduced} reproduced; ${linked} active Disclosure; ` +
+            `${trashed} in recycle bin; ${missing} missing`;
+          td.className = "numeric-cell";
         } else {
           td.textContent = c ?? "—";
           if (typeof c === "string" && c !== "—") td.title = c;
@@ -2652,10 +2663,32 @@ async function loadRunDetail(runId) {
   for (const v of allVulns) {
     const tr = document.createElement("tr");
     const cwes = parseJsonList(v.cwe_ids).join(", ");
-    const disclosure = v.disclosure_report_path
+    const localDisclosure = v.disclosure_report_path
       ? dlLink(v.disclosure_report_path, "report") +
         (v.disclosure_zip_path ? ` ${dlLink(v.disclosure_zip_path, "zip")}` : "")
       : "—";
+    const linked = v.disclosure;
+    let registryDisclosure = "";
+    if (v.disclosure_state === "active" && linked) {
+      registryDisclosure =
+        `<span class="badge badge-disc-${escapeHtml(linked.review_status)}">` +
+        `${escapeHtml(linked.review_status)}</span> ` +
+        `<a href="#/disclosures" data-disclosure-open="${escapeHtml(linked.dedupe_key)}">Open</a>`;
+    } else if (v.disclosure_state === "trashed" && linked) {
+      registryDisclosure =
+        `<span class="badge badge-disc-rejected">in recycle bin</span> ` +
+        `<a href="#/trash" data-disclosure-trash="${escapeHtml(linked.dedupe_key)}">Open</a>`;
+    } else if (v.disclosure_missing_reason === "not_registered") {
+      registryDisclosure =
+        `<span class="dim">Registry missing</span> ` +
+        `<button type="button" class="btn btn-compact" ` +
+        `data-disclosure-register="${escapeHtml(v.vuln_id)}">Add</button>`;
+    } else {
+      registryDisclosure = `<span class="dim">Not created</span>`;
+    }
+    const disclosure =
+      `<div class="run-disclosure-state">${registryDisclosure}</div>` +
+      `<div class="run-disclosure-files">${localDisclosure}</div>`;
     tr.innerHTML =
       `<td>${escapeHtml(v.vuln_id)}</td><td class="sev-cell"></td><td>${escapeHtml(v.cvss_score ?? "—")}</td>` +
       `<td>${escapeHtml(cwes) || "—"}</td><td>${escapeHtml(v.title) || "—"}</td>` +
@@ -2670,6 +2703,11 @@ async function loadRunDetail(runId) {
       `<div class="kv">Location: ${escapeHtml(v.location) || "—"}</div>` +
       `<div class="kv">Trigger: ${escapeHtml(v.trigger) || "—"}</div>` +
       `<div class="kv">Impact: ${escapeHtml(v.impact) || "—"}</div>` +
+      `<div class="kv">Disclosure identity: ${escapeHtml(v.disclosure_project) || "—"} · ` +
+      `<code>${escapeHtml(v.dedupe_key) || "—"}</code></div>` +
+      (linked
+        ? `<div class="kv">Current Disclosure title: ${escapeHtml(linked.title) || "—"}</div>`
+        : "") +
       (v.poc_report_path
         ? `<div class="kv">PoC report: <a href="#" data-file="${escapeHtml(v.poc_report_path)}">${escapeHtml(v.poc_report_path)}</a></div>`
         : "") +
@@ -2685,6 +2723,42 @@ async function loadRunDetail(runId) {
     a.addEventListener("click", (e) => {
       e.preventDefault();
       viewHistoryFile(runId, a.getAttribute("data-file"));
+    });
+  });
+  document.querySelectorAll("#view-run-detail [data-disclosure-open]").forEach((a) => {
+    a.addEventListener("click", () => {
+      disclosureFilter = "";
+      $("disclosure-project").value = "";
+      $("disclosure-search").value = a.dataset.disclosureOpen;
+    });
+  });
+  document.querySelectorAll("#view-run-detail [data-disclosure-trash]").forEach((a) => {
+    a.addEventListener("click", () => {
+      $("trash-project").value = "";
+      $("trash-search").value = a.dataset.disclosureTrash;
+    });
+  });
+  document.querySelectorAll("#view-run-detail [data-disclosure-register]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      setResumeMessage("Adding Disclosure to the registry…");
+      try {
+        const res = await fetch("/api/disclosures/from-history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            run_id: Number(runId),
+            vuln_id: button.dataset.disclosureRegister,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        await loadRunDetail(runId);
+        setResumeMessage("Disclosure added to the registry.");
+      } catch (error) {
+        setResumeMessage(`Could not add Disclosure: ${error.message || error}`, true);
+        button.disabled = false;
+      }
     });
   });
   wireTerminalButtons($("view-run-detail"));
@@ -2856,6 +2930,95 @@ function wireSortableTable(tableId, state, reload) {
     });
   }
   updateSortIndicators(tableId, state);
+}
+
+function wireResizableTable(tableId) {
+  const table = $(tableId);
+  const columns = [...table.querySelectorAll("colgroup col")];
+  const headers = [...table.querySelectorAll("thead th")];
+  if (columns.length !== headers.length || columns.length < 2) return;
+
+  const columnWidths = () =>
+    headers.map((header) => header.getBoundingClientRect().width);
+
+  const applyWidths = (widths) => {
+    const total = widths.reduce((sum, width) => sum + width, 0);
+    if (total <= 0) return;
+    columns.forEach((column, index) => {
+      column.style.width = `${(widths[index] / total) * 100}%`;
+    });
+  };
+
+  const resizeBoundary = (index, startWidths, delta) => {
+    const widths = [...startWidths];
+    const combined = widths[index] + widths[index + 1];
+    const requestedMinimums = [56, 56];
+    const minimumScale = Math.min(
+      1,
+      combined / (requestedMinimums[0] + requestedMinimums[1])
+    );
+    const leftMinimum = requestedMinimums[0] * minimumScale;
+    const rightMinimum = requestedMinimums[1] * minimumScale;
+    const boundedDelta = Math.max(
+      leftMinimum - widths[index],
+      Math.min(delta, widths[index + 1] - rightMinimum)
+    );
+    widths[index] += boundedDelta;
+    widths[index + 1] -= boundedDelta;
+    applyWidths(widths);
+  };
+
+  headers.slice(0, -1).forEach((header, index) => {
+    const resizer = document.createElement("span");
+    resizer.className = "column-resizer";
+    resizer.tabIndex = 0;
+    resizer.setAttribute("role", "separator");
+    resizer.setAttribute("aria-orientation", "vertical");
+    resizer.setAttribute(
+      "aria-label",
+      `Resize ${header.textContent.trim()} column`
+    );
+    resizer.title = "Drag to resize columns; double-click to reset";
+    header.appendChild(resizer);
+
+    resizer.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const startX = event.clientX;
+      const startWidths = columnWidths();
+      resizer.setPointerCapture(event.pointerId);
+      document.body.classList.add("column-resizing");
+
+      const move = (moveEvent) => {
+        if (moveEvent.pointerId !== event.pointerId) return;
+        resizeBoundary(index, startWidths, moveEvent.clientX - startX);
+      };
+      const finish = (finishEvent) => {
+        if (finishEvent.pointerId !== event.pointerId) return;
+        resizer.removeEventListener("pointermove", move);
+        resizer.removeEventListener("pointerup", finish);
+        resizer.removeEventListener("pointercancel", finish);
+        document.body.classList.remove("column-resizing");
+      };
+      resizer.addEventListener("pointermove", move);
+      resizer.addEventListener("pointerup", finish);
+      resizer.addEventListener("pointercancel", finish);
+    });
+
+    resizer.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      resizeBoundary(
+        index,
+        columnWidths(),
+        event.key === "ArrowLeft" ? -12 : 12
+      );
+    });
+
+    resizer.addEventListener("dblclick", () => {
+      columns.forEach((column) => column.style.removeProperty("width"));
+    });
+  });
 }
 
 function disclosureSortValue(entry, key) {
@@ -3372,6 +3535,10 @@ async function loadDisclosures() {
       reproduceButton.type = "button";
       reproduceButton.className = "btn btn-reproduce";
       reproduceButton.textContent = "Reproduce";
+      reproduceButton.setAttribute(
+        "aria-label",
+        `Reproduce ${e.title || e.dedupe_key} on the latest source`
+      );
       reproduceButton.addEventListener("click", () => {
         pendingReproductionSelection = {
           project: e.project,
@@ -3417,6 +3584,13 @@ async function loadDisclosures() {
           `<code>${escapeHtml((e.latest_reproduction.tested_commit || "").slice(0, 12) || "unresolved")}</code>` +
           `${e.latest_reproduction.disposition ? ` · Agent: ${escapeHtml(e.latest_reproduction.disposition)}` : ""}</div>`
         : `<div class="kv">Latest retest: not tested</div>`;
+      const historySources = (e.history_sources || [])
+        .map(
+          (source) =>
+            `<a href="#/run/${escapeHtml(source.run_id)}">Run #${escapeHtml(source.run_id)}` +
+            ` · ${escapeHtml(source.vuln_id)}</a>`
+        )
+        .join("");
       details.innerHTML =
         `<td colspan="8"><details><summary>details</summary>` +
         `<div class="kv">${escapeHtml(e.summary) || "—"}</div>` +
@@ -3424,6 +3598,8 @@ async function loadDisclosures() {
         `<div class="kv">Trigger: ${escapeHtml(e.trigger) || "—"}</div>` +
         `<div class="kv">Repo: ${externalLinkHtml(e.repo_url, e.repo_url) || "—"} · ` +
         `backend: ${escapeHtml(e.model_backend) || "legacy record (not recorded)"}</div>` +
+        `<div class="kv disclosure-history">History: ` +
+        `<span class="table-link-list">${historySources || "No reproduced Run is linked"}</span></div>` +
         `<div class="kv">Artifacts: ${artifacts || "—"}</div>` +
         latestReproduction +
         unavailable +
@@ -4005,6 +4181,7 @@ function renderCveProjectOptions(projects) {
 $("cve-project").addEventListener("change", loadCves);
 
 wireSortableTable("disclosures-table", disclosureSort, loadDisclosures);
+wireResizableTable("disclosures-table");
 wireSortableTable("cves-table", cveSort, loadCves);
 
 function addCveReferenceRow(reference = {}) {

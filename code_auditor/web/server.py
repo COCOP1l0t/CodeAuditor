@@ -439,6 +439,11 @@ class ImportRequest(StrictRequest):
     output_dir: str = Field(min_length=1, max_length=4096)
 
 
+class HistoryDisclosureLinkRequest(StrictRequest):
+    run_id: int = Field(gt=0)
+    vuln_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
 class DisclosureIdentityRequest(StrictRequest):
     project: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
     dedupe_key: str = Field(min_length=71, max_length=71, pattern=_DEDUPE_KEY_PATTERN)
@@ -1716,6 +1721,18 @@ def create_app(
         return {"imported": len(runs), "runs": runs}
 
     # ── Database-backed Disclosure catalogue ────────────────────────────
+
+    @app.post("/api/disclosures/from-history", status_code=201)
+    def create_disclosure_from_history(
+        request: HistoryDisclosureLinkRequest,
+    ) -> dict:
+        try:
+            identity = store.register_history_disclosure(
+                request.run_id, request.vuln_id
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return {"ok": True, **identity}
 
     @app.get("/api/disclosures")
     def list_disclosures(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Coroutine, TypeVar
@@ -96,6 +97,22 @@ def natural_sort_key(s: str) -> list[int | str]:
     Ensures e.g. 'AU-2' sorts before 'AU-10' instead of after 'AU-1'.
     """
     return [int(c) if c.isdigit() else c for c in re.split(r"(\d+)", s)]
+
+
+def path_is_within(path: str | os.PathLike[str], root: str | os.PathLike[str]) -> bool:
+    """Return whether ``path`` is ``root`` or a descendant of it.
+
+    Both sides are realpath'd, so symlink aliases and ``..`` segments cannot
+    escape the root. This is the single containment primitive shared by the
+    managed-path checks in the Web server, job manager, database, and cleanup
+    tooling; a false result on an unresolvable path is the safe default.
+    """
+    try:
+        resolved = os.path.realpath(os.fspath(path))
+        resolved_root = os.path.realpath(os.fspath(root))
+    except (OSError, ValueError, TypeError):
+        return False
+    return resolved == resolved_root or resolved.startswith(resolved_root + os.sep)
 
 
 def list_json_files(dir_path: str) -> list[str]:

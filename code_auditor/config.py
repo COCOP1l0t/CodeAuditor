@@ -12,6 +12,11 @@ SandboxMode = Literal["docker-networked", "docker-isolated", "local-worktree"]
 SandboxRuntime = Literal["docker-default", "runc", "runsc"]
 DEFAULT_SANDBOX_RUNTIME: SandboxRuntime = "docker-default"
 SANDBOX_RUNTIMES = ("docker-default", "runc", "runsc")
+SANDBOX_MODES: tuple[str, ...] = (
+    "docker-networked",
+    "docker-isolated",
+    "local-worktree",
+)
 
 DEFAULT_BACKEND: AgentBackend = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"

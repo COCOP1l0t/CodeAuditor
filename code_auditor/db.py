@@ -12,6 +12,7 @@ the asyncio event loop.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from uuid import uuid4
 
 from .config import AuditConfig
@@ -40,7 +41,7 @@ from .reproduction_status import (
     REPRODUCED_STATUSES,
     read_reproduction_status,
 )
-from .utils import natural_sort_key
+from .utils import natural_sort_key, path_is_within
 
 DEFAULT_DB_PATH = os.path.join("~", ".code_auditor", "audits.db")
 
@@ -65,6 +66,7 @@ RUN_STATUSES = frozenset(
 )
 _POC_BACKFILL_OUTPUT_SUFFIX = "-poc-backfill"
 _POC_BACKFILL_OUTPUT_LIKE = f"%{_POC_BACKFILL_OUTPUT_SUFFIX}"
+_VULN_ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 DISCLOSURE_REVIEW_STATUSES = {
     "unreviewed",
     "reported",
@@ -284,8 +286,16 @@ def _find_output_dirs(root: str) -> list[str]:
     found: list[str] = []
     for dirpath, dirnames, _filenames in os.walk(root):
         for name in dirnames:
-            if name.startswith("audit-output"):
-                found.append(os.path.join(dirpath, name))
+            if not name.startswith("audit-output"):
+                continue
+            candidate = os.path.join(dirpath, name)
+            # A symlink named ``audit-output-*`` resolves outside the results
+            # root during import, letting a crafted entry register an
+            # arbitrary directory as a run's output_dir. Ignore linked
+            # directories entirely (os.walk already does not descend them).
+            if os.path.islink(candidate):
+                continue
+            found.append(candidate)
         # Never descend into output directories or git internals.
         dirnames[:] = [
             d for d in dirnames if not d.startswith("audit-output") and d != ".git"
@@ -466,7 +476,7 @@ def _registered_stage5_report(output_dir: str, report_value: object) -> str | No
         if os.path.isabs(report_value)
         else os.path.join(root, report_value)
     )
-    if not resolved.startswith(root + os.sep) or not os.path.isfile(resolved):
+    if not path_is_within(resolved, root) or not os.path.isfile(resolved):
         return None
     report = Path(resolved)
     if (
@@ -510,7 +520,7 @@ def _stage6_terminal_paths(
         except RetentionError:
             continue
         entrypoint = os.path.realpath(os.path.join(disclosure_dir, manifest.entrypoint))
-        if not entrypoint.startswith(disclosure_dir + os.sep) or not os.path.isfile(
+        if not path_is_within(entrypoint, disclosure_dir) or not os.path.isfile(
             entrypoint
         ):
             continue
@@ -807,7 +817,16 @@ class AuditStore:
             # prevent the history database from opening.
             logger.warning("Stage 6 evidence backfill failed: %s", exc)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a short-lived connection, committing or rolling back on exit.
+
+        ``sqlite3.Connection`` used directly as a context manager only manages
+        its transaction; it never closes the handle. Every caller here uses
+        ``with self._connect() as conn``, so this generator both preserves the
+        commit/rollback semantics and guarantees the connection is closed,
+        which prevents file-descriptor exhaustion in the long-running server.
+        """
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -816,7 +835,11 @@ class AuditStore:
         # each other's short transactions.
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 30000")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     # ── Web authentication ────────────────────────────────────────────────
 
@@ -1102,21 +1125,26 @@ class AuditStore:
             """
         )
 
-    @staticmethod
-    def _path_is_within(path: str, root: str) -> bool:
-        return path == root or path.startswith(root + os.sep)
-
-    def _stage6_disclosure_dirs(
+    def _managed_artifact_dirs(
         self,
         artifacts_json: str,
-        registered_stage6_dirs: set[str],
+        registered_stage_dirs: set[str],
+        *,
+        matches_label: Callable[[str], bool],
+        stage_dirname: str,
+        leaf_dirname: str | None = None,
     ) -> set[str]:
-        """Resolve only registered Stage 6 ``<vuln>/disclosure`` directories.
+        """Resolve registered Stage 5/6 directories that are safe to delete.
 
         Artifact paths are database input, so structural checks alone are not
         enough for a recursive delete.  A candidate must also live below the
         configured Web results root or exactly below a run output directory
         already registered in this database.
+
+        ``leaf_dirname`` names the removable directory when it is not the
+        vulnerability directory itself (Stage 6 keeps files in
+        ``<vuln>/disclosure``).  The returned set always holds the directory
+        that may be removed.
         """
         try:
             artifacts = json.loads(artifacts_json or "[]")
@@ -1127,33 +1155,50 @@ class AuditStore:
 
         result: set[str] = set()
         for artifact in artifacts:
-            if not isinstance(artifact, dict) or not str(
-                artifact.get("label") or ""
-            ).startswith("Stage 6 "):
+            if not isinstance(artifact, dict) or not matches_label(
+                str(artifact.get("label") or "")
+            ):
                 continue
             path = artifact.get("path")
             if not isinstance(path, str) or not path or "\x00" in path:
                 continue
             artifact_path = os.path.realpath(os.path.expanduser(path))
-            disclosure_dir = os.path.dirname(artifact_path)
-            vuln_dir = os.path.dirname(disclosure_dir)
-            stage6_dir = os.path.dirname(vuln_dir)
+            delete_dir = os.path.dirname(artifact_path)
+            if leaf_dirname is not None:
+                if os.path.basename(delete_dir) != leaf_dirname:
+                    continue
+                vuln_dir = os.path.dirname(delete_dir)
+            else:
+                vuln_dir = delete_dir
+            stage_dir = os.path.dirname(vuln_dir)
             vuln_id = os.path.basename(vuln_dir)
             if (
-                os.path.basename(disclosure_dir) != "disclosure"
-                or os.path.basename(stage6_dir) != "stage6-disclosures"
-                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", vuln_id) is None
-                or not self._path_is_within(artifact_path, disclosure_dir)
+                os.path.basename(stage_dir) != stage_dirname
+                or _VULN_ID_PATTERN.fullmatch(vuln_id) is None
             ):
                 continue
 
             below_managed_results = bool(
                 self.managed_results_dir
-                and self._path_is_within(stage6_dir, self.managed_results_dir)
+                and path_is_within(stage_dir, self.managed_results_dir)
             )
-            if below_managed_results or stage6_dir in registered_stage6_dirs:
-                result.add(disclosure_dir)
+            if below_managed_results or stage_dir in registered_stage_dirs:
+                result.add(delete_dir)
         return result
+
+    def _stage6_disclosure_dirs(
+        self,
+        artifacts_json: str,
+        registered_stage6_dirs: set[str],
+    ) -> set[str]:
+        """Resolve only registered Stage 6 ``<vuln>/disclosure`` directories."""
+        return self._managed_artifact_dirs(
+            artifacts_json,
+            registered_stage6_dirs,
+            matches_label=lambda label: label.startswith("Stage 6 "),
+            stage_dirname="stage6-disclosures",
+            leaf_dirname="disclosure",
+        )
 
     def _stage5_poc_dirs(
         self,
@@ -1161,41 +1206,12 @@ class AuditStore:
         registered_stage5_dirs: set[str],
     ) -> set[str]:
         """Resolve only registered Stage 5 ``<vuln>`` PoC directories."""
-        try:
-            artifacts = json.loads(artifacts_json or "[]")
-        except (json.JSONDecodeError, TypeError):
-            return set()
-        if not isinstance(artifacts, list):
-            return set()
-
-        result: set[str] = set()
-        for artifact in artifacts:
-            if (
-                not isinstance(artifact, dict)
-                or artifact.get("label") != "Stage 5 Report"
-            ):
-                continue
-            path = artifact.get("path")
-            if not isinstance(path, str) or not path or "\x00" in path:
-                continue
-            artifact_path = os.path.realpath(os.path.expanduser(path))
-            poc_dir = os.path.dirname(artifact_path)
-            stage5_dir = os.path.dirname(poc_dir)
-            vuln_id = os.path.basename(poc_dir)
-            if (
-                os.path.basename(stage5_dir) != "stage5-pocs"
-                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", vuln_id) is None
-                or not self._path_is_within(artifact_path, poc_dir)
-            ):
-                continue
-
-            below_managed_results = bool(
-                self.managed_results_dir
-                and self._path_is_within(stage5_dir, self.managed_results_dir)
-            )
-            if below_managed_results or stage5_dir in registered_stage5_dirs:
-                result.add(poc_dir)
-        return result
+        return self._managed_artifact_dirs(
+            artifacts_json,
+            registered_stage5_dirs,
+            matches_label=lambda label: label == "Stage 5 Report",
+            stage_dirname="stage5-pocs",
+        )
 
     def _purge_expired_disclosures(
         self,
@@ -1641,7 +1657,7 @@ class AuditStore:
                         label in {"Stage 5 Trigger Graph", "Stage 5 ASan Report"}
                         and isinstance(path, str)
                         and any(
-                            self._path_is_within(
+                            path_is_within(
                                 os.path.realpath(os.path.expanduser(path)),
                                 disclosure_dir,
                             )
@@ -1828,7 +1844,7 @@ class AuditStore:
         resolved = os.path.realpath(
             value if os.path.isabs(value) else os.path.join(root, value)
         )
-        if not resolved.startswith(root + os.sep) or not os.path.isfile(resolved):
+        if not path_is_within(resolved, root) or not os.path.isfile(resolved):
             return None
         report = Path(resolved)
         poc_dir = report.parent
@@ -1898,7 +1914,7 @@ class AuditStore:
                     RUN_SUPERSEDED,
                 }:
                     continue
-                identity = str(row["target_key"] or "") or (
+                identity = (
                     str(row["target"] or ""),
                     str(row["commit"] or ""),
                 )
@@ -1906,7 +1922,7 @@ class AuditStore:
                     if later_id <= run_id:
                         continue
                     later_row = later["row"]
-                    later_identity = str(later_row["target_key"] or "") or (
+                    later_identity = (
                         str(later_row["target"] or ""),
                         str(later_row["commit"] or ""),
                     )
@@ -2196,10 +2212,20 @@ class AuditStore:
         Used when a git-clone audit's preliminary output_dir (date-based) is
         replaced by the commit-stamped directory after cloning completes.
         """
+        resolved = os.path.realpath(output_dir)
+        # History read endpoints treat the stored output_dir as the file-access
+        # containment root, so it must stay inside the managed results root.
+        if self.managed_results_dir and not path_is_within(
+            resolved, self.managed_results_dir
+        ):
+            raise ValueError(
+                "Output directory is outside the managed results directory: "
+                f"{resolved}"
+            )
         with self._connect() as conn:
             conn.execute(
                 "UPDATE runs SET output_dir = ? WHERE id = ?",
-                (output_dir, run_id),
+                (resolved, run_id),
             )
 
     def record_run(
@@ -2251,11 +2277,29 @@ class AuditStore:
         output_dir = os.path.realpath(output_dir)
         if not os.path.isdir(output_dir):
             raise ValueError(f"Output directory not found: {output_dir}")
+        # Importing must never register a directory outside the managed results
+        # root: history read endpoints trust the stored output_dir as the
+        # containment boundary for file access.
+        if self.managed_results_dir and not path_is_within(
+            output_dir, self.managed_results_dir
+        ):
+            raise ValueError(
+                "Output directory is outside the managed results directory: "
+                f"{output_dir}"
+            )
         target = target or os.path.dirname(output_dir)
-        latest_mtime = max(
-            (p.stat().st_mtime for p in Path(output_dir).rglob("*") if p.is_file()),
-            default=None,
-        )
+        latest_mtime: float | None = None
+        for candidate in Path(output_dir).rglob("*"):
+            try:
+                if not candidate.is_file():
+                    continue
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                # A file can vanish between the walk and the stat; an import
+                # must not fail because of a concurrent cleanup.
+                continue
+            if latest_mtime is None or mtime > latest_mtime:
+                latest_mtime = mtime
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -2433,6 +2477,30 @@ class AuditStore:
             reproduced = sum(
                 1 for p in artifacts["pocs"] if p["status"] in REPRODUCED_STATUSES
             )
+            # INSERT OR REPLACE mirrors the filesystem but never drops rows for
+            # artifacts that disappeared (for example a purged PoC). Left in
+            # place they make the stored counts, the list-endpoint counts, and
+            # the detail view disagree and keep pointing at deleted files.
+            self._prune_missing_artifacts(
+                conn, run_id, "analysis_units", "au_id",
+                [str(au["au_id"]) for au in artifacts["analysis_units"]],
+            )
+            self._prune_missing_artifacts(
+                conn, run_id, "findings", "finding_key",
+                [str(item["finding_key"]) for item in artifacts["findings"]],
+            )
+            self._prune_missing_artifacts(
+                conn, run_id, "vulnerabilities", "vuln_id",
+                [str(item["vuln_id"]) for item in artifacts["vulnerabilities"]],
+            )
+            self._prune_missing_artifacts(
+                conn, run_id, "pocs", "vuln_id",
+                [str(item["vuln_id"]) for item in artifacts["pocs"]],
+            )
+            self._prune_missing_artifacts(
+                conn, run_id, "disclosures", "vuln_id",
+                [str(item["vuln_id"]) for item in artifacts["disclosures"]],
+            )
             conn.execute(
                 """
                 UPDATE runs SET findings_count = ?, vulns_count = ?,
@@ -2450,6 +2518,25 @@ class AuditStore:
             self._sync_disclosures_from_run(conn, run_id, output_dir)
 
     @staticmethod
+    def _prune_missing_artifacts(
+        conn: sqlite3.Connection,
+        run_id: int,
+        table: str,
+        key_column: str,
+        keys: list[str],
+    ) -> None:
+        """Delete this run's artifact rows whose scan key is no longer present."""
+        if keys:
+            placeholders = ",".join("?" * len(keys))
+            conn.execute(
+                f"DELETE FROM {table} WHERE run_id = ? "
+                f"AND {key_column} NOT IN ({placeholders})",
+                (run_id, *keys),
+            )
+        else:
+            conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+
+    @staticmethod
     def _sync_disclosures_from_run(
         conn: sqlite3.Connection, run_id: int, output_dir: str,
         *, vuln_id: str | None = None,
@@ -2463,7 +2550,7 @@ class AuditStore:
             candidate = os.path.realpath(
                 path if os.path.isabs(path) else os.path.join(output_root, path)
             )
-            if not candidate.startswith(output_root + os.sep):
+            if not path_is_within(candidate, output_root):
                 return None
             return candidate if os.path.isfile(candidate) else None
 
@@ -3019,37 +3106,6 @@ class AuditStore:
                 raise ValueError("The retained Stage 6 report is no longer available.")
         return {"project": project, "dedupe_key": row["dedupe_key"]}
 
-    def list_history_reproduction_candidates(self) -> list[dict]:
-        """List historical vulnerabilities with an exactly reproduced PoC."""
-        with self._connect() as conn:
-            rows = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT v.run_id, v.vuln_id, v.severity, v.cvss_score,
-                           v.dedupe_key,
-                           v.title, v.location, r.repo_name, r.repo_url,
-                           r.branch, r."commit", r.target, r.output_dir,
-                           p.status AS poc_status,
-                           p.report_path AS poc_report_path
-                    FROM vulnerabilities v
-                    JOIN runs r ON r.id = v.run_id
-                    JOIN pocs p
-                      ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
-                    WHERE p.status = 'reproduced'
-                    ORDER BY r.repo_name, r.id DESC, v.vuln_id
-                    """
-                ).fetchall()
-            ]
-        rows.sort(
-            key=lambda item: (
-                item.get("repo_name") or "",
-                -item["run_id"],
-                natural_sort_key(item["vuln_id"]),
-            )
-        )
-        return rows
-
     def _disclosure_reproduction_source(
         self,
         conn: sqlite3.Connection,
@@ -3111,7 +3167,7 @@ class AuditStore:
                 path = os.path.realpath(raw)
                 if not os.path.isfile(path):
                     continue
-                if self.managed_results_dir and not self._path_is_within(
+                if self.managed_results_dir and not path_is_within(
                     path, self.managed_results_dir
                 ):
                     continue
@@ -3312,6 +3368,10 @@ class AuditStore:
     def cancel_running_reproductions(self, error: str) -> list[str]:
         ended_at = time.time()
         with self._connect() as conn:
+            # Match cancel_running_runs: the immediate write lock makes the
+            # SELECT and UPDATE one atomic step, so a job inserted between them
+            # cannot be cancelled without being reported (or vice versa).
+            conn.execute("BEGIN IMMEDIATE")
             keys = [
                 str(row[0])
                 for row in conn.execute(
@@ -3493,7 +3553,7 @@ class AuditStore:
             resolved = os.path.realpath(
                 value if os.path.isabs(value) else os.path.join(output_dir, value)
             )
-            if not resolved.startswith(output_dir + os.sep):
+            if not path_is_within(resolved, output_dir):
                 return None
             return resolved if os.path.isfile(resolved) else None
 

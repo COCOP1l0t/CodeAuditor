@@ -58,6 +58,7 @@ def test_stage2_validator_accepts_valid_au_file():
         path = os.path.join(tmp, "AU-1.json")
         _write_au(path, "Parses raw DHCP packets from the network", ["src/parser/parse.c", "src/parser/options.c"], "Trace the len field from the packet header through parse_options().")
 
+
         assert validate_stage2_au_file(path) == []
 
 
@@ -483,3 +484,53 @@ def test_stage3_run_unit_does_not_checkpoint_invalid_finding(
             assert not os.path.exists(finding_path)
 
     asyncio.run(run_case())
+
+
+@pytest.mark.parametrize("payload", ["[]", "5", "null", '"text"'])
+def test_validators_report_non_object_json_instead_of_raising(
+    tmp_path, payload: str
+) -> None:
+    from code_auditor.validation.stage1 import validate_stage1_file
+    from code_auditor.validation.stage3 import validate_stage3_file
+
+    stage1 = tmp_path / "stage1.json"
+    stage1.write_text(payload, encoding="utf-8")
+    assert validate_stage1_file(str(stage1))
+
+    stage3 = tmp_path / "AU-1-F-1.json"
+    stage3.write_text(payload, encoding="utf-8")
+    assert validate_stage3_file(str(stage3))
+
+    stage4 = tmp_path / "H-01.json"
+    stage4.write_text(payload, encoding="utf-8")
+    assert validate_stage4_file(str(stage4))
+
+    au = tmp_path / "AU-1.json"
+    au.write_text(payload, encoding="utf-8")
+    assert validate_stage2_au_file(str(au))
+
+
+def test_reproduction_status_negation_and_affirmation() -> None:
+    from code_auditor.reproduction_status import _find_status_value
+
+    assert (
+        _find_status_value(
+            "The vulnerability could not be reproduced on this revision."
+        )
+        == "not-reproduced"
+    )
+    assert (
+        _find_status_value("The bug was not successfully reproduced.")
+        == "not-reproduced"
+    )
+    assert _find_status_value("not reproduced") == "not-reproduced"
+    assert _find_status_value("false positive") == "false-positive"
+    assert _find_status_value("partially reproduced") == "partially-reproduced"
+    assert _find_status_value("Reproduction Status: reproduced") == "reproduced"
+    assert (
+        _find_status_value(
+            "reproduced (the first attempt failed to reproduce the crash, "
+            "the second succeeded)"
+        )
+        == "reproduced"
+    )

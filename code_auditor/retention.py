@@ -343,7 +343,8 @@ def validate_retain_manifest_data(
         raise RetentionError("reproduce.sh must be listed exactly once with role entrypoint")
     entrypoint_path = root / entrypoint
     try:
-        first_line = entrypoint_path.open("rb").readline(256)
+        with entrypoint_path.open("rb") as entrypoint_stream:
+            first_line = entrypoint_stream.readline(256)
     except OSError as exc:
         raise RetentionError(f"cannot read reproduce.sh: {exc}") from exc
     if not first_line.startswith(b"#!"):

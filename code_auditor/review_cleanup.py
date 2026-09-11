@@ -18,6 +18,7 @@ from .retention import (
     find_audit_output_dirs,
     load_retain_manifest,
 )
+from .utils import path_is_within
 
 CLEANUP_REPORT_SCHEMA_VERSION = 1
 
@@ -59,13 +60,6 @@ def _resolve_results_root(results_root: str | os.PathLike[str]) -> Path:
     return root
 
 
-def _path_is_within(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except (OSError, ValueError):
-        return False
-
-
 def _registered_path(output: Path, value: object) -> Path | None:
     if not isinstance(value, str) or not value or "\x00" in value:
         return None
@@ -73,7 +67,7 @@ def _registered_path(output: Path, value: object) -> Path | None:
     if not candidate.is_absolute():
         candidate = output / candidate
     resolved = candidate.resolve()
-    return resolved if _path_is_within(resolved, output) else None
+    return resolved if path_is_within(resolved, output) else None
 
 
 def _database_state(
@@ -254,7 +248,7 @@ def _manifest_paths(artifact: Path) -> set[Path]:
 def _target_blockers(target: Path, protected_paths: set[Path]) -> list[dict[str, str]]:
     blockers: list[dict[str, str]] = []
     for protected in sorted(protected_paths, key=str):
-        if _path_is_within(protected, target):
+        if path_is_within(protected, target):
             blockers.append({"type": "registered_or_retained_path", "path": str(protected)})
     for current, dirs, files in os.walk(target, topdown=True, followlinks=False):
         current_path = Path(current)
@@ -352,7 +346,7 @@ def build_reviewed_cleanup_report(
         key=lambda value: (len(Path(value["path"]).parts), value["path"]),
     ):
         path = Path(item["path"])
-        if any(_path_is_within(path, Path(parent["path"])) for parent in selected_targets):
+        if any(path_is_within(path, Path(parent["path"])) for parent in selected_targets):
             continue
         item["allocated_bytes"] = allocated_tree_bytes(path)
         selected_targets.append(item)
@@ -384,7 +378,7 @@ def _assert_safe_target(target: Path, root: Path) -> None:
     if target.is_symlink() or not target.is_dir():
         raise ReviewedCleanupError(f"cleanup target changed type or is missing: {target}")
     resolved = target.resolve()
-    if resolved != target or not _path_is_within(resolved, root):
+    if resolved != target or not path_is_within(resolved, root):
         raise ReviewedCleanupError(f"cleanup target escapes results root: {target}")
     relative = resolved.relative_to(root)
     if len(relative.parts) < 3:
@@ -401,7 +395,7 @@ def _revalidate_target(
     if database["active_outputs"]:
         raise ReviewedCleanupError("an audit became active during cleanup")
     output = Path(item["output"]).resolve()
-    if not _path_is_within(output, root):
+    if not path_is_within(output, root):
         raise ReviewedCleanupError(f"cleanup output escapes results root: {output}")
     mappings = database["by_artifact"]
     protected_paths: set[Path] = set(database["registered_paths"])

@@ -27,6 +27,13 @@ def validate_stage1_file(file_path: str) -> list[ValidationIssue]:
             fix="Fix the JSON syntax error (trailing commas, missing quotes, etc.).",
         )]
 
+    if not isinstance(data, dict):
+        return [ValidationIssue(
+            description="Output file root must be a JSON object.",
+            expected="A JSON research record with project metadata and security findings.",
+            fix="Rewrite the file as a single JSON object.",
+        )]
+
     validation_issues: list[ValidationIssue] = []
 
     if "project" not in data:

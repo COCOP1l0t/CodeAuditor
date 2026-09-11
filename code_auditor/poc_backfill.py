@@ -32,14 +32,18 @@ from .db import (
 )
 from .disclosures import build_dedupe_key
 from .logger import configure_logging, get_logger
-from .repos import capture_repo_identity
+from .repos import capture_repo_identity, create_detached_worktree
 from .stages.stage5 import _run_reproduce
 from .stages.stage6 import _run_disclosure
+from .utils import path_is_within
 from .web.settings import DEFAULT_SETTINGS_PATH, WebSettings, load_web_settings
 
 logger = get_logger("poc_backfill")
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+# Matching the Web/Stage 4 identifier shape keeps a tampered finding's ``id``
+# from becoming a path component of the recovery output.
+_VULN_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _SKIPPED_REVIEW_STATUSES = {"duplicated", "rejected", "slop"}
 _PROVIDER_BLOCKER_MARKERS = (
     "failed to authenticate",
@@ -155,7 +159,7 @@ def _registered_poc_report(
         if os.path.isabs(report_value)
         else os.path.join(output_dir, report_value)
     )
-    if not report_path.startswith(output_dir + os.sep):
+    if not path_is_within(report_path, output_dir):
         return ""
     report = Path(report_path)
     if (
@@ -169,13 +173,17 @@ def _registered_poc_report(
 
 
 def _git_has_commit(target: str, commit: str) -> bool:
-    result = subprocess.run(
-        ["git", "-C", target, "cat-file", "-e", f"{commit}^{{commit}}"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", target, "cat-file", "-e", f"{commit}^{{commit}}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return result.returncode == 0
 
 
@@ -284,6 +292,7 @@ def discover_candidates(
             if (
                 not _COMMIT_RE.fullmatch(commit)
                 or not vuln_id
+                or _VULN_ID_RE.fullmatch(vuln_id) is None
                 or source_run is None
             ):
                 skipped.append(
@@ -436,6 +445,24 @@ async def _run_group(
     config.sandbox_run_id = run_id
     config.sandbox_job_key = f"maintenance-{run_id}"
     _pin_run_identity(store, run_id, first)
+    if not config.sandbox_enabled and config.poc_worktree is None:
+        # Without Docker, Stage 5/6 work in ``poc_worktree or target``. Pin a
+        # detached worktree at the audited commit so the recovery neither runs
+        # against the shared mirror's current HEAD nor mutates that mirror.
+        worktree = os.path.join(output_dir, ".poc-worktree")
+        if os.path.isdir(worktree):
+            config.poc_worktree = worktree
+        else:
+            try:
+                await create_detached_worktree(first.target, first.commit, worktree)
+                config.poc_worktree = worktree
+            except Exception as exc:
+                logger.warning(
+                    "Backfill: could not pin a worktree at %s (%s); Stage 5/6 "
+                    "will use the shared checkout.",
+                    first.commit[:12],
+                    exc,
+                )
     checkpoint = CheckpointManager(output_dir, resume=True)
     results: list[dict[str, Any]] = []
     errors: list[str] = []

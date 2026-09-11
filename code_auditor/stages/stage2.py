@@ -26,8 +26,18 @@ async def run_stage2(
     log_file = os.path.join(result_dir, "agent.log")
 
     if checkpoint.is_complete(_TASK_KEY):
-        logger.info("Stage 2 already complete, loading existing output.")
-        return parse_au_files(result_dir)
+        issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
+        if not issues:
+            logger.info("Stage 2 already complete, loading existing output.")
+            return parse_au_files(result_dir)
+        # The marker was written by an older run that accepted a failed repair;
+        # re-validate instead of trusting it, and re-run when the output is
+        # still invalid.
+        logger.warning(
+            "Stage 2: checkpointed output is invalid; rerunning.\n%s",
+            format_validation_issues(issues),
+        )
+        checkpoint.clear(_TASK_KEY)
 
     # On resume, check for intermediate results from a crashed previous run.
     # The agent may have written AU files before the checkpoint marker was set.
@@ -107,7 +117,14 @@ async def run_stage2(
                 format_validation_issues(issues),
             )
 
-    checkpoint.mark_complete(_TASK_KEY)
     units = parse_au_files(result_dir)
+    if issues:
+        # Do not checkpoint invalid output: leaving the marker unset lets a
+        # resume re-run Stage 2 instead of feeding malformed units downstream.
+        logger.error(
+            "Stage 2 finished with validation issues; not marking it complete."
+        )
+        return units
+    checkpoint.mark_complete(_TASK_KEY)
     logger.info("Stage 2 complete. Analysis units: %s", ", ".join(u.id for u in units))
     return units

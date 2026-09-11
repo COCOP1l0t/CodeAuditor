@@ -67,7 +67,11 @@ def validate_trigger_graph_data(
     if not isinstance(data, dict):
         return ["trigger graph must be a JSON object"]
 
-    if data.get("schema_version") != TRIGGER_GRAPH_SCHEMA_VERSION:
+    if (
+        not isinstance(data.get("schema_version"), int)
+        or isinstance(data.get("schema_version"), bool)
+        or data.get("schema_version") != TRIGGER_GRAPH_SCHEMA_VERSION
+    ):
         errors.append(
             f"schema_version must be {TRIGGER_GRAPH_SCHEMA_VERSION}"
         )
@@ -120,7 +124,7 @@ def validate_trigger_graph_data(
             node.get("location"), f"{prefix}.location", errors, max_length=1024
         )
         role = node.get("role")
-        if role not in TRIGGER_GRAPH_NODE_ROLES:
+        if not isinstance(role, str) or role not in TRIGGER_GRAPH_NODE_ROLES:
             errors.append(
                 f"{prefix}.role must be one of: "
                 + ", ".join(sorted(TRIGGER_GRAPH_NODE_ROLES))

@@ -7,15 +7,25 @@ REPRODUCED_STATUSES = {"reproduced"}
 FAILED_STATUSES = {"partially-reproduced", "not-reproduced", "false-positive"}
 VALID_STATUSES = REPRODUCED_STATUSES | FAILED_STATUSES
 
-_STATUS_PATTERN = re.compile(
-    r"(partially[-\s]+reproduced|not[-\s]+reproduced|false[-\s]+positive|reproduced)",
+_COMPOUND_STATUS_PATTERN = re.compile(
+    r"(partially[-\s]+reproduced|not[-\s]+reproduced|false[-\s]+positive)",
     re.IGNORECASE,
 )
+# An affirmative status value, optionally after a "Reproduction Status:" label
+# or list bullet. Checked before the negation heuristic so a genuine success
+# whose narrative mentions an earlier failed attempt is not misread.
+_LEADING_REPRODUCED_PATTERN = re.compile(
+    r"^\s*(?:[-*+]\s*)?(?:reproduction\s+status\s*[:=\-]\s*)?reproduced\b",
+    re.IGNORECASE,
+)
+_BARE_REPRODUCED_PATTERN = re.compile(r"\breproduced\b", re.IGNORECASE)
 _NEGATED_REPRODUCTION_PATTERN = re.compile(
-    r"\b(?:not|never)\s+(?:successfully\s+)?reproduced\b"
+    r"\b(?:not|never)\s+(?:successfully\s+)?(?:be\s+)?reproduced\b"
+    r"|\bnon[-\s]?reproduc\w*\b"
+    r"|\bcould\s+not\s+be\s+reproduced\b"
     r"|\bcould\s+not\s+reproduce\b"
-    r"|\bfailed\s+to\s+reproduce\b"
-    r"|\bunable\s+to\s+reproduce\b",
+    r"|\b(?:failed|unable)\s+to\s+reproduce\b"
+    r"|\b(?:was|were|is|are)\s+not\s+able\s+to\s+reproduce\b",
     re.IGNORECASE,
 )
 
@@ -25,15 +35,20 @@ def _normalize_status(raw_status: str) -> str:
 
 
 def _find_status_value(text: str) -> str | None:
+    match = _COMPOUND_STATUS_PATTERN.search(text)
+    if match:
+        status = _normalize_status(match.group(1))
+        return status if status in VALID_STATUSES else None
+
+    if _LEADING_REPRODUCED_PATTERN.match(text):
+        return "reproduced"
+
     if _NEGATED_REPRODUCTION_PATTERN.search(text):
         return "not-reproduced"
 
-    match = _STATUS_PATTERN.search(text)
-    if not match:
-        return None
-
-    status = _normalize_status(match.group(1))
-    return status if status in VALID_STATUSES else None
+    if _BARE_REPRODUCED_PATTERN.search(text):
+        return "reproduced"
+    return None
 
 
 def read_reproduction_status(report_path: str) -> str | None:
@@ -74,7 +89,9 @@ def read_reproduction_status(report_path: str) -> str | None:
 
     success_match = re.search(r"\bsuccessfully\s+reproduced\b", content[:4000], re.IGNORECASE)
     if success_match:
-        return "reproduced"
+        window = content[max(0, success_match.start() - 40) : success_match.end()]
+        if not _NEGATED_REPRODUCTION_PATTERN.search(window):
+            return "reproduced"
 
     return None
 

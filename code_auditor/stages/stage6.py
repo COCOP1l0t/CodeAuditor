@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -469,7 +470,9 @@ async def _run_disclosure(
             work_report_path = str(copied_poc_dir / "report.md")
             if finding_file:
                 finding_file = str(sandbox.copy_input(finding_file, "finding.json"))
-        except Exception:
+        except BaseException:
+            # BaseException also covers CancelledError so a cancel during
+            # prepare() still tears down the scratch tree it created.
             await sandbox.close()
             raise
 
@@ -555,7 +558,17 @@ async def _run_disclosure(
                 )
     finally:
         if sandbox is not None:
-            await sandbox.close()
+            # Capture any in-flight validation/agent error before close() so a
+            # teardown failure cannot replace the real task result.
+            propagating = sys.exc_info()[0] is not None
+            try:
+                await sandbox.close()
+            except Exception:
+                if not propagating:
+                    raise
+                logger.exception(
+                    "Stage 6: failed to clean up scratch workspace for %s.", vuln_id
+                )
 
     checkpoint.mark_complete(key)
     has_report = os.path.exists(disclosure_report)

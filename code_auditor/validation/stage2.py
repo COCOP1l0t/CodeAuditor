@@ -108,6 +108,13 @@ def validate_stage2_au_file(file_path: str) -> list[ValidationIssue]:
             fix="Fix the JSON syntax error.",
         )]
 
+    if not isinstance(data, dict):
+        return [ValidationIssue(
+            description=f"{name}: root element is not a JSON object.",
+            expected="A JSON object with description, files, and focus fields.",
+            fix="Rewrite the analysis unit as a single JSON object.",
+        )]
+
     if _is_blank(data.get("description")):
         issues.append(ValidationIssue(
             description=f'{name}: missing or blank "description".',

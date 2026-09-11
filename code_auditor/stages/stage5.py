@@ -102,12 +102,20 @@ async def _run_reproduce(
     persistent_poc_dir = os.path.join(config.output_dir, "stage5-pocs", vuln_id)
 
     if checkpoint.is_complete(key):
-        logger.info("Stage 5: %s already complete, skipping.", vuln_id)
         resolved = _resolve_reproduction_report(persistent_poc_dir)
-        if _is_fp_report(resolved):
-            logger.info("Stage 5: %s marked as false positive.", vuln_id)
-            return None
-        return resolved
+        if resolved is not None:
+            logger.info("Stage 5: %s already complete, skipping.", vuln_id)
+            if _is_fp_report(resolved):
+                logger.info("Stage 5: %s marked as false positive.", vuln_id)
+                return None
+            return resolved
+        # A previous run marked this task complete without retaining any
+        # report (for example an interrupted non-sandbox agent). Re-run it
+        # instead of caching an incomplete PoC and reporting success.
+        logger.warning(
+            "Stage 5: %s was marked complete without a report; rerunning.", vuln_id
+        )
+        checkpoint.clear(key)
 
     logger.info("Stage 5: Starting PoC reproduction for %s.", vuln_id)
     sandbox: DockerScratch | None = None
@@ -138,7 +146,9 @@ async def _run_reproduce(
                     "cause on the pinned source revision. Do not treat an old "
                     "harness failure as proof that the vulnerability was fixed."
                 )
-        except Exception:
+        except BaseException:
+            # BaseException also covers CancelledError: a cancel during
+            # prepare() must still tear down the scratch tree it created.
             await sandbox.close()
             raise
 
@@ -303,6 +313,16 @@ async def _run_reproduce(
                     "preserving the original task error.",
                     vuln_id,
                 )
+
+    if resolved_report is None:
+        # No retained report means the task did not finish; leave the
+        # checkpoint unset so a resume retries it instead of treating an
+        # incomplete reproduction as complete.
+        logger.warning(
+            "Stage 5: %s produced no report; not marking the task complete.",
+            vuln_id,
+        )
+        return None
 
     checkpoint.mark_complete(key)
     if _is_fp_report(resolved_report):

@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import re
 
+from .utils import path_is_within
+
 DEFAULT_WIKIS_DIR = os.path.join("~", ".code_auditor", "wiki")
 _SAFE_WIKI_NAME = re.compile(
     r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
@@ -26,7 +28,7 @@ def list_local_wikis(
     wikis: list[dict[str, str]] = []
     for root, dirs, files in os.walk(base, followlinks=False):
         resolved = os.path.realpath(root)
-        if resolved != base and not resolved.startswith(base + os.sep):
+        if not path_is_within(resolved, base):
             dirs[:] = []
             continue
 

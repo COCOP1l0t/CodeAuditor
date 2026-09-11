@@ -10,9 +10,12 @@ checkouts are reused as-is — stage 0 of the audit pipeline already runs
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import os
 import re
+import shutil
+import signal
 import subprocess
 import urllib.parse
 from datetime import datetime
@@ -24,6 +27,7 @@ logger = get_logger("repos")
 
 DEFAULT_REPOS_DIR = os.path.join("~", ".code_auditor", "repo")
 DEFAULT_RESULTS_DIR = os.path.join("~", ".code_auditor", "results")
+CLONE_TIMEOUT_SECONDS = 30 * 60
 
 _SCP_LIKE_RE = re.compile(r"^[\w.-]+@(?P<host>[\w.-]+):(?P<path>.+)$")
 _SAFE_SEGMENT_RE = re.compile(r"^[\w.-]+$")
@@ -161,14 +165,30 @@ async def ensure_repo(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=_clone_env(),
+        start_new_session=True,
     )
     try:
-        out, _ = await proc.communicate()
-    except asyncio.CancelledError:
-        proc.kill()
-        raise
+        out, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=CLONE_TIMEOUT_SECONDS
+        )
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        # Kill the whole clone process group and remove the partial checkout:
+        # a half-written mirror would otherwise be reused as a valid checkout
+        # (or block every later clone with "Path exists but is not a git
+        # repository").
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        shutil.rmtree(dest, ignore_errors=True)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise RepoError(
+            f"git clone timed out for {url} after {CLONE_TIMEOUT_SECONDS} seconds"
+        ) from exc
     if proc.returncode != 0:
         tail = (out or b"").decode("utf-8", errors="replace")[-500:]
+        shutil.rmtree(dest, ignore_errors=True)
         raise RepoError(f"git clone failed for {url}: {tail}")
     logger.info("Clone complete: %s", dest)
     return dest
@@ -185,14 +205,22 @@ def ensure_repo_sync(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
 
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     logger.info("Cloning %s into %s ...", url, dest)
-    result = subprocess.run(
-        ["git", "clone", "--", url, dest],
-        capture_output=True,
-        text=True,
-        env=_clone_env(),
-    )
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--", url, dest],
+            capture_output=True,
+            text=True,
+            env=_clone_env(),
+            timeout=CLONE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise RepoError(
+            f"git clone timed out for {url} after {CLONE_TIMEOUT_SECONDS} seconds"
+        ) from exc
     if result.returncode != 0:
         tail = (result.stdout + result.stderr)[-500:]
+        shutil.rmtree(dest, ignore_errors=True)
         raise RepoError(f"git clone failed for {url}: {tail}")
     logger.info("Clone complete: %s", dest)
     return dest
@@ -287,6 +315,14 @@ def default_audit_output_dir(target: str, results_dir: str = DEFAULT_RESULTS_DIR
         if url
         else os.path.basename(top or os.path.realpath(target))
     )
+    # The origin URL is repository-controlled data. A crafted last segment
+    # (for example "..") would otherwise place the output directory one level
+    # outside the managed results root, where retention and cleanup never see
+    # it. Fall back to the checkout directory name for an unsafe segment.
+    if project in {"", ".", ".."} or _SAFE_SEGMENT_RE.fullmatch(project) is None:
+        project = os.path.basename(top or os.path.realpath(target))
+    if project in {"", ".", ".."} or _SAFE_SEGMENT_RE.fullmatch(project) is None:
+        project = "project"
     stamp = (
         commit[:12]
         if commit
@@ -311,6 +347,7 @@ async def create_detached_worktree(repo: str, commit: str, destination: str) -> 
         "worktree",
         "add",
         "--detach",
+        "--",
         destination,
         commit,
         stdout=asyncio.subprocess.PIPE,

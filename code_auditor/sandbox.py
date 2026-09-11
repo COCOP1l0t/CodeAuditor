@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -166,6 +167,24 @@ def _locate_codex_vendor() -> Path:
     )
 
 
+def _atomic_write_text(path: Path, text: str, mode: int) -> None:
+    """Write a control file atomically so a concurrent reader/exec sees it whole."""
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}-", dir=path.parent, text=True
+    )
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
 def _copy_regular_if_present(source: Path, destination: Path) -> None:
     try:
         source_stat = source.lstat()
@@ -255,6 +274,7 @@ class DockerScratch:
         self.source_commit = commit
         self.verify_environment()
         self.root_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._verify_root_parent()
         root = Path(
             tempfile.mkdtemp(
                 prefix=f"{self.task_name}-",
@@ -299,6 +319,28 @@ class DockerScratch:
             await self.close()
             raise
         return self
+
+    def _verify_root_parent(self) -> None:
+        """Require the shared scratch parent to be a real, owner-only directory.
+
+        The control directory and the host-executed ``claude``/``codex``
+        wrappers live directly under this path. A pre-existing directory owned
+        by, or writable to, another local user would let that user substitute a
+        wrapper and run host commands as the audit user.
+        """
+        root = self.root_parent
+        try:
+            info = root.lstat()
+        except OSError as exc:
+            raise DockerSandboxError(f"sandbox root is unavailable: {root}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise DockerSandboxError(f"sandbox root must be a real directory: {root}")
+        if info.st_uid != os.getuid():
+            raise DockerSandboxError(
+                f"sandbox root must be owned by the current user: {root}"
+            )
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            os.chmod(root, 0o700)
 
     def _verify_runtime(self) -> None:
         try:
@@ -478,20 +520,21 @@ class DockerScratch:
         # repair/status-check invocation cannot be turned into a host-side
         # command or arbitrary bind-mount escape.
         self.spec_path = self.control_dir / "docker-spec.json"
-        self.spec_path.write_text(json.dumps(spec, sort_keys=True), encoding="utf-8")
-        os.chmod(self.spec_path, 0o600)
+        _atomic_write_text(
+            self.spec_path, json.dumps(spec, sort_keys=True), 0o600
+        )
         package_root = Path(__file__).resolve().parent.parent
         for tool in ("claude", "codex"):
             wrapper = self.control_dir / tool
-            wrapper.write_text(
+            _atomic_write_text(
+                wrapper,
                 f"#!{sys.executable}\n"
                 "import sys\n"
                 f"sys.path.insert(0, {str(package_root)!r})\n"
                 "from code_auditor.sandbox import docker_cli_main\n"
                 f"raise SystemExit(docker_cli_main({tool!r}))\n",
-                encoding="utf-8",
+                0o700,
             )
-            wrapper.chmod(0o700)
 
     def ensure_backend(self, backend: str) -> None:
         """Prepare this scratch's wrapper metadata for a hot-switched backend."""

@@ -19,6 +19,10 @@ _RECORD_NAME = re.compile(r"[0-9a-f]{32}\.json\Z")
 
 
 def create_execution_directory(output_dir: str, scratch_id: str) -> Path:
+    if not isinstance(scratch_id, str) or _RECORD_NAME.fullmatch(
+        f"{scratch_id}.json"
+    ) is None:
+        raise ValueError("execution record identifier must be 32 hex characters")
     root = Path(output_dir).expanduser().resolve() / EXECUTION_DIRECTORY
     root.mkdir(parents=True, mode=0o700, exist_ok=True)
     info = root.lstat()

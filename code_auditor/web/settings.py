@@ -11,8 +11,9 @@ from urllib.parse import urlsplit
 
 from ..config import (
     DEFAULT_BACKEND, DEFAULT_SANDBOX_MODE, DEFAULT_SANDBOX_RUNTIME,
-    SANDBOX_RUNTIMES, SandboxMode, SandboxRuntime,
+    SANDBOX_MODES, SANDBOX_RUNTIMES, SandboxMode, SandboxRuntime,
 )
+from ..utils import path_is_within
 
 DEFAULT_STATE_DIR = os.path.join("~", ".code_auditor")
 DEFAULT_SETTINGS_PATH = os.path.join(DEFAULT_STATE_DIR, "settings.json")
@@ -238,6 +239,21 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
     return _validate_settings(config_path, {**defaults, **raw})
 
 
+def _validated_sandbox_mode(value: object) -> SandboxMode:
+    if value not in SANDBOX_MODES:
+        raise WebSettingsError(
+            "sandbox_mode must be 'docker-networked', 'docker-isolated', "
+            "or 'local-worktree'."
+        )
+    return value  # type: ignore[return-value]
+
+
+def _validated_sandbox_runtime(value: object) -> SandboxRuntime:
+    if value not in SANDBOX_RUNTIMES:
+        raise WebSettingsError("sandbox_runtime must be docker-default, runc, or runsc.")
+    return value  # type: ignore[return-value]
+
+
 def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
     state_dir = os.path.dirname(os.path.realpath(config_path))
     backend = raw.get("backend")
@@ -258,20 +274,10 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         raise WebSettingsError("max_concurrent_jobs must be an integer.")
     if not 1 <= max_concurrent_jobs <= 16:
         raise WebSettingsError("max_concurrent_jobs must be between 1 and 16.")
-    sandbox_mode = raw.get("sandbox_mode")
-    if sandbox_mode not in {
-        "docker-networked",
-        "docker-isolated",
-        "local-worktree",
-    }:
-        raise WebSettingsError(
-            "sandbox_mode must be 'docker-networked', 'docker-isolated', "
-            "or 'local-worktree'."
-        )
-
-    sandbox_runtime = raw.get("sandbox_runtime", DEFAULT_SANDBOX_RUNTIME)
-    if sandbox_runtime not in SANDBOX_RUNTIMES:
-        raise WebSettingsError("sandbox_runtime must be docker-default, runc, or runsc.")
+    sandbox_mode = _validated_sandbox_mode(raw.get("sandbox_mode"))
+    sandbox_runtime = _validated_sandbox_runtime(
+        raw.get("sandbox_runtime", DEFAULT_SANDBOX_RUNTIME)
+    )
 
     managed_paths = {}
     for key in (
@@ -336,19 +342,10 @@ def update_agent_settings(
     )
     selected_sandbox_mode = settings.sandbox_mode
     if sandbox_mode is not None:
-        if sandbox_mode not in {
-            "docker-networked",
-            "docker-isolated",
-            "local-worktree",
-        }:
-            raise WebSettingsError(
-                "sandbox_mode must be 'docker-networked', 'docker-isolated', "
-                "or 'local-worktree'."
-            )
-        selected_sandbox_mode = sandbox_mode
-    selected_runtime = settings.sandbox_runtime if sandbox_runtime is None else sandbox_runtime
-    if selected_runtime not in SANDBOX_RUNTIMES:
-        raise WebSettingsError("sandbox_runtime must be docker-default, runc, or runsc.")
+        selected_sandbox_mode = _validated_sandbox_mode(sandbox_mode)
+    selected_runtime = _validated_sandbox_runtime(
+        settings.sandbox_runtime if sandbox_runtime is None else sandbox_runtime
+    )
     updated = replace(
         settings,
         backend=backend,
@@ -408,7 +405,7 @@ def _managed_path(value: Any, key: str, state_dir: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise WebSettingsError(f"{key} must be a non-empty path string.")
     resolved = os.path.realpath(os.path.expanduser(value))
-    if resolved != state_dir and not resolved.startswith(state_dir + os.sep):
+    if not path_is_within(resolved, state_dir):
         raise WebSettingsError(f"{key} must stay under {state_dir}.")
     return resolved
 

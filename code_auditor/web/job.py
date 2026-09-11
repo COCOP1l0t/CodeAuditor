@@ -51,16 +51,18 @@ from ..orchestrator import run_audit
 from ..repos import (
     DEFAULT_REPOS_DIR,
     DEFAULT_RESULTS_DIR,
+    RepoError,
     capture_repo_identity,
     create_detached_worktree as repos_create_detached_worktree,
     default_audit_output_dir,
     ensure_repo,
     repo_local_path,
+    validate_remote_repo_url,
 )
 from ..reproduction_review import run_reproduction_review
 from ..reproduction_status import FAILED_STATUSES, read_reproduction_status
 from ..stages.stage5 import run_stage5
-from ..utils import summarize_task_errors
+from ..utils import path_is_within, summarize_task_errors
 from ..wikis import DEFAULT_WIKIS_DIR, list_local_wikis
 from .progress import CURRENT_JOB_KEY, EventBus, WebProgressReporter
 
@@ -156,12 +158,6 @@ def _recorded_local_wiki(path: str | None, wikis_dir: str) -> str | None:
     return None
 
 
-def _path_is_within(path: str, root: str) -> bool:
-    resolved = os.path.realpath(os.path.expanduser(path))
-    managed_root = os.path.realpath(os.path.expanduser(root))
-    return resolved == managed_root or resolved.startswith(managed_root + os.sep)
-
-
 def _local_branch_points_to(target: str, branch: str, commit: str) -> bool:
     """Return whether a safe local branch already names the recorded commit."""
     if (
@@ -187,9 +183,10 @@ def _local_branch_points_to(target: str, branch: str, commit: str) -> bool:
             capture_output=True,
             text=True,
             check=False,
+            timeout=RESUME_GIT_TIMEOUT_SECONDS,
             env=current_audit_subprocess_env(),
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0 and result.stdout.strip() == commit
 
@@ -204,11 +201,19 @@ async def _terminate_resume_git_process(proc: asyncio.subprocess.Process) -> Non
     await proc.wait()
 
 
-async def _run_resume_git_command(
+async def _run_git_command(
     target: str,
-    *args: str,
-    timeout_seconds: float = RESUME_GIT_TIMEOUT_SECONDS,
+    args: tuple[str, ...],
+    *,
+    timeout_seconds: float,
+    env: dict[str, str],
+    context: str,
 ) -> str:
+    """Run ``git -C target <args>`` with a bounded timeout and a killed group.
+
+    ``context`` names the caller in diagnostics; the two public wrappers below
+    differ only in their environment and message context.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
@@ -218,19 +223,17 @@ async def _run_resume_git_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
-            env=current_audit_subprocess_env(),
+            env=env,
         )
     except OSError as exc:
-        raise JobValidationError(
-            f"Cannot run git while restoring the checkout: {exc}"
-        ) from exc
+        raise JobValidationError(f"Cannot run git for {context}: {exc}") from exc
     try:
         output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except TimeoutError as exc:
         await _terminate_resume_git_process(proc)
         raise JobValidationError(
-            "Timed out while restoring the cancelled run checkout with "
-            f"`git {' '.join(args)}` after {timeout_seconds:g} seconds."
+            f"Timed out for {context} with `git {' '.join(args)}` "
+            f"after {timeout_seconds:g} seconds."
         ) from exc
     except asyncio.CancelledError:
         await _terminate_resume_git_process(proc)
@@ -238,10 +241,24 @@ async def _run_resume_git_command(
     text = (output or b"").decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
         raise JobValidationError(
-            f"Cannot restore the cancelled run checkout with "
-            f"`git {' '.join(args)}`: {text[-1000:] or 'git failed'}"
+            f"git command failed for {context} (`git {' '.join(args)}`): "
+            f"{text[-1000:] or 'git failed'}"
         )
     return text
+
+
+async def _run_resume_git_command(
+    target: str,
+    *args: str,
+    timeout_seconds: float = RESUME_GIT_TIMEOUT_SECONDS,
+) -> str:
+    return await _run_git_command(
+        target,
+        args,
+        timeout_seconds=timeout_seconds,
+        env=current_audit_subprocess_env(),
+        context="restoring the cancelled run checkout",
+    )
 
 
 async def _checkout_recorded_revision(
@@ -250,7 +267,7 @@ async def _checkout_recorded_revision(
     branch: str,
 ) -> None:
     """Checkout the recorded superproject commit and its exact submodules."""
-    if _local_branch_points_to(target, branch, commit):
+    if await asyncio.to_thread(_local_branch_points_to, target, branch, commit):
         checkout_target = branch
         checkout_args = ("checkout", branch)
     else:
@@ -401,38 +418,13 @@ def _snapshot_reproduction_reference(
 async def _run_reproduction_git(
     target: str, *args: str, timeout_seconds: float = 300.0
 ) -> str:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "-C",
-            target,
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-            env=_reproduction_git_env(),
-        )
-    except OSError as exc:
-        raise JobValidationError(
-            f"Cannot run git for latest-source reproduction: {exc}"
-        ) from exc
-    try:
-        output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-    except TimeoutError as exc:
-        await _terminate_resume_git_process(proc)
-        raise JobValidationError(
-            f"Timed out resolving remote HEAD with `git {' '.join(args)}`."
-        ) from exc
-    except asyncio.CancelledError:
-        await _terminate_resume_git_process(proc)
-        raise
-    text = (output or b"").decode("utf-8", errors="replace").strip()
-    if proc.returncode != 0:
-        raise JobValidationError(
-            f"Latest-source git command failed (`git {' '.join(args)}`): "
-            f"{text[-1000:] or 'git failed'}"
-        )
-    return text
+    return await _run_git_command(
+        target,
+        args,
+        timeout_seconds=timeout_seconds,
+        env=_reproduction_git_env(),
+        context="latest-source reproduction",
+    )
 
 
 async def _resolve_latest_remote_commit(
@@ -644,7 +636,8 @@ class AuditJob:
             return
         self.error = INTERRUPTED_AUDIT_ERROR
         task = self.task
-        task.cancel()
+        if not task.cancelling():
+            task.cancel()
         done, _ = await asyncio.wait({task}, timeout=SHUTDOWN_TASK_TIMEOUT_SECONDS)
         if not done:
             self.state = STATE_CANCELLED
@@ -672,6 +665,10 @@ class AuditJob:
         """Cancel the running job. Returns False if it is not running."""
         self.reconcile()
         if self.state not in BUSY_STATES or self.task is None:
+            return False
+        if self.task.cancelling():
+            # A second Stop must not interrupt the task's own cleanup/finally
+            # (for example the reproduction worktree removal).
             return False
         self.error = ""
         self.task.cancel()
@@ -822,35 +819,7 @@ class AuditJob:
     ) -> AuditConfig:
         if not os.path.isdir(target):
             raise JobValidationError(f"Target directory not found: {target}")
-        output_dir = os.path.realpath(
-            params.output_dir
-            or default_audit_output_dir(target, results_dir=params.results_dir)
-        )
-        sandbox_enabled, sandbox_network_enabled = sandbox_mode_flags(
-            params.sandbox_mode
-        )
-        return AuditConfig(
-            target=target,
-            output_dir=output_dir,
-            wiki_path=wiki_path,
-            max_parallel=params.max_parallel,
-            resume=True,
-            update_repo=params.update_repo,
-            log_level=params.log_level,
-            backend=params.backend,  # type: ignore[arg-type]
-            model=self._resolve_model(params),
-            provider_mode=params.provider_mode,
-            provider_base_url=params.provider_base_url,
-            provider_api_key=params.provider_api_key,
-            target_au_count=params.target_au_count,
-            agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
-            sandbox_enabled=sandbox_enabled,
-            sandbox_runtime=params.sandbox_runtime,
-            sandbox_network_enabled=sandbox_network_enabled,
-            known_disclosures=tuple(
-                self.store.disclosure_dedupe_index() if self.store else ()
-            ),
-        )
+        return self._build_audit_config(params, target, wiki_path)
 
     def _build_preliminary_config(
         self, params: AuditStartParams, target: str, wiki_path: str | None
@@ -860,6 +829,11 @@ class AuditJob:
         The output_dir uses a date-based stamp because the commit is unknown
         until the clone completes. ``_run`` updates it afterwards.
         """
+        return self._build_audit_config(params, target, wiki_path)
+
+    def _build_audit_config(
+        self, params: AuditStartParams, target: str, wiki_path: str | None
+    ) -> AuditConfig:
         output_dir = os.path.realpath(
             params.output_dir
             or default_audit_output_dir(target, results_dir=params.results_dir)
@@ -1043,13 +1017,13 @@ class AuditJob:
                 run_id,
                 recorded_commit,
             )
-            identity = capture_repo_identity(target)
+            identity = await asyncio.to_thread(capture_repo_identity, target)
             if identity.get("dirty"):
                 # Older runs let PoC agents work inside the shared mirror,
                 # which could leave it dirty. Stash the leftovers instead of
                 # refusing.
                 await _stash_resume_leftovers(target, run_id)
-                identity = capture_repo_identity(target)
+                identity = await asyncio.to_thread(capture_repo_identity, target)
                 if identity.get("dirty"):
                     raise JobValidationError(
                         "The source checkout still has uncommitted or untracked "
@@ -1057,7 +1031,7 @@ class AuditJob:
                         "continuing."
                     )
             await _checkout_recorded_revision(target, recorded_commit, branch)
-            identity = capture_repo_identity(target)
+            identity = await asyncio.to_thread(capture_repo_identity, target)
             if identity.get("dirty"):
                 raise JobValidationError(
                     "The restored source checkout is dirty after checkout/submodule update."
@@ -1123,6 +1097,16 @@ class AuditJob:
                     raise JobValidationError(
                         "The selected Disclosure has no available Git repository."
                     )
+                try:
+                    # The URL comes from editable Disclosure metadata, so apply
+                    # the same remote restrictions as a new audit before the
+                    # server clones from it (blocks internal-address SSRF and
+                    # local file:// transports).
+                    validate_remote_repo_url(repo_url)
+                except RepoError as exc:
+                    raise JobValidationError(
+                        f"The selected Disclosure repository URL is not allowed: {exc}"
+                    ) from exc
                 source_repo = await ensure_repo(repo_url, params.repos_dir)
                 self.target_path = os.path.realpath(source_repo)
             self.reporter.begin_stage(0, "Fetching and pinning remote HEAD")
@@ -1436,6 +1420,13 @@ class AuditJobManager:
             )
 
     def _register(self, job: AuditJob) -> AuditJob:
+        previous = self._jobs.get(job.job_key)
+        if previous is not None and previous is not job:
+            # Resume/replacement reuses the run id as its job key. Keep the
+            # existing EventBus so an already-open SSE stream continues to
+            # receive this job's events instead of blocking on a dead bus.
+            job.bus = previous.bus
+            job.reporter = WebProgressReporter(job.bus)
         self._jobs[job.job_key] = job
         return job
 
@@ -1584,11 +1575,11 @@ class AuditJobManager:
 
         target = os.path.realpath(run.get("target") or "")
         output_dir = os.path.realpath(run.get("output_dir") or "")
-        if not _path_is_within(target, repos_dir):
+        if not path_is_within(target, repos_dir):
             raise JobValidationError(
                 "The recorded source is outside the managed repository directory."
             )
-        if not _path_is_within(output_dir, results_dir):
+        if not path_is_within(output_dir, results_dir):
             raise JobValidationError(
                 "The recorded output is outside the managed results directory."
             )
@@ -1846,6 +1837,12 @@ class AuditJobManager:
                 raise JobValidationError(
                     "The selected Disclosure source checkout is unavailable and has no repository URL."
                 )
+            try:
+                validate_remote_repo_url(repo_url)
+            except RepoError as exc:
+                raise JobValidationError(
+                    f"The selected Disclosure repository URL is not allowed: {exc}"
+                ) from exc
             target = os.path.realpath(repo_local_path(repo_url, params.repos_dir))
         self._check_start_allowed(target)
         self._check_history_write_headroom()

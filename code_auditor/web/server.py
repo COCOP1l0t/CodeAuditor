@@ -15,7 +15,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
@@ -41,6 +41,7 @@ from ..logger import configure_logging, get_logger
 from ..repos import RepoError, list_cloned_repos, validate_remote_repo_url
 from ..retention import RetentionError, export_retained_artifacts
 from ..sandbox import inspect_docker_sandbox_environment
+from ..utils import path_is_within
 from ..validation.stage6 import validate_stage6_disclosure
 from ..wikis import list_local_wikis
 from .job import (
@@ -265,6 +266,44 @@ def _latest_agent_log(output_dir: str) -> tuple[Path, str] | None:
     return path, str(path.relative_to(Path(output_dir)))
 
 
+def _agent_log_response(output_dir: str, download: bool):
+    """Serve the latest agent log as an inline document or a download."""
+    latest = _latest_agent_log(output_dir)
+    if latest is None:
+        raise HTTPException(status_code=404, detail="No Agent log is available yet.")
+    path, relative_path = latest
+    if download:
+        return FileResponse(
+            path,
+            media_type="text/plain; charset=utf-8",
+            filename=f"{path.parent.name}-{path.name}",
+        )
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return PlainTextResponse(
+        content,
+        headers={"X-CodeAuditor-Log-Path": relative_path},
+    )
+
+
+def _output_file_response(output_dir: str, rel_path: str, download: bool):
+    """Serve one resolved output file inline, or as an attachment."""
+    full = _resolve_output_file(output_dir, rel_path)
+    if download:
+        return FileResponse(
+            full,
+            media_type="application/octet-stream",
+            filename=Path(full).name,
+        )
+    try:
+        content = Path(full).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return PlainTextResponse(content)
+
+
 def _count_json_files(base: Path, pattern: str) -> int:
     directory = base / pattern.split("/")[0]
     if not directory.is_dir():
@@ -357,7 +396,7 @@ def _resolve_output_file(output_dir: str, rel_path: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid output file path.")
     base = os.path.realpath(output_dir)
     full = os.path.realpath(os.path.join(base, rel_path))
-    if full != base and not full.startswith(base + os.sep):
+    if not path_is_within(full, base):
         raise HTTPException(
             status_code=400, detail="Path escapes the output directory."
         )
@@ -393,7 +432,7 @@ def _resolve_managed_import_path(path: str, results_dir: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid import path.")
     resolved = os.path.realpath(os.path.expanduser(path))
     root = os.path.realpath(results_dir)
-    if resolved != root and not resolved.startswith(root + os.sep):
+    if not path_is_within(resolved, root):
         raise HTTPException(
             status_code=400,
             detail=f"Import path must stay under the managed results directory: {root}",
@@ -403,15 +442,26 @@ def _resolve_managed_import_path(path: str, results_dir: str) -> str:
     return resolved
 
 
-def _is_managed_path(path: str, root: str) -> bool:
-    resolved = os.path.realpath(path)
-    managed_root = os.path.realpath(root)
-    return resolved == managed_root or resolved.startswith(managed_root + os.sep)
-
-
 def _safe_revision_component(value: object) -> str:
     component = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value or ""))
     return component.strip("-")[:40] or "previous"
+
+
+def _tokens_match(provided: str, expected: str) -> bool:
+    """Constant-time token comparison that tolerates non-ASCII input.
+
+    ``hmac.compare_digest`` raises ``TypeError`` for ``str`` arguments that
+    contain non-ASCII characters, so a percent-encoded query token or a
+    latin-1-decoded header would turn an authentication failure into an
+    unhandled server error. Compare UTF-8 bytes instead and treat any
+    comparison failure as a non-match.
+    """
+    try:
+        return hmac.compare_digest(
+            provided.encode("utf-8"), expected.encode("utf-8")
+        )
+    except (AttributeError, UnicodeError):
+        return False
 
 
 def _websocket_origin_allowed(websocket: WebSocket) -> bool:
@@ -590,6 +640,12 @@ def create_app(
                     )
             except Exception:
                 logger.exception("Failed to purge expired Disclosure trash records.")
+            try:
+                # Revoked/expired session digests are otherwise retained
+                # forever; bound the sessions table with the same cadence.
+                await asyncio.to_thread(store.purge_expired_auth_sessions)
+            except Exception:
+                logger.exception("Failed to purge expired authentication sessions.")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -619,25 +675,31 @@ def create_app(
     _AUTH_PUBLIC_PATHS = {
         "/api/auth/status",
         "/api/auth/setup",
-        "/api/auth/register",
         "/api/auth/login",
         "/api/auth/logout",
     }
 
-    def _session_user(request) -> dict[str, object] | None:
+    async def _session_user(request) -> dict[str, object] | None:
+        """Resolve the session cookie's user without blocking the event loop."""
         token = request.cookies.get(SESSION_COOKIE_NAME, "")
         if not token:
             return None
-        return store.get_auth_user_by_session(session_token_digest(token))
+        return await asyncio.to_thread(
+            store.get_auth_user_by_session, session_token_digest(token)
+        )
 
-    def _session_cookie(response: Response, token: str) -> None:
+    def _session_cookie(response: Response, token: str, *, secure: bool = False) -> None:
         response.set_cookie(
             SESSION_COOKIE_NAME,
             token,
             max_age=SESSION_TTL_SECONDS,
             httponly=True,
             samesite="lax",
-            secure=False,
+            # Mark the bearer cookie Secure whenever the request actually
+            # arrived over HTTPS (uvicorn's proxy handling maps forwarded
+            # schemes onto request.url.scheme). Plain-HTTP local deployments
+            # keep working.
+            secure=secure,
             path="/",
         )
 
@@ -662,12 +724,17 @@ def create_app(
         Existing installations remain usable until setup is completed; this
         compatibility mode lets an operator reach ``/api/auth/setup`` without
         a migration-time lockout.  Once any account exists, every API except
-        the explicit auth endpoints requires a valid session cookie.
+        the explicitly public authentication endpoints requires a session
+        cookie — including user registration, which is an administrator
+        action (see the README) and not an open sign-up.
         """
         path = request.url.path
         if path.startswith("/api/") and path not in _AUTH_PUBLIC_PATHS:
-            if store.auth_user_count() > 0:
-                user = _session_user(request)
+            # Keep the blocking SQLite reads off the event loop: a locked
+            # writer (busy_timeout is 30s) would otherwise stall every SSE
+            # stream and concurrent job.
+            if await asyncio.to_thread(store.auth_user_count) > 0:
+                user = await _session_user(request)
                 if user is None:
                     return JSONResponse(
                         {"detail": "Authentication required."},
@@ -781,8 +848,8 @@ def create_app(
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/api/auth/status")
-    def auth_status(request: Request) -> dict[str, object]:
-        user = _session_user(request)
+    async def auth_status(request: Request) -> dict[str, object]:
+        user = await _session_user(request)
         return {
             "setup_required": store.auth_user_count() == 0,
             "authenticated": user is not None,
@@ -791,7 +858,7 @@ def create_app(
 
     @app.post("/api/auth/setup", status_code=201)
     def auth_setup(
-        credentials: AuthCredentialsRequest, response: Response
+        credentials: AuthCredentialsRequest, request: Request, response: Response
     ) -> dict[str, object]:
         if store.auth_user_count() > 0:
             raise HTTPException(
@@ -815,15 +882,30 @@ def create_app(
         # A pre-setup /api/config response may have exposed the old process
         # token. Rotate it as soon as authentication is initialized.
         app.state.terminal_token = secrets.token_urlsafe(32)
-        _session_cookie(response, _issue_session(user))
+        _session_cookie(
+            response,
+            _issue_session(user),
+            secure=request.url.scheme == "https",
+        )
         return {"user": user, "setup_required": False}
 
     @app.post("/api/auth/register", status_code=201)
-    def auth_register(credentials: AuthCredentialsRequest) -> dict[str, object]:
+    def auth_register(
+        credentials: AuthCredentialsRequest, request: Request
+    ) -> dict[str, object]:
         if store.auth_user_count() == 0:
             raise HTTPException(
                 status_code=409,
                 detail="Complete administrator setup before registering users.",
+            )
+        # Registration creates credentials, so it is an administrator action.
+        # Leaving it public lets any network client mint itself an account and
+        # reach every other API; the middleware above requires the session.
+        actor = getattr(request.state, "user", None)
+        if actor is None or str(actor.get("role") or "") != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Administrator authentication is required to register users.",
             )
         username = normalize_username(credentials.username)
         try:
@@ -838,7 +920,7 @@ def create_app(
 
     @app.post("/api/auth/login")
     def auth_login(
-        credentials: AuthCredentialsRequest, response: Response
+        credentials: AuthCredentialsRequest, request: Request, response: Response
     ) -> dict[str, object]:
         username = normalize_username(credentials.username)
         record = store.get_auth_user_by_username(username)
@@ -852,7 +934,11 @@ def create_app(
         store.mark_auth_login(int(user["id"]))
         user = store.get_auth_user_by_username(username) or record
         user.pop("password_hash", None)
-        _session_cookie(response, _issue_session(user))
+        _session_cookie(
+            response,
+            _issue_session(user),
+            secure=request.url.scheme == "https",
+        )
         return {"user": AuditStore._public_user(user)}
 
     @app.post("/api/auth/logout")
@@ -1102,7 +1188,7 @@ def create_app(
         if record.get("applied_at"):
             raise HTTPException(status_code=409, detail="That draft is already active.")
         draft = os.path.realpath(str(record.get("draft_path") or ""))
-        if not _is_managed_path(draft, settings.reproductions_dir) or not os.path.isdir(
+        if not path_is_within(draft, settings.reproductions_dir) or not os.path.isdir(
             draft
         ):
             raise HTTPException(status_code=404, detail="Disclosure draft not found.")
@@ -1122,7 +1208,7 @@ def create_app(
         if (
             not active
             or os.path.basename(active) != "disclosure"
-            or not _is_managed_path(active, settings.results_dir)
+            or not path_is_within(active, settings.results_dir)
             or not os.path.isdir(active)
         ):
             raise HTTPException(
@@ -1147,7 +1233,7 @@ def create_app(
                 status_code=409,
                 detail=f"Could not inspect Disclosure revision directory: {exc}",
             ) from exc
-        if not stat.S_ISDIR(revisions_stat.st_mode) or not _is_managed_path(
+        if not stat.S_ISDIR(revisions_stat.st_mode) or not path_is_within(
             revisions, settings.results_dir
         ):
             raise HTTPException(
@@ -1269,6 +1355,43 @@ def create_app(
             raise HTTPException(status_code=404, detail="CVE not found.")
         return {"entry": entry}
 
+    async def _serve_terminal(
+        websocket: WebSocket,
+        token: str,
+        resolve_candidate: Callable[[], dict | None],
+        *,
+        missing_reason: str,
+    ) -> None:
+        """Authorize and serve one interactive terminal for a resolved target.
+
+        Both terminal routes share the token/origin gate, the session limit,
+        the managed-path check, and the active-session accounting; only target
+        resolution and the not-found diagnostic differ. The resolver runs only
+        after authorization so an unauthenticated caller cannot drive DB work.
+        """
+        if not _tokens_match(
+            token, app.state.terminal_token
+        ) or not _websocket_origin_allowed(websocket):
+            await websocket.close(code=1008, reason="Terminal authorization failed.")
+            return
+        if app.state.active_terminals >= 16:
+            await websocket.accept()
+            await websocket.close(code=1008, reason="Terminal session limit reached.")
+            return
+        candidate = resolve_candidate()
+        if candidate is None or not (
+            path_is_within(candidate["output_dir"], settings.results_dir)
+            and path_is_within(candidate["poc_dir"], settings.results_dir)
+        ):
+            await websocket.accept()
+            await websocket.close(code=1008, reason=missing_reason)
+            return
+        app.state.active_terminals += 1
+        try:
+            await serve_poc_terminal(websocket, candidate)
+        finally:
+            app.state.active_terminals -= 1
+
     @app.websocket("/ws/terminal/{run_id}/{vuln_id}")
     async def poc_terminal(
         websocket: WebSocket,
@@ -1276,34 +1399,27 @@ def create_app(
         vuln_id: str,
         token: str = Query(default="", max_length=128),
     ) -> None:
-        if not hmac.compare_digest(
-            token, app.state.terminal_token
-        ) or not _websocket_origin_allowed(websocket):
-            await websocket.close(code=1008, reason="Terminal authorization failed.")
-            return
         if run_id < 1 or re.fullmatch(_VULN_ID_PATTERN, vuln_id) is None:
+            # A malformed request is rejected before target resolution; the
+            # token/origin gate still applies.
+            if not _tokens_match(
+                token, app.state.terminal_token
+            ) or not _websocket_origin_allowed(websocket):
+                await websocket.close(
+                    code=1008, reason="Terminal authorization failed."
+                )
+                return
             # The token and origin are valid, so complete the handshake before
             # closing to let the browser receive this diagnostic reason.
             await websocket.accept()
             await websocket.close(code=1008, reason="Invalid terminal request.")
             return
-        if app.state.active_terminals >= 16:
-            await websocket.accept()
-            await websocket.close(code=1008, reason="Terminal session limit reached.")
-            return
-        candidate = store.get_poc_terminal_candidate(run_id, vuln_id)
-        if candidate is None or not (
-            _is_managed_path(candidate["output_dir"], settings.results_dir)
-            and _is_managed_path(candidate["poc_dir"], settings.results_dir)
-        ):
-            await websocket.accept()
-            await websocket.close(code=1008, reason="PoC terminal target not found.")
-            return
-        app.state.active_terminals += 1
-        try:
-            await serve_poc_terminal(websocket, candidate)
-        finally:
-            app.state.active_terminals -= 1
+        await _serve_terminal(
+            websocket,
+            token,
+            lambda: store.get_poc_terminal_candidate(run_id, vuln_id),
+            missing_reason="PoC terminal target not found.",
+        )
 
     @app.websocket("/ws/disclosure-terminal")
     async def disclosure_terminal(
@@ -1316,30 +1432,12 @@ def create_app(
         ),
         token: str = Query(default="", max_length=128),
     ) -> None:
-        if not hmac.compare_digest(
-            token, app.state.terminal_token
-        ) or not _websocket_origin_allowed(websocket):
-            await websocket.close(code=1008, reason="Terminal authorization failed.")
-            return
-        if app.state.active_terminals >= 16:
-            await websocket.accept()
-            await websocket.close(code=1008, reason="Terminal session limit reached.")
-            return
-        candidate = store.get_disclosed_terminal_candidate(project, dedupe_key)
-        if candidate is None or not (
-            _is_managed_path(candidate["output_dir"], settings.results_dir)
-            and _is_managed_path(candidate["poc_dir"], settings.results_dir)
-        ):
-            await websocket.accept()
-            await websocket.close(
-                code=1008, reason="Disclosure terminal target not found."
-            )
-            return
-        app.state.active_terminals += 1
-        try:
-            await serve_poc_terminal(websocket, candidate)
-        finally:
-            app.state.active_terminals -= 1
+        await _serve_terminal(
+            websocket,
+            token,
+            lambda: store.get_disclosed_terminal_candidate(project, dedupe_key),
+            missing_reason="Disclosure terminal target not found.",
+        )
 
     @app.post("/api/reproduction", status_code=202)
     async def start_reproduction(request: ReproductionStartRequest) -> dict:
@@ -1399,7 +1497,7 @@ def create_app(
         else:
             record = _reproduction_record_or_404(job_key)
             root = os.path.realpath(str(record.get("output_dir") or ""))
-            if not _is_managed_path(root, settings.reproductions_dir):
+            if not path_is_within(root, settings.reproductions_dir):
                 raise HTTPException(
                     status_code=404, detail="Reproduction output not found."
                 )
@@ -1439,40 +1537,16 @@ def create_app(
         job_key: str,
         download: bool = Query(default=False),
     ):
-        output_dir = _reproduction_output_or_404(job_key)
-        latest = _latest_agent_log(output_dir)
-        if latest is None:
-            raise HTTPException(
-                status_code=404, detail="No Agent log is available yet."
-            )
-        path, relative_path = latest
-        if download:
-            return FileResponse(
-                path,
-                media_type="text/plain; charset=utf-8",
-                filename=f"{path.parent.name}-{path.name}",
-            )
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return PlainTextResponse(
-            content,
-            headers={"X-CodeAuditor-Log-Path": relative_path},
-        )
+        return _agent_log_response(_reproduction_output_or_404(job_key), download)
 
     @app.get("/api/reproduction/{job_key}/results/file")
     async def reproduction_result_file(
         job_key: str,
         path: str = Query(min_length=1, max_length=4096),
     ) -> PlainTextResponse:
-        output_dir = _reproduction_output_or_404(job_key)
-        full = _resolve_output_file(output_dir, path)
-        try:
-            content = Path(full).read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return PlainTextResponse(content)
+        return _output_file_response(
+            _reproduction_output_or_404(job_key), path, download=False
+        )
 
     # ── History (SQLite-backed) ──────────────────────────────────────────
 
@@ -1500,7 +1574,7 @@ def create_app(
         ),
     ) -> dict:
         """Open a native chooser and issue a short-lived opaque target token."""
-        if not hmac.compare_digest(selection_token, app.state.terminal_token):
+        if not _tokens_match(selection_token, app.state.terminal_token):
             raise HTTPException(
                 status_code=403,
                 detail="Local folder selection authorization failed.",
@@ -1665,27 +1739,7 @@ def create_app(
         download: bool = Query(default=False),
     ):
         """Latest agent log of a run; works for both live and finished runs."""
-        run = _get_history_run(run_id)
-        latest = _latest_agent_log(run["output_dir"])
-        if latest is None:
-            raise HTTPException(
-                status_code=404, detail="No Agent log is available yet."
-            )
-        path, relative_path = latest
-        if download:
-            return FileResponse(
-                path,
-                media_type="text/plain; charset=utf-8",
-                filename=f"{path.parent.name}-{path.name}",
-            )
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return PlainTextResponse(
-            content,
-            headers={"X-CodeAuditor-Log-Path": relative_path},
-        )
+        return _agent_log_response(_get_history_run(run_id)["output_dir"], download)
 
     @app.get("/api/history/{run_id}/file")
     def history_run_file(
@@ -1693,19 +1747,9 @@ def create_app(
         path: str = Query(min_length=1, max_length=4096),
         download: bool = Query(default=False),
     ):
-        run = _get_history_run(run_id)
-        full = _resolve_output_file(run["output_dir"], path)
-        if download:
-            return FileResponse(
-                full,
-                media_type="application/octet-stream",
-                filename=Path(full).name,
-            )
-        try:
-            content = Path(full).read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        return PlainTextResponse(content)
+        return _output_file_response(
+            _get_history_run(run_id)["output_dir"], path, download
+        )
 
     @app.post("/api/history/import", status_code=201)
     def import_history(request: ImportRequest) -> dict:
@@ -1769,7 +1813,7 @@ def create_app(
                 status_code=404, detail="Disclosure artifact not found."
             )
         path = resolved["path"]
-        if not _is_managed_path(path, settings.results_dir) or not os.path.isfile(path):
+        if not path_is_within(path, settings.results_dir) or not os.path.isfile(path):
             raise HTTPException(
                 status_code=404, detail="Disclosure artifact not found."
             )

@@ -11,6 +11,11 @@ import shutil
 import subprocess
 import sys
 
+# A native chooser blocks a thread-pool worker; bound it so a picker that
+# never returns (no display, denied permission prompt) cannot exhaust the
+# shared default executor.
+_PICKER_TIMEOUT_SECONDS = 10 * 60
+
 
 class LocalDirectoryPickerError(RuntimeError):
     """Raised when a local directory cannot be selected or validated."""
@@ -90,7 +95,17 @@ def choose_local_directory() -> str | None:
             )
 
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_PICKER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LocalDirectoryPickerUnavailable(
+            "The native folder picker did not return in time; close it and try again."
+        ) from exc
     except OSError as exc:
         raise LocalDirectoryPickerUnavailable(
             f"Could not open the native folder picker: {exc}"

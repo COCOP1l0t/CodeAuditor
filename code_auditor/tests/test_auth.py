@@ -63,8 +63,9 @@ def test_register_login_logout_and_duplicate_username(tmp_path: Path) -> None:
             "/api/auth/setup",
             json={"username": "admin", "password": PASSWORD},
         )
-        client.post("/api/auth/logout")
 
+        # Registration is an administrator action; the admin session from
+        # setup is still active here.
         registered = client.post(
             "/api/auth/register",
             json={"username": "Reviewer", "password": PASSWORD},
@@ -77,6 +78,8 @@ def test_register_login_logout_and_duplicate_username(tmp_path: Path) -> None:
             json={"username": "reviewer", "password": PASSWORD},
         )
         assert duplicate.status_code == 409
+
+        assert client.post("/api/auth/logout").json() == {"logged_out": True}
 
         assert client.post(
             "/api/auth/login",
@@ -92,6 +95,23 @@ def test_register_login_logout_and_duplicate_username(tmp_path: Path) -> None:
 
         assert client.post("/api/auth/logout").json() == {"logged_out": True}
         assert client.get("/api/auth/status").json()["authenticated"] is False
+
+
+def test_register_requires_authenticated_administrator(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        client.post(
+            "/api/auth/setup",
+            json={"username": "admin", "password": PASSWORD},
+        )
+        client.post("/api/auth/logout")
+
+        # An unauthenticated client must not be able to mint an account and
+        # thereby reach every other API.
+        response = client.post(
+            "/api/auth/register",
+            json={"username": "reviewer", "password": PASSWORD},
+        )
+        assert response.status_code == 401
 
 
 def test_register_requires_completed_setup(tmp_path: Path) -> None:

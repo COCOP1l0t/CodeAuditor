@@ -80,7 +80,17 @@ class BoundedEventQueue:
             if drop_index is None:
                 if not _priority_event(event):
                     return
-                drop_index = 0
+                # Every queued event is priority. Prefer discarding a
+                # warning/stage event over a job lifecycle transition so the
+                # sidebar and run state cannot silently stop updating.
+                drop_index = next(
+                    (
+                        index
+                        for index, queued_event in enumerate(self._items)
+                        if queued_event.get("type") != "job"
+                    ),
+                    0,
+                )
             del self._items[drop_index]
         self._items.append(event)
         self._ready.set()

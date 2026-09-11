@@ -2974,6 +2974,35 @@ def test_api_history_import_rejects_symlink_escape(tmp_path) -> None:
     assert "managed results" in res.json()["detail"].lower()
 
 
+def test_api_history_import_ignores_symlinked_output_dirs(tmp_path) -> None:
+    # A symlink named "audit-output-*" must not let a tree import register a
+    # directory outside the managed results root.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "audit-output-evil").symlink_to(outside, target_is_directory=True)
+    app = _make_app(tmp_path)
+    client = TestClient(app)
+
+    res = client.post("/api/history/import", json={"output_dir": str(results)})
+
+    assert res.status_code == 400
+    assert app.state.store.list_runs()[1] == 0
+
+
+def test_api_terminal_token_rejects_non_ascii_without_crashing(tmp_path) -> None:
+    # hmac.compare_digest raises TypeError for non-ASCII strings; the endpoint
+    # must still return a clean authorization failure. Send raw latin-1 header
+    # bytes because HTTP clients normally refuse non-ASCII str header values.
+    client = TestClient(_make_app(tmp_path))
+    res = client.post(
+        "/api/local-directories/select",
+        headers={"X-CodeAuditor-Token": b"t\xf6k\xe9n"},
+    )
+    assert res.status_code == 403
+
+
 def test_api_history_run_not_found_returns_404(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
     assert client.get("/api/history/999").status_code == 404

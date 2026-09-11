@@ -55,6 +55,7 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
     loop = asyncio.get_running_loop()
     output: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
     reader_state = {"active": False, "paused": False}
+    bridge_tasks: set[asyncio.Task[None]] = set()
 
     def remove_reader() -> None:
         if reader_state["active"]:
@@ -143,6 +144,7 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
         add_reader()
         sender = asyncio.create_task(send_output())
         receiver = asyncio.create_task(receive_input())
+        bridge_tasks.update({sender, receiver})
         done, pending = await asyncio.wait(
             {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
         )
@@ -162,6 +164,14 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
         except Exception:
             pass
     finally:
+        # Cancellation can land here with the bridge tasks still pending; stop
+        # them before the PTY descriptors are closed or the shell is signalled,
+        # otherwise a late read/write can hit a reused file descriptor.
+        for task in list(bridge_tasks):
+            if not task.done():
+                task.cancel()
+        if bridge_tasks:
+            await asyncio.gather(*bridge_tasks, return_exceptions=True)
         remove_reader()
         if slave_fd >= 0:
             os.close(slave_fd)

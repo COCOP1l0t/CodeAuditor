@@ -5,6 +5,7 @@ import os
 import re
 
 from ..config import ValidationIssue
+from .common import read_file_or_issues
 
 _PLACEHOLDERS = {"none", "n/a", "...", "tbd", ""}
 
@@ -82,15 +83,9 @@ def validate_stage2_au_file(file_path: str) -> list[ValidationIssue]:
     name = os.path.basename(file_path)
     issues: list[ValidationIssue] = []
 
-    try:
-        with open(file_path) as f:
-            content = f.read()
-    except FileNotFoundError:
-        return [ValidationIssue(
-            description=f"File not found: {file_path}",
-            expected="The AU file should exist.",
-            fix="Ensure the file was written.",
-        )]
+    content, read_issues = read_file_or_issues(file_path)
+    if read_issues:
+        return read_issues
 
     if not content.strip():
         return [ValidationIssue(
@@ -141,15 +136,9 @@ def validate_triage_file(file_path: str, max_aus: int = DEFAULT_MAX_ANALYSIS_UNI
     """Validate the triage.json manifest."""
     issues: list[ValidationIssue] = []
 
-    try:
-        with open(file_path) as f:
-            content = f.read()
-    except FileNotFoundError:
-        return [ValidationIssue(
-            description="triage.json not found.",
-            expected="A triage manifest at triage.json in the result directory.",
-            fix="Write the triage manifest before creating AU files.",
-        )]
+    content, read_issues = read_file_or_issues(file_path)
+    if read_issues:
+        return read_issues
 
     if not content.strip():
         return [ValidationIssue(

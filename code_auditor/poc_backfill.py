@@ -32,10 +32,12 @@ from .db import (
 )
 from .disclosures import build_dedupe_key
 from .logger import configure_logging, get_logger
+from .poc_artifacts import resolve_stage5_report_path
 from .repos import capture_repo_identity, create_detached_worktree
+from .reproduction_status import is_reproduced_status, read_reproduction_status
 from .stages.stage5 import _run_reproduce
 from .stages.stage6 import _run_disclosure
-from .utils import path_is_within
+from .utils import is_nonfatal_sandbox_cleanup_error
 from .web.settings import DEFAULT_SETTINGS_PATH, WebSettings, load_web_settings
 
 logger = get_logger("poc_backfill")
@@ -59,11 +61,19 @@ _PROVIDER_BLOCKER_MARKERS = (
 
 def _is_nonfatal_cleanup_error(exc: Exception) -> bool:
     """Recognize Docker teardown races after a task wrote its report."""
-    message = str(exc).casefold()
-    return (
-        "cannot remove sandbox container" in message
-        and "already in progress" in message
+    return is_nonfatal_sandbox_cleanup_error(exc)
+
+
+def _retained_reproduced_report(
+    candidate: "BackfillCandidate", output_dir: str
+) -> str | None:
+    """Return the candidate's retained Stage 5 report when it reproduced."""
+    report = resolve_stage5_report_path(
+        output_dir, f"stage5-pocs/{candidate.vuln_id}/report.md"
     )
+    if report and is_reproduced_status(read_reproduction_status(report)):
+        return report
+    return None
 
 
 class BackfillProviderUnavailable(RuntimeError):
@@ -151,25 +161,9 @@ def _registered_poc_report(
     ).fetchone()
     if row is None:
         return ""
-    output_dir = os.path.realpath(os.path.expanduser(str(row["output_dir"] or "")))
-    if not output_dir or not os.path.isdir(output_dir):
-        return ""
-    report_path = os.path.realpath(
-        report_value
-        if os.path.isabs(report_value)
-        else os.path.join(output_dir, report_value)
+    return (
+        resolve_stage5_report_path(str(row["output_dir"] or ""), report_value) or ""
     )
-    if not path_is_within(report_path, output_dir):
-        return ""
-    report = Path(report_path)
-    if (
-        report.name != "report.md"
-        or report.parent.parent.name != "stage5-pocs"
-        or report.parent.name.endswith("_fp")
-        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", report.parent.name) is None
-    ):
-        return ""
-    return report_path if os.path.isfile(report_path) else ""
 
 
 def _git_has_commit(target: str, commit: str) -> bool:
@@ -445,6 +439,7 @@ async def _run_group(
     config.sandbox_run_id = run_id
     config.sandbox_job_key = f"maintenance-{run_id}"
     _pin_run_identity(store, run_id, first)
+    worktree_error: str | None = None
     if not config.sandbox_enabled and config.poc_worktree is None:
         # Without Docker, Stage 5/6 work in ``poc_worktree or target``. Pin a
         # detached worktree at the audited commit so the recovery neither runs
@@ -457,11 +452,17 @@ async def _run_group(
                 await create_detached_worktree(first.target, first.commit, worktree)
                 config.poc_worktree = worktree
             except Exception as exc:
-                logger.warning(
-                    "Backfill: could not pin a worktree at %s (%s); Stage 5/6 "
-                    "will use the shared checkout.",
-                    first.commit[:12],
-                    exc,
+                # Falling back to the shared checkout would test whatever HEAD
+                # happens to be while the run identity records the audited
+                # commit. Refuse the whole group instead of producing
+                # misattributed evidence.
+                worktree_error = (
+                    f"could not pin a worktree at {first.commit[:12]}: {exc}"
+                )
+                logger.error(
+                    "Backfill: %s; refusing to run the group against the "
+                    "shared checkout.",
+                    worktree_error,
                 )
     checkpoint = CheckpointManager(output_dir, resume=True)
     results: list[dict[str, Any]] = []
@@ -476,6 +477,12 @@ async def _run_group(
                 "recovery_output_dir": output_dir,
                 "result": "error",
             }
+            if worktree_error is not None:
+                message = f"{candidate.project}/{candidate.vuln_id}: {worktree_error}"
+                errors.append(message)
+                result["error"] = worktree_error
+                results.append(result)
+                continue
             try:
                 finding_path = _copy_finding(candidate, output_dir)
                 logger.info(
@@ -490,6 +497,18 @@ async def _run_group(
                 )
                 store.persist_artifacts(run_id, output_dir)
                 if stage5_report is None:
+                    result["result"] = "not-reproduced"
+                    results.append(result)
+                    continue
+                if not is_reproduced_status(read_reproduction_status(stage5_report)):
+                    # Stage 6 normally applies this gate itself; the backfill
+                    # calls _run_disclosure directly, so enforce it here to
+                    # avoid staging an unverified disclosure.
+                    logger.warning(
+                        "Backfill: %s Stage 5 report is not reproduced; "
+                        "skipping Stage 6.",
+                        candidate.vuln_id,
+                    )
                     result["result"] = "not-reproduced"
                     results.append(result)
                     continue
@@ -512,8 +531,35 @@ async def _run_group(
                 message = f"{candidate.project}/{candidate.vuln_id}: {exc}"
                 logger.exception("Backfill failed for %s", message)
                 if _is_nonfatal_cleanup_error(exc):
-                    # The agent has already exported a report; Docker's
-                    # asynchronous ``--rm`` teardown is not a PoC failure.
+                    # Docker's asynchronous ``--rm`` teardown is not a PoC
+                    # failure: the task may already have exported a reproduced
+                    # report. Re-resolve it before labelling the outcome.
+                    retained = _retained_reproduced_report(candidate, output_dir)
+                    if retained is not None:
+                        try:
+                            stage6_report = await _run_disclosure(
+                                retained, config, checkpoint
+                            )
+                            store.persist_artifacts(run_id, output_dir)
+                            terminal = store.get_disclosed_terminal_candidate(
+                                candidate.project, candidate.dedupe_key
+                            )
+                            if stage6_report is not None and terminal is not None:
+                                result["result"] = "reproduced"
+                                result["stage5_report"] = retained
+                                result["stage6_report"] = stage6_report
+                                result["warning"] = str(exc)
+                                results.append(result)
+                                continue
+                        except Exception as inner:
+                            logger.exception(
+                                "Backfill: Stage 6 failed after a cleanup race for %s",
+                                message,
+                            )
+                            errors.append(f"{message} (stage6: {inner})")
+                            result["error"] = str(inner)
+                            results.append(result)
+                            continue
                     result["result"] = "not-reproduced"
                     result["warning"] = str(exc)
                     warnings.append(message)
@@ -541,20 +587,29 @@ async def _run_group(
             warning="\n".join(warnings),
         )
         summary_path = Path(output_dir) / "poc-backfill-summary.json"
-        summary_path.write_text(
-            json.dumps(
-                {
-                    "run_id": run_id,
-                    "started_at": started_at,
-                    "finished_at": time.time(),
-                    "results": results,
-                },
-                ensure_ascii=False,
-                indent=2,
+        try:
+            # ``output_dir`` may not exist when every candidate failed before
+            # any artifact was written; a failure here must not mask an
+            # in-flight exception from the run itself.
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "started_at": started_at,
+                        "finished_at": time.time(),
+                        "results": results,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
             )
-            + "\n",
-            encoding="utf-8",
-        )
+        except OSError as exc:
+            logger.error(
+                "Backfill: could not write %s: %s", summary_path, exc
+            )
     return results
 
 

@@ -28,10 +28,27 @@ _NEGATED_REPRODUCTION_PATTERN = re.compile(
     r"|\b(?:was|were|is|are)\s+not\s+able\s+to\s+reproduce\b",
     re.IGNORECASE,
 )
+# Broader negation guard: a negation marker within a few words before any
+# "reproduc*" token. Agent prose uses many variants the explicit list above
+# misses ("cannot be reproduced", "not fully reproduced", "has not been
+# reproduced", "no longer reproduced", "not currently reproduced"); without this
+# the bare-"reproduced" fallback misreads them as successes.
+_NEGATION_BEFORE_REPRODUCED_PATTERN = re.compile(
+    r"\b(?:not|never|cannot|can\s+not|can't|no\s+longer|unable|fail(?:ed|s|ing)?|without)\b"
+    r"(?:\s+\w+){0,3}\s+reproduc\w*",
+    re.IGNORECASE,
+)
+
+
+def _has_negated_reproduction(text: str) -> bool:
+    return bool(
+        _NEGATED_REPRODUCTION_PATTERN.search(text)
+        or _NEGATION_BEFORE_REPRODUCED_PATTERN.search(text)
+    )
 
 
 def _normalize_status(raw_status: str) -> str:
-    return re.sub(r"\s+", "-", raw_status.strip().lower())
+    return re.sub(r"[-\s]+", "-", raw_status.strip().lower())
 
 
 def _find_status_value(text: str) -> str | None:
@@ -43,7 +60,7 @@ def _find_status_value(text: str) -> str | None:
     if _LEADING_REPRODUCED_PATTERN.match(text):
         return "reproduced"
 
-    if _NEGATED_REPRODUCTION_PATTERN.search(text):
+    if _has_negated_reproduction(text):
         return "not-reproduced"
 
     if _BARE_REPRODUCED_PATTERN.search(text):
@@ -90,7 +107,7 @@ def read_reproduction_status(report_path: str) -> str | None:
     success_match = re.search(r"\bsuccessfully\s+reproduced\b", content[:4000], re.IGNORECASE)
     if success_match:
         window = content[max(0, success_match.start() - 40) : success_match.end()]
-        if not _NEGATED_REPRODUCTION_PATTERN.search(window):
+        if not _has_negated_reproduction(window):
             return "reproduced"
 
     return None

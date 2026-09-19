@@ -18,6 +18,19 @@ _VALUES = {
 _VECTOR = re.compile(
     r"(?:CVSS:3\.1/)?(?:AV|AC|PR|UI|S|C|I|A):[A-Z](?:/(?:AV|AC|PR|UI|S|C|I|A):[A-Z]){3,}"
 )
+# A decimal only counts as a written score when it follows an explicit score
+# label. Otherwise any unrelated decimal in the same paragraph (for example a
+# section number like "4.2") would be compared against the computed score and
+# fail an otherwise valid disclosure.
+_SCORE_LABEL = re.compile(
+    r"(?:\bcvss(?:\s*(?:v|:)?\s*3\.[01])?\b|\bbase\s+score\b|\bscore\b)"
+    r"\s*[:=]?\s*(?P<score>10\.0|[0-9]\.[0-9])",
+    re.IGNORECASE,
+)
+
+
+def _labelled_scores(text: str) -> list[float]:
+    return [float(match.group("score")) for match in _SCORE_LABEL.finditer(text)]
 
 
 def base_score(vector: str) -> float:
@@ -85,10 +98,7 @@ def report_score_errors(text: str, *, require_vector: bool = False) -> list[str]
             paragraph = text[previous + 2 if previous >= 0 else 0 : end]
         cleaned = _VECTOR.sub("", paragraph)
         cleaned = re.sub(r"CVSS\s*(?:v|:)?\s*3\.[01]", "CVSS", cleaned, flags=re.I)
-        scores = [
-            float(s)
-            for s in re.findall(r"(?<![\d.])(?:10\.0|[0-9]\.[0-9])(?![\d.])", cleaned)
-        ]
+        scores = _labelled_scores(cleaned)
         if not scores and start:
             previous = text.rfind("\n\n", 0, max(0, start - 2))
             preceding = text[previous + 2 if previous >= 0 else 0 : start]
@@ -96,13 +106,7 @@ def report_score_errors(text: str, *, require_vector: bool = False) -> list[str]
             preceding = re.sub(
                 r"CVSS\s*(?:v|:)?\s*3\.[01]", "CVSS", preceding, flags=re.I
             )
-            if "CVSS" in preceding:
-                scores = [
-                    float(s)
-                    for s in re.findall(
-                        r"(?<![\d.])(?:10\.0|[0-9]\.[0-9])(?![\d.])", preceding
-                    )
-                ]
+            scores = _labelled_scores(preceding)
         if scores and calculated not in scores:
             errors.append(
                 f"Line {line}: CVSS score {scores[0]:.1f} does not match "

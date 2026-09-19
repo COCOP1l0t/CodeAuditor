@@ -1592,7 +1592,15 @@ class AuditJobManager:
         ):
             repos_root = os.path.realpath(os.path.expanduser(repos_dir))
             rel = os.path.relpath(target, repos_root)
+            # Prefer the URL recorded with the run so an SSH-origin mirror is
+            # not silently resumed over HTTPS; fall back to the mirror path.
             git_url = "https://" + rel.replace(os.sep, "/")
+            recorded_url = str(run.get("repo_url") or "").strip()
+            if recorded_url:
+                try:
+                    git_url = validate_remote_repo_url(recorded_url)
+                except RepoError:
+                    pass
             max_parallel = run.get("max_parallel")
             target_au_count = run.get("target_au_count")
             if not isinstance(max_parallel, int) or not 1 <= max_parallel <= 16:

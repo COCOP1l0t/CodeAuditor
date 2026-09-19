@@ -22,9 +22,9 @@ def parse_au_files(result_dir: str) -> list[AnalysisUnit]:
             continue
         path = os.path.join(result_dir, name)
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeError):
             continue
 
         au_id = f"AU-{m.group(1)}"
@@ -39,7 +39,7 @@ def parse_auditing_focus(path: str) -> tuple[str, str]:
     Returns (scope_modules, hot_spots) body text.
     """
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             content = f.read()
     except OSError:
         return "", ""

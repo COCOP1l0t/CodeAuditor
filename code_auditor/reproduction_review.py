@@ -56,7 +56,8 @@ def _load_assessment(path: Path, expected_outcome: str) -> dict[str, Any]:
 
 def _copy_regular(source: Path, destination: Path) -> None:
     info = source.lstat()
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+    # lstat() never follows links, so a symlink is already non-regular here.
+    if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"review output must be a regular file: {source.name}")
     if info.st_size > _MAX_REVIEW_FILE_BYTES:
         raise ValueError(f"review output exceeds size limit: {source.name}")
@@ -103,7 +104,9 @@ async def run_reproduction_review(
                 work_previous = sandbox.copy_input_tree(
                     previous_dir, "previous-disclosure"
                 )
-        except Exception:
+        except BaseException:
+            # CancelledError is a BaseException; a cancel during prepare() must
+            # still tear down the Docker scratch tree before propagating.
             await sandbox.close()
             raise
 

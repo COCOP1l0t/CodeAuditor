@@ -146,7 +146,14 @@ def _locate_codex_vendor() -> Path:
         if codex_bin:
             resolved_bin = Path(codex_bin).expanduser().resolve()
             package_or_vendor_root = resolved_bin.parent.parent
-            if (package_or_vendor_root / "bin" / "codex").resolve() == resolved_bin:
+            # Only accept the static musl vendor bundle. A generic
+            # ``<prefix>/bin/codex`` (for example /usr/bin/codex) would mount
+            # the whole host prefix read-only into the sandbox and run a
+            # dynamically linked host binary there.
+            if (
+                (package_or_vendor_root / "bin" / "codex").resolve() == resolved_bin
+                and package_or_vendor_root.name.endswith("-unknown-linux-musl")
+            ):
                 candidates.append(package_or_vendor_root)
             candidates.extend(
                 package_or_vendor_root.glob(
@@ -211,17 +218,27 @@ async def _run_async_checked(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=current_audit_subprocess_env(),
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         raise DockerSandboxError(f"required executable not found: {command[0]}") from exc
+
+    def _kill_group() -> None:
+        # Kill the whole process group so a killed ``git clone`` cannot leave
+        # orphaned ``git index-pack``/``git-remote-*`` children behind.
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
     try:
         output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        process.kill()
+        _kill_group()
         await process.wait()
         raise DockerSandboxError(f"sandbox setup timed out: {' '.join(command)}")
     except asyncio.CancelledError:
-        process.kill()
+        _kill_group()
         await process.wait()
         raise
     text = (output or b"").decode("utf-8", errors="replace")

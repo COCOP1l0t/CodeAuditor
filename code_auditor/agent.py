@@ -49,7 +49,9 @@ _NON_RETRYABLE_AGENT_ERROR_PATTERN = re.compile(
     r"no left credit|insufficient\s*(credit|balance|quota)|quota exceeded"
     r"|invalid\s*api[\s_-]*key|authentication failed|unauthorized"
     r"|supported api model names|invalid[ _-]model|model not found|unknown model"
-    r"|\b401\b|\b403\b",
+    # Require an HTTP/status context so a bare "401"/"403" quoted in the
+    # agent's own output cannot make a retryable failure fail fast.
+    r"|\b(?:http|status(?:\s*code)?|error(?:\s*code)?)\s*[:=]?\s*(?:401|403)\b",
     re.IGNORECASE,
 )
 
@@ -1123,12 +1125,18 @@ async def _run_codex_agent(
                         if turn_obj is not None:
                             status = getattr(turn_obj, "status", None)
                             status_val = getattr(status, "value", str(status)) if status else ""
-                            if status_val == "failed":
+                            # The SDK's TurnStatus is completed | interrupted |
+                            # failed | in_progress. Anything but ``completed``
+                            # (for example an interrupted turn) must not be
+                            # reported as a successful agent invocation.
+                            if status_val and status_val != "completed":
                                 error = getattr(turn_obj, "error", None)
                                 error_msg = getattr(error, "message", "") if error else ""
                                 if error_msg:
                                     raise RuntimeError(error_msg)
-                                raise RuntimeError(f"turn failed with status {status_val}")
+                                raise RuntimeError(
+                                    f"turn ended with status {status_val}"
+                                )
                         if token_usage is None and turn_obj is not None:
                             token_usage = _codex_usage_dict(
                                 getattr(turn_obj, "usage", None)
@@ -1294,7 +1302,7 @@ async def run_agent(
             raise asyncio.CancelledError
         logger.debug(
             "Destroyed %s subagent subagent_id=%s status=%s elapsed=%.2fs",
-            config.backend,
+            invocation_config.backend,
             subagent_id,
             status,
             time.monotonic() - started_at,

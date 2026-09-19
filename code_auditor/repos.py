@@ -17,6 +17,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import urllib.parse
 from datetime import datetime
 
@@ -149,9 +150,32 @@ def _clone_env() -> dict[str, str]:
     return env
 
 
+_REPO_LOCKS: dict[str, asyncio.Lock] = {}
+_REPO_LOCKS_GUARD = threading.Lock()
+
+
+def _repo_lock(destination: str) -> asyncio.Lock:
+    """Return a process-wide lock that serializes clones of one destination."""
+    with _REPO_LOCKS_GUARD:
+        lock = _REPO_LOCKS.get(destination)
+        if lock is None:
+            lock = asyncio.Lock()
+            _REPO_LOCKS[destination] = lock
+        return lock
+
+
 async def ensure_repo(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
     """Clone ``url`` into the repos dir if needed; return the local path."""
     dest = repo_local_path(url, repos_dir)
+    # Serialize concurrent clones of the same destination. Without this, one
+    # caller's failed clone can ``rmtree`` a mirror another caller just
+    # finished (or is still writing), leaving a successful caller with a
+    # deleted path.
+    async with _repo_lock(dest):
+        return await _ensure_repo_locked(url, dest)
+
+
+async def _ensure_repo_locked(url: str, dest: str) -> str:
     if os.path.isdir(os.path.join(dest, ".git")):
         logger.info("Using existing repository checkout: %s", dest)
         return dest
@@ -367,6 +391,23 @@ async def create_detached_worktree(repo: str, commit: str, destination: str) -> 
         )
 
 
+async def _worktree_head_commit(destination: str) -> str | None:
+    """Return the checked-out commit of a real worktree, or None."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", destination, "rev-parse", "--verify", "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=current_audit_subprocess_env(),
+        )
+        output, _ = await proc.communicate()
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return (output or b"").decode("utf-8", errors="replace").strip() or None
+
+
 async def ensure_poc_worktree(target: str, output_dir: str) -> str | None:
     """Create (or reuse) an isolated worktree for the Stage 5/6 PoC agents.
 
@@ -380,8 +421,25 @@ async def ensure_poc_worktree(target: str, output_dir: str) -> str | None:
     if not commit:
         return None
     destination = os.path.join(output_dir, ".poc-worktree")
+    if os.path.islink(destination):
+        # A symlinked path could point outside the managed output tree, where
+        # local-worktree PoC agents run with bypassPermissions.
+        logger.warning(
+            "Ignoring symlinked PoC worktree path: %s", destination
+        )
+        return None
     if os.path.isdir(destination):
-        return destination
+        # Reuse only a real git worktree already at the audited commit; a stale
+        # or empty directory would make the PoC agents test another revision or
+        # fail confusingly.
+        if await _worktree_head_commit(destination) == commit:
+            return destination
+        logger.warning(
+            "Existing PoC worktree at %s is not at commit %s; not reusing it.",
+            destination,
+            commit[:12],
+        )
+        return None
     try:
         await create_detached_worktree(target, commit, destination)
     except Exception as exc:

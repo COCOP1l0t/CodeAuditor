@@ -22,10 +22,14 @@ def extract_json_object(text: str) -> str | None:
         stripped = stripped.removeprefix("```").removesuffix("```").strip()
 
     try:
-        json.loads(stripped)
-        return stripped
+        parsed = json.loads(stripped)
     except (json.JSONDecodeError, ValueError):
         pass
+    else:
+        # Only a JSON object satisfies this function's contract; a bare array,
+        # number, or string must fall through to the object search.
+        if isinstance(parsed, dict):
+            return stripped
 
     start = stripped.find("{")
     if start == -1:
@@ -116,10 +120,7 @@ def path_is_within(path: str | os.PathLike[str], root: str | os.PathLike[str]) -
 
 
 def list_json_files(dir_path: str) -> list[str]:
-    p = Path(dir_path)
-    if not p.is_dir():
-        return []
-    return sorted((str(f) for f in p.iterdir() if f.is_file() and f.suffix == ".json"), key=natural_sort_key)
+    return list_matching_files(dir_path, re.compile(r"\.json$"))
 
 
 def list_matching_files(dir_path: str, pattern: re.Pattern[str]) -> list[str]:
@@ -155,6 +156,21 @@ def record_task_error(config: Any, stage: str, task_id: str, error: BaseExceptio
     config.task_errors.append(f"{stage}:{task_id}: {text}")
 
 
+def is_nonfatal_sandbox_cleanup_error(error: BaseException | str) -> bool:
+    """Recognize Docker's asynchronous teardown race after a task wrote output.
+
+    ``docker rm`` can report "removal ... already in progress" while the
+    container is still shutting down. That is not a PoC failure by itself; the
+    caller must still verify the expected report exists before treating the
+    task as successful.
+    """
+    message = str(error).casefold()
+    return (
+        "cannot remove sandbox container" in message
+        and "already in progress" in message
+    )
+
+
 # Token-usage key variants emitted by the Claude SDK (snake_case) and the
 # Codex app-server protocol (camelCase).
 _USAGE_KEY_ALIASES = {
@@ -168,6 +184,7 @@ _USAGE_KEY_ALIASES = {
         "cache_read_input_tokens",
         "cacheReadInputTokens",
         "cachedInputTokens",
+        "cached_input_tokens",
     ),
 }
 

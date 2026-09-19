@@ -200,11 +200,17 @@ def _sse(event: dict) -> str:
 
 def _sse_stream(bus) -> StreamingResponse:
     """Replay the bus backlog, then stream live events until disconnect."""
-    queue = bus.subscribe()
 
     async def stream():
+        # Subscribe inside the generator: an async generator that is never
+        # started never runs its ``finally``, so subscribing in the endpoint
+        # leaked a queue per aborted response. Snapshot the backlog before
+        # subscribing so an event cannot be delivered from both the replay
+        # buffer and the live queue.
+        backlog = bus.backlog()
+        queue = bus.subscribe()
         try:
-            for event in bus.backlog():
+            for event in backlog:
                 yield _sse(event)
             while True:
                 event = await queue.get()
@@ -1271,7 +1277,7 @@ def create_app(
                 raise RuntimeError(
                     "reproduction record changed before the draft was applied"
                 )
-        except (OSError, RetentionError, RuntimeError) as exc:
+        except (OSError, RetentionError, RuntimeError, sqlite3.Error) as exc:
             if installed_new and os.path.isdir(active):
                 shutil.rmtree(active)
             if moved_old and os.path.isdir(backup):

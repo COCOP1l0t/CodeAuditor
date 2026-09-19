@@ -23,7 +23,7 @@ from ..reproduction_status import (
 from ..retention import export_retained_artifacts, secure_generated_manifest_mode
 from ..sandbox import DockerScratch
 from ..utils import extract_json_object, record_task_error, run_parallel_limited
-from ..validation.stage6 import validate_stage6_disclosure
+from ..validation.stage6 import _report_sections, validate_stage6_disclosure
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage6")
@@ -74,31 +74,33 @@ def _read_text(path: str) -> str:
 
 
 def _extract_report_title(report_path: str) -> str | None:
+    """Return the first Markdown heading outside fenced code blocks."""
     content = _read_text(report_path)
+    fence = ""
     for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            title = stripped.lstrip("#").strip()
+        marker = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if marker:
+            token = marker[1]
+            if not fence:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = ""
+            continue
+        if fence:
+            continue
+        heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            title = heading[1].strip()
             if title:
                 return title
     return None
 
 
 def _extract_report_section(content: str, heading: str) -> str | None:
-    heading_re = re.compile(rf"^\s*#+\s+{re.escape(heading)}\s*$", re.IGNORECASE)
-    lines = content.splitlines()
-    for index, line in enumerate(lines):
-        if not heading_re.match(line):
-            continue
-        section_lines: list[str] = []
-        for next_line in lines[index + 1 :]:
-            if next_line.lstrip().startswith("#"):
-                break
-            section_lines.append(next_line)
-        text = "\n".join(section_lines).strip()
-        if text:
-            return text
-    return None
+    # Reuse the validator's fence-aware section parser so a ``# comment`` inside
+    # a shell block cannot truncate a section or be mistaken for a heading.
+    sections, _ = _report_sections(content)
+    return sections.get(heading.strip().casefold()) or None
 
 
 def _fallback_finding_from_report(

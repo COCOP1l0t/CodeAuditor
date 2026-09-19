@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import fcntl
 import json
@@ -40,6 +41,9 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
     """Run an interactive shell rooted at one validated Stage 5 PoC directory."""
     await websocket.accept()
     master_fd, slave_fd = pty.openpty()
+    # The PTY master must never block the event loop: a paste larger than the
+    # tty buffer would otherwise stall every SSE stream and concurrent audit.
+    os.set_blocking(master_fd, False)
     _resize(master_fd, 100, 30)
     shell = _terminal_shell()
     env = os.environ.copy()
@@ -55,12 +59,41 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
     loop = asyncio.get_running_loop()
     output: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
     reader_state = {"active": False, "paused": False}
+    pending_writes: list[bytes] = []
     bridge_tasks: set[asyncio.Task[None]] = set()
 
     def remove_reader() -> None:
         if reader_state["active"]:
             loop.remove_reader(master_fd)
             reader_state["active"] = False
+
+    def remove_writer() -> None:
+        with contextlib.suppress(OSError, ValueError):
+            loop.remove_writer(master_fd)
+
+    def flush_writes() -> None:
+        """Drain queued client input without blocking the event loop."""
+        while pending_writes:
+            chunk = pending_writes[0]
+            try:
+                written = os.write(master_fd, chunk)
+            except BlockingIOError:
+                return
+            except OSError:
+                pending_writes.clear()
+                remove_writer()
+                return
+            if written < len(chunk):
+                pending_writes[0] = chunk[written:]
+                return
+            pending_writes.pop(0)
+        remove_writer()
+
+    def queue_write(data: bytes) -> None:
+        if not data:
+            return
+        pending_writes.append(data)
+        loop.add_writer(master_fd, flush_writes)
 
     def read_master() -> None:
         if output.full():
@@ -69,6 +102,8 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
             return
         try:
             data = os.read(master_fd, 65536)
+        except BlockingIOError:
+            return
         except OSError as exc:
             if exc.errno not in {errno.EAGAIN, errno.EIO, errno.EBADF}:
                 output.put_nowait(
@@ -103,7 +138,7 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
             if message["type"] == "websocket.disconnect":
                 return
             if message.get("bytes") is not None:
-                os.write(master_fd, message["bytes"])
+                queue_write(message["bytes"])
                 continue
             text = message.get("text")
             if text is None:
@@ -115,7 +150,7 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
             if payload.get("type") == "input" and isinstance(
                 payload.get("data"), str
             ):
-                os.write(master_fd, payload["data"].encode("utf-8"))
+                queue_write(payload["data"].encode("utf-8"))
             elif payload.get("type") == "resize":
                 _resize(master_fd, payload.get("cols"), payload.get("rows"))
 
@@ -173,6 +208,8 @@ async def serve_poc_terminal(websocket: WebSocket, candidate: dict) -> None:
         if bridge_tasks:
             await asyncio.gather(*bridge_tasks, return_exceptions=True)
         remove_reader()
+        remove_writer()
+        pending_writes.clear()
         if slave_fd >= 0:
             os.close(slave_fd)
         try:

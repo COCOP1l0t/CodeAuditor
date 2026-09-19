@@ -63,6 +63,7 @@ let historyServerFiltering = null;
 let liveDetailRunId = null;
 // Run id currently displayed on the run detail page (live or static).
 let detailRunId = null;
+let sandboxExecutionsSequence = 0;
 let detailEventSource = null;
 let processTreeTimer = null;
 let processTreeRunId = null;
@@ -1264,6 +1265,10 @@ function finishReproductionJob(ev) {
   loadReproductionCandidates();
   loadReproductionHistory();
   updateReproductionStartAvailability();
+  // The per-job SSE stream never completes server-side; close it now that the
+  // job is terminal so replayed events cannot re-run these three fetches for
+  // the rest of the session. This helper only runs for the active reproduction.
+  disconnectReproEvents();
 }
 
 function disconnectReproEvents() {
@@ -1689,21 +1694,30 @@ function stopAuditProcessTree() {
 
 async function pollDetailHeartbeat() {
   if (liveDetailRunId === null || auditHeartbeatPending) return;
+  const runId = liveDetailRunId;
   auditHeartbeatPending = true;
   try {
-    const res = await fetch(`/api/audit/${liveDetailRunId}/status`);
+    const res = await fetch(`/api/audit/${runId}/status`);
+    // The user may have navigated to another run while this request was in
+    // flight; a stale response must not retarget the process-tree poller.
+    if (liveDetailRunId !== runId) return;
     if (!res.ok) {
+      if (res.status !== 404 && res.status !== 409) {
+        // 401 (expired session) or a transient 5xx is not proof the job is
+        // gone; keep the live view and try again on the next heartbeat.
+        return;
+      }
       // The job is gone (finished and pruned): reload the page as static.
-      const runId = liveDetailRunId;
       liveDetailRunId = null;
       disconnectDetailEvents();
       loadRunDetail(runId);
       return;
     }
     const status = await res.json();
+    if (liveDetailRunId !== runId) return;
     applyJobStatus(status);
     if (status.state === "running") {
-      startAuditProcessTree(status.run_id);
+      startAuditProcessTree(runId);
     } else {
       stopAuditProcessTree();
     }
@@ -2457,12 +2471,16 @@ $("btn-import").addEventListener("click", async () => {
 async function loadSandboxExecutions(runId) {
   const table = $("sandbox-executions-table");
   const status = $("sandbox-executions-status");
+  const sequence = ++sandboxExecutionsSequence;
   table.querySelector("tbody").replaceChildren();
   status.textContent = "Loading recorded environments…";
   try {
     const res = await fetch(`/api/history/${runId}/sandbox-executions`, { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
+    // Ignore a slow response that lost the race against a newer request or a
+    // navigation away from this run.
+    if (sequence !== sandboxExecutionsSequence) return;
     if (String(detailRunId) !== String(runId)) return;
     const rows = data.executions || [];
     status.textContent = rows.length
@@ -2481,7 +2499,9 @@ async function loadSandboxExecutions(runId) {
       table.querySelector("tbody").appendChild(tr);
     }
   } catch (error) {
-    if (String(detailRunId) === String(runId)) status.textContent = `Execution records unavailable: ${error.message}`;
+    if (sequence === sandboxExecutionsSequence && String(detailRunId) === String(runId)) {
+      status.textContent = `Execution records unavailable: ${error.message}`;
+    }
   }
 }
 
@@ -2765,9 +2785,20 @@ async function loadRunDetail(runId) {
 }
 
 function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = String(text ?? "");
-  return div.innerHTML;
+  // textContent/innerHTML escapes only &, <, > and \u00a0 — not quotes — so it
+  // is unsafe in the attribute-value positions this helper feeds. Escape the
+  // full HTML metacharacter set explicitly.
+  return String(text ?? "").replace(
+    /[&<>"']/g,
+    (char) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[char]
+  );
 }
 
 async function viewHistoryFile(runId, path) {
@@ -3544,8 +3575,10 @@ async function loadDisclosures() {
           project: e.project,
           dedupeKey: e.dedupe_key,
         };
+        // Assigning the hash fires hashchange, which runs route() once. Calling
+        // route() here as well double-fetches candidates and races the target
+        // selection, so let the hashchange handler do it.
         location.hash = "#/reproduction";
-        if (location.hash === "#/reproduction") route();
       });
       actionContainer.appendChild(reproduceButton);
       const editButton = document.createElement("button");

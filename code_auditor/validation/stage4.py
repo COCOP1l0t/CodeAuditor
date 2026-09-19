@@ -10,6 +10,16 @@ _REQUIRED_KEYS = ["id", "title", "location", "data_flow_trace", "cwe_id", "vulne
 _DATA_FLOW_TRACE_KEYS = ["entry_point", "propagation_chain", "neutralizing_checks", "sink"]
 
 
+def _is_blank(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict, tuple, set)):
+        return not value
+    return False
+
+
 def validate_stage4_file(file_path: str) -> list[ValidationIssue]:
     content, issues = read_file_or_issues(file_path)
     if issues:
@@ -47,30 +57,37 @@ def validate_stage4_file(file_path: str) -> list[ValidationIssue]:
                 expected=f'The JSON object must contain "{key}".',
                 fix=f'Add "{key}" to the JSON object.',
             ))
+        elif key != "cvss_score" and _is_blank(data[key]):
+            # A present-but-empty value is not a real data flow / trigger / CWE
+            # and would otherwise collapse distinct findings onto one dedupe key.
+            validation_issues.append(ValidationIssue(
+                description=f'Required key "{key}" must not be blank.',
+                expected=f'A non-empty "{key}" value.',
+                fix=f'Populate "{key}" with the evaluated finding data.',
+            ))
 
     trace = data.get("data_flow_trace")
-    if trace is not None:
-        if not isinstance(trace, dict):
-            validation_issues.append(ValidationIssue(
-                description='"data_flow_trace" must be a JSON object.',
-                expected="A JSON object with keys: entry_point, propagation_chain, neutralizing_checks, sink.",
-                fix='Set "data_flow_trace" to a JSON object with the required subfields.',
-            ))
-        else:
-            for subkey in _DATA_FLOW_TRACE_KEYS:
-                if subkey not in trace:
-                    validation_issues.append(ValidationIssue(
-                        description=f'"data_flow_trace" is missing required key: "{subkey}".',
-                        expected=f'"data_flow_trace" must contain "{subkey}".',
-                        fix=f'Add "{subkey}" to the "data_flow_trace" object.',
-                    ))
-            chain = trace.get("propagation_chain")
-            if chain is not None and not isinstance(chain, list):
+    if isinstance(trace, dict):
+        for subkey in _DATA_FLOW_TRACE_KEYS:
+            if subkey not in trace:
                 validation_issues.append(ValidationIssue(
-                    description='"propagation_chain" must be a JSON array.',
-                    expected="A JSON array of strings describing each hop in the data flow.",
-                    fix='Set "propagation_chain" to a JSON array of strings.',
+                    description=f'"data_flow_trace" is missing required key: "{subkey}".',
+                    expected=f'"data_flow_trace" must contain "{subkey}".',
+                    fix=f'Add "{subkey}" to the "data_flow_trace" object.',
                 ))
+        chain = trace.get("propagation_chain")
+        if chain is not None and not isinstance(chain, list):
+            validation_issues.append(ValidationIssue(
+                description='"propagation_chain" must be a JSON array.',
+                expected="A JSON array of strings describing each hop in the data flow.",
+                fix='Set "propagation_chain" to a JSON array of strings.',
+            ))
+    elif not _is_blank(trace):
+        validation_issues.append(ValidationIssue(
+            description='"data_flow_trace" must be a JSON object.',
+            expected="A JSON object with keys: entry_point, propagation_chain, neutralizing_checks, sink.",
+            fix='Set "data_flow_trace" to a JSON object with the required subfields.',
+        ))
 
     cvss_raw = data.get("cvss_score")
     if cvss_raw is not None:

@@ -42,11 +42,13 @@ class ReviewedCleanupError(ValueError):
 
 def _is_disposable_directory_name(name: str) -> bool:
     lowered = name.lower()
+    # Deliberately token-anchored: a bare ``-build-`` substring matched real
+    # source directories such as ``pre-build-hooks`` or ``my-build-tools`` and
+    # would have deleted them once the plan was applied.
     return (
         lowered in DISPOSABLE_DIRECTORY_NAMES
         or lowered.startswith(("build-", "build_", "cmake-build-", "pip-"))
         or lowered.endswith("-build")
-        or "-build-" in lowered
     )
 
 
@@ -232,14 +234,20 @@ def _artifact_cleanup_candidates(
     return candidates
 
 
-def _manifest_paths(artifact: Path) -> set[Path]:
+def _manifest_paths(artifact: Path) -> set[Path] | None:
+    """Retained paths for an artifact, or None when its manifest is invalid.
+
+    A manifest that fails validation means the retained payload cannot be
+    enumerated; callers must treat the whole artifact as protected rather than
+    dropping protection for files it still lists.
+    """
     manifest_path = artifact / RETAIN_MANIFEST_FILENAME
     if not manifest_path.exists():
         return set()
     try:
         manifest = load_retain_manifest(artifact)
     except RetentionError:
-        return {manifest_path.resolve()}
+        return None
     paths = {manifest_path.resolve()}
     paths.update((artifact / item.path).resolve() for item in manifest.files)
     return paths
@@ -295,9 +303,17 @@ def build_reviewed_cleanup_report(
 
         if artifacts and all(state[3] == "eligible_non_unreviewed" for state in artifact_states):
             shared_protected = set(registered_paths)
+            manifests_valid = True
             for _vuln_id, _kind, artifact, _gate, _statuses in artifact_states:
-                shared_protected.update(_manifest_paths(artifact))
-            for name in (".poc-worktree", "toolchain"):
+                manifest_paths = _manifest_paths(artifact)
+                if manifest_paths is None:
+                    # One unreadable manifest means the retained payload of an
+                    # artifact in this output cannot be enumerated; do not
+                    # offer the shared directories for deletion.
+                    manifests_valid = False
+                    break
+                shared_protected.update(manifest_paths)
+            for name in (".poc-worktree", "toolchain") if manifests_valid else ():
                 target = output / name
                 if target.is_dir() and not target.is_symlink():
                     item = {
@@ -321,7 +337,29 @@ def build_reviewed_cleanup_report(
         for vuln_id, kind, artifact, gate, statuses in artifact_states:
             if gate != "eligible_non_unreviewed":
                 continue
-            protected = registered_paths | _manifest_paths(artifact)
+            manifest_paths = _manifest_paths(artifact)
+            if manifest_paths is None:
+                # Fail closed: an invalid manifest must not let cleanup delete
+                # the retained payload it still references.
+                blocked_targets.append(
+                    {
+                        "path": str(artifact.resolve()),
+                        "scope": "artifact",
+                        "output": str(output),
+                        "vuln_id": vuln_id,
+                        "artifact": str(artifact),
+                        "artifact_kind": kind,
+                        "review_statuses": statuses,
+                        "blockers": [
+                            {
+                                "type": "invalid_retain_manifest",
+                                "path": str(artifact / RETAIN_MANIFEST_FILENAME),
+                            }
+                        ],
+                    }
+                )
+                continue
+            protected = registered_paths | manifest_paths
             for target in _artifact_cleanup_candidates(artifact, kind=kind):
                 item = {
                     "path": str(target.resolve()),

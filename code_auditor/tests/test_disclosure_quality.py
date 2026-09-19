@@ -43,6 +43,19 @@ def test_cvss_checks_wrapped_score_and_reordered_vector() -> None:
     assert report_score_errors(text.replace("8.1", "9.8")) == []
 
 
+def test_cvss_ignores_unlabelled_decimals_near_the_vector() -> None:
+    # A section number in the same paragraph is not a written CVSS score.
+    assert report_score_errors("AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\nSee section 4.2.") == []
+    assert (
+        report_score_errors(
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\nSee section 4.2."
+        )
+        == []
+    )
+    # A genuine mislabeled score is still reported.
+    assert report_score_errors("CVSS v3.1: 4.2\n\nAV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+
+
 def _package(base: Path, *, report: str | None = None) -> None:
     text = report or (
         "# Example report\n\n## Summary\nExample.\n\n"

@@ -33,6 +33,8 @@ from .poc_artifacts import (
     TRIGGER_GRAPH_FILENAME,
     load_asan_report,
     load_trigger_graph,
+    resolve_stage5_report_path,
+    stage5_vuln_id,
 )
 from .repos import DEFAULT_REPOS_DIR, capture_repo_identity, list_cloned_repos
 from .retention import RetentionError, load_retain_manifest
@@ -41,7 +43,11 @@ from .reproduction_status import (
     REPRODUCED_STATUSES,
     read_reproduction_status,
 )
-from .utils import natural_sort_key, path_is_within
+from .utils import (
+    is_nonfatal_sandbox_cleanup_error,
+    natural_sort_key,
+    path_is_within,
+)
 
 DEFAULT_DB_PATH = os.path.join("~", ".code_auditor", "audits.db")
 
@@ -440,6 +446,8 @@ def _has_local_disclosure_report(artifacts: list[dict[str, Any]]) -> bool:
 
 def _stage5_terminal_paths(
     artifacts: list[dict[str, Any]],
+    *,
+    root: str | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Resolve a registered Stage 5 report to its output and PoC directories."""
     for artifact in artifacts:
@@ -449,12 +457,14 @@ def _stage5_terminal_paths(
         if not isinstance(path, str) or not path:
             continue
         report_file = os.path.realpath(os.path.expanduser(path))
+        if root and not path_is_within(report_file, root):
+            continue
         poc_dir = os.path.dirname(report_file)
         stage5_dir = os.path.dirname(poc_dir)
         vuln_id = os.path.basename(poc_dir)
         if (
             os.path.basename(stage5_dir) != "stage5-pocs"
-            or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", vuln_id) is None
+            or stage5_vuln_id(vuln_id) is None
             or not os.path.isfile(report_file)
         ):
             continue
@@ -464,33 +474,13 @@ def _stage5_terminal_paths(
 
 def _registered_stage5_report(output_dir: str, report_value: object) -> str | None:
     """Resolve a reproduced PoC report only when it is still on disk."""
-    if not output_dir:
-        return None
-    if not isinstance(report_value, str) or not report_value or "\x00" in report_value:
-        return None
-    root = os.path.realpath(os.path.expanduser(output_dir))
-    if not root:
-        return None
-    resolved = os.path.realpath(
-        report_value
-        if os.path.isabs(report_value)
-        else os.path.join(root, report_value)
-    )
-    if not path_is_within(resolved, root) or not os.path.isfile(resolved):
-        return None
-    report = Path(resolved)
-    if (
-        report.name != "report.md"
-        or report.parent.parent.name != "stage5-pocs"
-        or report.parent.name.endswith("_fp")
-        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", report.parent.name) is None
-    ):
-        return None
-    return resolved
+    return resolve_stage5_report_path(output_dir, report_value)
 
 
 def _stage6_terminal_paths(
     artifacts: list[dict[str, Any]],
+    *,
+    root: str | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Resolve a retained Stage 6 reproducer to its disclosure directory."""
     for artifact in artifacts:
@@ -500,6 +490,8 @@ def _stage6_terminal_paths(
         if not isinstance(path, str) or not path:
             continue
         report_file = os.path.realpath(os.path.expanduser(path))
+        if root and not path_is_within(report_file, root):
+            continue
         disclosure_dir = os.path.dirname(report_file)
         vuln_dir = os.path.dirname(disclosure_dir)
         stage6_dir = os.path.dirname(vuln_dir)
@@ -530,9 +522,13 @@ def _stage6_terminal_paths(
 
 def _terminal_paths(
     artifacts: list[dict[str, Any]],
+    *,
+    root: str | None = None,
 ) -> tuple[str, str, str, str] | None:
     """Prefer a portable Stage 6 reproducer, with legacy Stage 5 fallback."""
-    return _stage6_terminal_paths(artifacts) or _stage5_terminal_paths(artifacts)
+    return _stage6_terminal_paths(artifacts, root=root) or _stage5_terminal_paths(
+        artifacts, root=root
+    )
 
 
 def _retained_stage6_evidence(
@@ -1105,7 +1101,13 @@ class AuditStore:
 
     @staticmethod
     def _clear_nonconfirmed_cve_links(conn: sqlite3.Connection) -> None:
-        """Enforce that only confirmed Disclosures can own CVE links."""
+        """Enforce that only confirmed Disclosures can own CVE links.
+
+        A ``dedupe_key`` is only unique per project, so the owning Disclosure is
+        matched on ``(project, dedupe_key)`` using the project of the CVE that
+        owns the link. Without the project predicate a link could be justified
+        by an unrelated project's disclosure that happens to share the key.
+        """
         conn.execute(
             """
             DELETE FROM cve_links
@@ -1113,6 +1115,10 @@ class AuditStore:
                 SELECT 1 FROM disclosed_bugs
                 WHERE disclosed_bugs.dedupe_key = cve_links.dedupe_key
                   AND disclosed_bugs.review_status = 'confirmed'
+                  AND disclosed_bugs.deleted_at IS NULL
+                  AND disclosed_bugs.project = (
+                      SELECT project FROM cves WHERE cves.cve_id = cve_links.cve_id
+                  )
             )
             """
         )
@@ -1836,25 +1842,9 @@ class AuditStore:
     @staticmethod
     def _maintenance_report_path(output_dir: str, value: object) -> str | None:
         """Resolve a Stage 5 report for either a reproduced or FP outcome."""
-        if not isinstance(value, str) or not value or "\x00" in value:
-            return None
-        root = os.path.realpath(os.path.expanduser(output_dir or ""))
-        if not root:
-            return None
-        resolved = os.path.realpath(
-            value if os.path.isabs(value) else os.path.join(root, value)
+        return resolve_stage5_report_path(
+            output_dir, value, allow_false_positive=True
         )
-        if not path_is_within(resolved, root) or not os.path.isfile(resolved):
-            return None
-        report = Path(resolved)
-        poc_dir = report.parent
-        if (
-            report.name != "report.md"
-            or poc_dir.parent.name != "stage5-pocs"
-            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}(?:_fp)?", poc_dir.name)
-        ):
-            return None
-        return resolved
 
     def repair_maintenance_statuses(self, *, apply: bool = False) -> dict[str, Any]:
         """Reconcile stale PoC-backfill lifecycle rows using later evidence.
@@ -1971,12 +1961,7 @@ class AuditStore:
                 # Docker's asynchronous removal race is non-fatal when the
                 # affected task already left a valid report. Do not hide any
                 # other task error behind this normalization.
-                lowered = error.casefold()
-                cleanup_race = (
-                    "cannot remove sandbox container" in lowered
-                    and "already in progress" in lowered
-                )
-                if status == RUN_DONE and cleanup_race:
+                if status == RUN_DONE and is_nonfatal_sandbox_cleanup_error(error):
                     affected = error.split(":", 1)[0].strip().split("/")[-1]
                     if self._maintenance_report_path(
                         str(row["output_dir"] or ""), data["pocs"].get(affected)
@@ -2301,23 +2286,36 @@ class AuditStore:
             if latest_mtime is None or mtime > latest_mtime:
                 latest_mtime = mtime
         with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO runs (
-                    target, output_dir, status, started_at, ended_at,
-                    duration_known, created_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?)
-                """,
-                (
-                    target,
-                    output_dir,
-                    RUN_IMPORTED,
-                    started_at,
-                    latest_mtime,
-                    time.time(),
-                ),
-            )
-            run_id = int(cursor.lastrowid)
+            # Importing the same directory twice must not create two History
+            # rows (and duplicated artifact counts); reuse the existing row.
+            existing = conn.execute(
+                "SELECT id FROM runs WHERE output_dir = ? ORDER BY id LIMIT 1",
+                (output_dir,),
+            ).fetchone()
+            if existing is not None:
+                run_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE runs SET ended_at = COALESCE(?, ended_at) WHERE id = ?",
+                    (latest_mtime, run_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO runs (
+                        target, output_dir, status, started_at, ended_at,
+                        duration_known, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                    """,
+                    (
+                        target,
+                        output_dir,
+                        RUN_IMPORTED,
+                        started_at,
+                        latest_mtime,
+                        time.time(),
+                    ),
+                )
+                run_id = int(cursor.lastrowid)
         identity = capture_repo_identity(target)
         if identity["commit"]:
             self.set_run_identity(run_id, identity)
@@ -2543,6 +2541,15 @@ class AuditStore:
     ) -> None:
         """Upsert Stage 6 records directly into the Web Disclosure catalogue."""
         output_root = os.path.realpath(output_dir)
+        run_row = conn.execute(
+            "SELECT repo_name, repo_url, target FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        fallback_name = str(run_row["repo_name"] or "") if run_row else ""
+        fallback_target = str(run_row["target"] or "") if run_row else ""
+        run_project = _project_name_from_repo_url(
+            str(run_row["repo_url"] or "") if run_row else "",
+            fallback_name or os.path.basename(os.path.realpath(fallback_target or output_root)),
+        )
 
         def resolved_file(path: str | None) -> str | None:
             if not path or "\x00" in path:
@@ -2564,11 +2571,12 @@ class AuditStore:
             JOIN vulnerabilities v ON v.dedupe_key = b.dedupe_key
             JOIN pocs p ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
             WHERE v.run_id = ? AND (? IS NULL OR v.vuln_id = ?)
+              AND b.project = ?
               AND b.deleted_at IS NULL
               AND b.review_status = 'unreviewed'
               AND p.status != 'reproduced'
             """,
-            (run_id, vuln_id, vuln_id),
+            (run_id, vuln_id, vuln_id, run_project),
         ).fetchall()
         for bad in bad_rows:
             if bad["status"] not in FAILED_STATUSES:
@@ -2576,7 +2584,8 @@ class AuditStore:
                 continue
             alternatives = conn.execute(
                 """
-                SELECT r.output_dir, p.report_path, d.report_path AS disclosure_report
+                SELECT r.output_dir, r.repo_name, r.repo_url, r.target,
+                       p.report_path, d.report_path AS disclosure_report
                 FROM vulnerabilities v JOIN runs r ON r.id = v.run_id
                 JOIN pocs p ON p.run_id = v.run_id AND p.vuln_id = v.vuln_id
                 LEFT JOIN disclosures d ON d.run_id = v.run_id AND d.vuln_id = v.vuln_id
@@ -2586,6 +2595,19 @@ class AuditStore:
             ).fetchall()
             retained_success = False
             for alternative in alternatives:
+                # The key is only unique per project; another project's
+                # reproduced record must not keep this one out of triage.
+                alternative_project = _project_name_from_repo_url(
+                    alternative["repo_url"] or "",
+                    alternative["repo_name"]
+                    or os.path.basename(
+                        os.path.realpath(
+                            alternative["target"] or alternative["output_dir"]
+                        )
+                    ),
+                )
+                if alternative_project != run_project:
+                    continue
                 root = Path(alternative["output_dir"]).resolve()
                 for name in ("report_path", "disclosure_report"):
                     raw = alternative[name]
@@ -3565,7 +3587,9 @@ class AuditStore:
             report_file = registered_file(value)
             if report_file:
                 artifacts.append({"label": label, "path": report_file})
-        terminal_paths = _terminal_paths(artifacts)
+        terminal_paths = _terminal_paths(
+            artifacts, root=self.managed_results_dir
+        )
         if terminal_paths is None or terminal_paths[0] != output_dir:
             return None
         candidate["poc_dir"] = terminal_paths[1]
@@ -3743,16 +3767,27 @@ class AuditStore:
     def import_cve(self, record: dict[str, Any]) -> dict[str, Any]:
         """Create or replace one CVE explicitly linked to local disclosures."""
         dedupe_keys = list(dict.fromkeys(record.get("dedupe_keys") or []))
-        available = {
-            entry["dedupe_key"]: entry for entry in self.list_cve_import_candidates()
-        }
+        # A dedupe_key is only unique per project; collect every candidate so an
+        # ambiguous key is rejected instead of silently binding the CVE to
+        # another project's disclosure.
+        available: dict[str, list[dict[str, Any]]] = {}
+        for entry in self.list_cve_import_candidates():
+            available.setdefault(entry["dedupe_key"], []).append(entry)
         missing = [key for key in dedupe_keys if key not in available]
         if not dedupe_keys or missing:
             raise ValueError(
                 "Every selected vulnerability must be confirmed and have a local "
                 "Stage 6 disclosure report."
             )
-        selected = [available[key] for key in dedupe_keys]
+        selected: list[dict[str, Any]] = []
+        for key in dedupe_keys:
+            entries = available[key]
+            projects = {entry["project"].casefold() for entry in entries}
+            if len(projects) != 1:
+                raise ValueError(
+                    "Vulnerability identity is ambiguous across projects: " + key
+                )
+            selected.append(entries[0])
         project_names = {entry["project"].casefold() for entry in selected}
         if len(project_names) != 1:
             raise ValueError("All selected vulnerabilities must belong to one project.")
@@ -3810,7 +3845,8 @@ class AuditStore:
     def list_cves(self, project: str | None = None) -> list[dict]:
         """Return manually imported CVEs backed by local disclosure reports."""
         local_disclosures = {
-            entry["dedupe_key"]: entry for entry in self.list_cve_import_candidates()
+            (entry["project"].casefold(), entry["dedupe_key"]): entry
+            for entry in self.list_cve_import_candidates()
         }
         with self._connect() as conn:
             if project:
@@ -3820,11 +3856,14 @@ class AuditStore:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM cves").fetchall()
+            cve_projects = {
+                row["cve_id"]: str(row["project"] or "").casefold() for row in rows
+            }
             links = conn.execute("SELECT cve_id, dedupe_key FROM cve_links").fetchall()
             candidates = conn.execute(
                 """
                 SELECT l.cve_id, v.run_id, v.vuln_id, v.title, v.dedupe_key,
-                       r.repo_name, r."commit", r.output_dir,
+                       r.repo_name, r.repo_url, r.target, r."commit", r.output_dir,
                        p.report_path AS poc_report_path
                 FROM cve_links l
                 JOIN vulnerabilities v ON v.dedupe_key = l.dedupe_key
@@ -3838,12 +3877,26 @@ class AuditStore:
 
         keys_by_cve: dict[str, list[str]] = {}
         for link in links:
-            if link["dedupe_key"] in local_disclosures:
+            cve_project = cve_projects.get(link["cve_id"], "")
+            if (cve_project, link["dedupe_key"]) in local_disclosures:
                 keys_by_cve.setdefault(link["cve_id"], []).append(link["dedupe_key"])
         pocs_by_cve: dict[str, list[dict]] = {}
         seen_pocs: set[tuple[str, int, str]] = set()
         for raw in candidates:
             item = dict(raw)
+            # Only attach PoCs from the CVE's own project; a shared dedupe_key
+            # must not pull in another project's runs.
+            candidate_project = _project_name_from_repo_url(
+                item.get("repo_url") or "",
+                item.get("repo_name")
+                or os.path.basename(
+                    os.path.realpath(item.get("target") or item["output_dir"])
+                ),
+            ).casefold()
+            item.pop("repo_url", None)
+            item.pop("target", None)
+            if candidate_project != cve_projects.get(item["cve_id"], ""):
+                continue
             identity = (item["cve_id"], item["run_id"], item["vuln_id"])
             if identity in seen_pocs:
                 continue
@@ -3861,9 +3914,10 @@ class AuditStore:
                 item["references"] = []
             item.pop("updated_at", None)
             item["dedupe_keys"] = keys_by_cve.get(item["cve_id"], [])
-            item["project"] = local_disclosures[item["dedupe_keys"][0]]["project"]
+            item_project = str(item["project"] or "").casefold()
             item["local_disclosures"] = [
-                local_disclosures[key] for key in item["dedupe_keys"]
+                local_disclosures[(item_project, key)]
+                for key in item["dedupe_keys"]
             ]
             item["confirmed_disclosures"] = [
                 entry
@@ -3977,7 +4031,9 @@ class AuditStore:
                 artifacts = json.loads(row.pop("artifact_links") or "[]")
             except (json.JSONDecodeError, TypeError):
                 artifacts = []
-            terminal_paths = _terminal_paths(artifacts)
+            terminal_paths = _terminal_paths(
+            artifacts, root=self.managed_results_dir
+        )
             row["has_disclosure_report"] = _has_local_disclosure_report(artifacts)
             row["artifacts"] = [
                 {"index": index, "label": artifact.get("label") or "Artifact"}
@@ -4146,6 +4202,7 @@ class AuditStore:
                 SELECT dedupe_key, title, location, cwe,
                        vulnerability_class, trigger, summary
                 FROM disclosed_bugs
+                WHERE deleted_at IS NULL
                 ORDER BY project, id
                 """
             ).fetchall()
@@ -4172,7 +4229,9 @@ class AuditStore:
             return None
         if not isinstance(artifacts, list):
             return None
-        terminal_paths = _terminal_paths(artifacts)
+        terminal_paths = _terminal_paths(
+            artifacts, root=self.managed_results_dir
+        )
         if terminal_paths is None:
             return None
         output_dir, poc_dir, report_file, vuln_id = terminal_paths
@@ -4261,7 +4320,13 @@ class AuditStore:
             )
             if cursor.rowcount > 0 and status != "confirmed":
                 conn.execute(
-                    "DELETE FROM cve_links WHERE dedupe_key = ?", (dedupe_key,)
+                    """
+                    DELETE FROM cve_links WHERE dedupe_key = ?
+                      AND cve_id IN (
+                          SELECT cve_id FROM cves WHERE lower(project) = lower(?)
+                      )
+                    """,
+                    (dedupe_key, project),
                 )
                 conn.execute(
                     """
@@ -4353,7 +4418,13 @@ class AuditStore:
             )
             if normalized_cve_ids is not None:
                 conn.execute(
-                    "DELETE FROM cve_links WHERE dedupe_key = ?", (dedupe_key,)
+                    """
+                    DELETE FROM cve_links WHERE dedupe_key = ?
+                      AND cve_id IN (
+                          SELECT cve_id FROM cves WHERE lower(project) = lower(?)
+                      )
+                    """,
+                    (dedupe_key, project),
                 )
                 conn.executemany(
                     "INSERT INTO cve_links (cve_id, dedupe_key) VALUES (?, ?)",

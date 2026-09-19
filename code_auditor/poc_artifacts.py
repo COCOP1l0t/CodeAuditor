@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
+
+from .utils import path_is_within
 
 TRIGGER_GRAPH_FILENAME = "trigger-graph.json"
 ASAN_REPORT_FILENAME = "asan-report.txt"
@@ -13,6 +16,68 @@ MAX_TRIGGER_GRAPH_BYTES = 2 * 1024 * 1024
 MAX_ASAN_REPORT_BYTES = 8 * 1024 * 1024
 MAX_TRIGGER_GRAPH_NODES = 128
 MAX_TRIGGER_GRAPH_EDGES = 256
+
+STAGE5_POCS_DIRNAME = "stage5-pocs"
+FALSE_POSITIVE_SUFFIX = "_fp"
+_VULN_DIR_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
+
+
+def stage5_vuln_id(
+    dir_name: str, *, allow_false_positive: bool = False
+) -> str | None:
+    """Return the vulnerability id for a ``stage5-pocs`` child directory name.
+
+    ``FalsePositiveSuffix`` names are rejected unless the caller explicitly
+    accepts false-positive outcomes, so a normalized ``<vuln_id>_fp`` directory
+    can never masquerade as a reproduced PoC.
+    """
+    is_false_positive = dir_name.endswith(FALSE_POSITIVE_SUFFIX)
+    if is_false_positive and not allow_false_positive:
+        return None
+    candidate = (
+        dir_name[: -len(FALSE_POSITIVE_SUFFIX)] if is_false_positive else dir_name
+    )
+    if not candidate or _VULN_DIR_RE.fullmatch(candidate) is None:
+        return None
+    return candidate
+
+
+def resolve_stage5_report_path(
+    output_dir: str | None,
+    value: object,
+    *,
+    allow_false_positive: bool = False,
+) -> str | None:
+    """Resolve a retained ``stage5-pocs/<vuln_id>[_fp]/report.md``.
+
+    An empty root is rejected explicitly because ``realpath("")`` resolves to
+    the process CWD; paths that escape the run root, contain NUL bytes, or use
+    a malformed vulnerability directory are also rejected. The returned path is
+    only produced when the report still exists on disk.
+    """
+    if not output_dir:
+        return None
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    root = os.path.realpath(os.path.expanduser(output_dir))
+    if not root or not os.path.isdir(root):
+        return None
+    resolved = os.path.realpath(
+        value if os.path.isabs(value) else os.path.join(root, value)
+    )
+    if not path_is_within(resolved, root):
+        return None
+    report = Path(resolved)
+    if report.name != "report.md" or report.parent.parent.name != STAGE5_POCS_DIRNAME:
+        return None
+    if (
+        stage5_vuln_id(
+            report.parent.name, allow_false_positive=allow_false_positive
+        )
+        is None
+    ):
+        return None
+    return resolved if os.path.isfile(resolved) else None
 
 TRIGGER_GRAPH_NODE_ROLES = {
     "trigger",
@@ -245,7 +310,7 @@ def load_trigger_graph(
         data = json.loads(graph_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None, [f"missing {TRIGGER_GRAPH_FILENAME}"]
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         return None, [f"cannot read {TRIGGER_GRAPH_FILENAME}: {exc}"]
     errors = validate_trigger_graph_data(
         data, expected_finding_id=expected_finding_id

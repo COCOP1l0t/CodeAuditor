@@ -726,6 +726,92 @@ def test_reproduction_source_never_crosses_project_on_legacy_dedupe_collision(
     assert second_candidate is not None and second_candidate["run_id"] == second_run
 
 
+def test_cve_links_stay_scoped_to_the_owning_project(tmp_path) -> None:
+    """A shared dedupe_key must not leak CVE links or PoCs across projects."""
+    first_out = _make_disclosure_output(tmp_path / "alpha")
+    second_out = _make_disclosure_output(tmp_path / "beta")
+    store = AuditStore(str(tmp_path / "history.db"), managed_results_dir=str(tmp_path))
+    first_run = store.record_run(
+        AuditConfig(target=str(tmp_path / "alpha"), output_dir=str(first_out)),
+        status=RUN_DONE,
+    )
+    second_run = store.record_run(
+        AuditConfig(target=str(tmp_path / "beta"), output_dir=str(second_out)),
+        status=RUN_DONE,
+    )
+    with store._connect() as conn:
+        key = conn.execute(
+            "SELECT dedupe_key FROM disclosed_bugs WHERE project = 'alpha'"
+        ).fetchone()["dedupe_key"]
+        # Force the legacy collision: both projects own the same key.
+        conn.execute(
+            "UPDATE vulnerabilities SET dedupe_key = ? WHERE run_id = ?",
+            (key, second_run),
+        )
+        conn.execute(
+            "UPDATE disclosed_bugs SET dedupe_key = ? WHERE project = 'beta'",
+            (key,),
+        )
+
+    assert store.set_disclosed_status("alpha", key, "confirmed")
+    store.import_cve(
+        {
+            "cve_id": "CVE-2026-12345",
+            "cve_url": "https://www.cve.org/CVERecord?id=CVE-2026-12345",
+            "dedupe_keys": [key],
+        }
+    )
+
+    cves = store.list_cves()
+    assert [cve["cve_id"] for cve in cves] == ["CVE-2026-12345"]
+    assert cves[0]["project"] == "alpha"
+    # PoCs must come only from the CVE's own project.
+    assert {poc["run_id"] for poc in cves[0]["pocs"]} == {first_run}
+
+    # Rejecting the other project's identically-keyed disclosure must not
+    # delete the link that belongs to the confirmed alpha disclosure.
+    assert store.set_disclosed_status("beta", key, "rejected")
+    assert [cve["cve_id"] for cve in store.list_cves()] == ["CVE-2026-12345"]
+
+
+def test_import_cve_rejects_an_ambiguous_cross_project_key(tmp_path) -> None:
+    first_out = _make_disclosure_output(tmp_path / "alpha")
+    second_out = _make_disclosure_output(tmp_path / "beta")
+    store = AuditStore(str(tmp_path / "history.db"), managed_results_dir=str(tmp_path))
+    store.record_run(
+        AuditConfig(target=str(tmp_path / "alpha"), output_dir=str(first_out)),
+        status=RUN_DONE,
+    )
+    second_run = store.record_run(
+        AuditConfig(target=str(tmp_path / "beta"), output_dir=str(second_out)),
+        status=RUN_DONE,
+    )
+    with store._connect() as conn:
+        key = conn.execute(
+            "SELECT dedupe_key FROM disclosed_bugs WHERE project = 'alpha'"
+        ).fetchone()["dedupe_key"]
+        conn.execute(
+            "UPDATE vulnerabilities SET dedupe_key = ? WHERE run_id = ?",
+            (key, second_run),
+        )
+        conn.execute(
+            "UPDATE disclosed_bugs SET dedupe_key = ? WHERE project = 'beta'",
+            (key,),
+        )
+    assert store.set_disclosed_status("alpha", key, "confirmed")
+    assert store.set_disclosed_status("beta", key, "confirmed")
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        store.import_cve(
+            {
+                "cve_id": "CVE-2026-54321",
+                "cve_url": "https://www.cve.org/CVERecord?id=CVE-2026-54321",
+                "dedupe_keys": [key],
+            }
+        )
+
+
+
 def test_finish_run_updates_status_and_scans(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))

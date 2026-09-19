@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
@@ -14,6 +15,27 @@ from ..wiki import build_wiki_context
 
 logger = get_logger("stage2")
 _TASK_KEY = "stage2"
+_AU_FILENAME = re.compile(r"^AU-\d+\.json$")
+
+
+def _clear_existing_units(result_dir: str) -> None:
+    """Remove stale Stage 2 artifacts before a full re-run.
+
+    The agent overwrites AU-1..AU-N but never deletes higher-numbered files, so
+    leftovers from an earlier run would otherwise survive as extra analysis
+    units and be merged with the new set.
+    """
+    try:
+        names = os.listdir(result_dir)
+    except OSError:
+        return
+    for name in names:
+        if name != "triage.json" and not _AU_FILENAME.match(name):
+            continue
+        try:
+            os.remove(os.path.join(result_dir, name))
+        except OSError:
+            continue
 
 
 async def run_stage2(
@@ -73,6 +95,8 @@ async def run_stage2(
         )
 
     logger.info("Stage 2: Starting codebase decomposition (target AU count: %d).", config.target_au_count)
+    # A fresh full run must not merge with stale files from a previous attempt.
+    _clear_existing_units(result_dir)
 
     scope_modules, hot_spots = parse_auditing_focus(auditing_focus_path)
     if config.target_au_count <= 0:
@@ -119,12 +143,16 @@ async def run_stage2(
 
     units = parse_au_files(result_dir)
     if issues:
-        # Do not checkpoint invalid output: leaving the marker unset lets a
-        # resume re-run Stage 2 instead of feeding malformed units downstream.
+        # Do not checkpoint invalid output or feed malformed units downstream:
+        # leaving the marker unset lets a resume re-run Stage 2, and returning
+        # nothing makes the orchestrator fail the run loudly instead of
+        # dispatching Stage 3 agents against invalid analysis units.
         logger.error(
-            "Stage 2 finished with validation issues; not marking it complete."
+            "Stage 2 finished with validation issues; not marking it complete "
+            "and discarding %d unvalidated unit(s).",
+            len(units),
         )
-        return units
+        return []
     checkpoint.mark_complete(_TASK_KEY)
     logger.info("Stage 2 complete. Analysis units: %s", ", ".join(u.id for u in units))
     return units

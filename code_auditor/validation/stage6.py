@@ -100,7 +100,8 @@ def validate_stage6_disclosure(disclosure_dir: str) -> list[ValidationIssue]:
         for section in required:
             key = section.casefold()
             if key == "reproduction" and key not in sections:
-                key = "reproduction steps"
+                # The prompt's nested heading is "Steps to Reproduce".
+                key = "steps to reproduce"
             if key not in sections:
                 issue(f"Missing required section in disclosure report: {section}")
             elif not sections[key]:

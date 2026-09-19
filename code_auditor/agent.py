@@ -724,6 +724,54 @@ def _patch_codex_sdk_service_tier_compat(app_server_client_cls: type[Any]) -> No
     app_server_client_cls._request_raw = patched_request_raw
 
 
+async def _run_with_retries(
+    attempt: Callable[[], Coroutine[Any, Any, str]],
+    log_fh: TextIO | None,
+    *,
+    label: str,
+) -> str:
+    """Run one backend attempt with bounded retries and exponential backoff.
+
+    Shared by the Claude and Codex backends: a fresh attempt is retried up to
+    ``AGENT_MAX_RETRIES`` times, retryable failures back off exponentially, and
+    a non-retryable failure (quota/auth/model) fails fast without retrying.
+    """
+    last_exc: Exception | None = None
+    for attempt_index in range(AGENT_MAX_RETRIES):
+        try:
+            if log_fh and attempt_index > 0:
+                log_fh.write(f"\n--- retry attempt {attempt_index + 1} ---\n\n")
+                log_fh.flush()
+            return await attempt()
+        except Exception as exc:
+            last_exc = exc
+            if _is_non_retryable_agent_error(exc):
+                logger.error(
+                    "%s call failed with a non-retryable error: %s", label, exc
+                )
+                raise
+            if attempt_index < AGENT_MAX_RETRIES - 1:
+                delay = AGENT_RETRY_BASE_DELAY * (2 ** attempt_index)
+                logger.warning(
+                    "%s call failed (attempt %d/%d), retrying in %ds: %s",
+                    label,
+                    attempt_index + 1,
+                    AGENT_MAX_RETRIES,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(
+                    "%s call failed after %d attempts: %s",
+                    label,
+                    AGENT_MAX_RETRIES,
+                    exc,
+                )
+
+    raise last_exc  # type: ignore[misc]
+
+
 async def _run_claude_agent(
     prompt: str,
     config: AuditConfig,
@@ -781,158 +829,138 @@ async def _run_claude_agent(
 
     log_fh = _open_agent_log(log_file)
 
-    last_exc: Exception | None = None
     try:
-        for attempt in range(AGENT_MAX_RETRIES):
+        async def collect_messages(parts: list[str]) -> str:
+            token = _AGENT_PROCESS_REGISTRAR.set(run_control.register_process)
+            tool_names: dict[str, str] = {}
+            last_system_activity_at: dict[str, float] = {}
+            result_error: list[bool] = []
             try:
-                text_parts: list[str] = []
-                if log_fh and attempt > 0:
-                    log_fh.write(f"\n--- retry attempt {attempt + 1} ---\n\n")
-                    log_fh.flush()
-
-                async def collect_messages(parts: list[str]) -> str:
-                    token = _AGENT_PROCESS_REGISTRAR.set(run_control.register_process)
-                    tool_names: dict[str, str] = {}
-                    last_system_activity_at: dict[str, float] = {}
-                    result_error: list[bool] = []
-                    try:
-                        async for message in query(prompt=prompt, options=options):
-                            if message is None:
-                                continue
-                            content = getattr(message, "content", None)
-                            if isinstance(content, list):
-                                for block in content:
-                                    text = getattr(block, "text", None)
-                                    if isinstance(text, str) and text:
-                                        parts.append(text)
-                                        if log_fh:
-                                            log_fh.write(text)
-                                            log_fh.write("\n")
-                                            log_fh.flush()
-                                        _record_agent_activity(
-                                            None,
-                                            f"Response: {_compact_agent_activity(text)}",
-                                        )
-                                        continue
-
-                                    tool_name = getattr(block, "name", None)
-                                    tool_input = getattr(block, "input", None)
-                                    tool_id = getattr(block, "id", None)
-                                    if isinstance(tool_name, str) and tool_name:
-                                        if isinstance(tool_id, str):
-                                            tool_names[tool_id] = tool_name
-                                        detail = _tool_input_summary(tool_name, tool_input)
-                                        _record_agent_activity(
-                                            log_fh,
-                                            f"Started {tool_name}"
-                                            + (f": {detail}" if detail else ""),
-                                        )
-                                        continue
-
-                                    tool_use_id = getattr(block, "tool_use_id", None)
-                                    if isinstance(tool_use_id, str):
-                                        completed_tool = tool_names.get(
-                                            tool_use_id, "tool call"
-                                        )
-                                        outcome = (
-                                            "failed"
-                                            if getattr(block, "is_error", False)
-                                            else "completed"
-                                        )
-                                        _record_agent_activity(
-                                            log_fh,
-                                            f"{completed_tool} {outcome}",
-                                        )
-
-                            message_type = type(message).__name__
-                            if message_type == "SystemMessage":
-                                subtype = _compact_agent_activity(
-                                    getattr(message, "subtype", "session"), 100
-                                )
-                                activity = AGENT_NOISY_SYSTEM_EVENTS.get(subtype)
-                                if activity:
-                                    now = time.monotonic()
-                                    last_activity = last_system_activity_at.get(
-                                        subtype, 0.0
-                                    )
-                                    if (
-                                        now - last_activity
-                                        < AGENT_SYSTEM_ACTIVITY_INTERVAL_SECONDS
-                                    ):
-                                        continue
-                                    last_system_activity_at[subtype] = now
-                                    _record_agent_activity(log_fh, activity)
-                                else:
-                                    _record_agent_activity(
-                                        log_fh, f"Session event: {subtype}"
-                                    )
-                            elif message_type == "ResultMessage":
-                                record_agent_usage(
-                                    config,
-                                    getattr(message, "usage", None),
-                                    getattr(message, "total_cost_usd", None),
-                                )
-                                turns = getattr(message, "num_turns", None)
-                                duration_ms = getattr(message, "duration_ms", None)
-                                is_error = bool(getattr(message, "is_error", False))
-                                result_parts = [
-                                    "Agent result",
-                                    "error" if is_error else "complete",
-                                ]
-                                if turns is not None:
-                                    result_parts.append(f"turns={turns}")
-                                if duration_ms is not None:
-                                    result_parts.append(
-                                        f"duration={float(duration_ms) / 1000:.1f}s"
-                                    )
+                async for message in query(prompt=prompt, options=options):
+                    if message is None:
+                        continue
+                    content = getattr(message, "content", None)
+                    if isinstance(content, list):
+                        for block in content:
+                            text = getattr(block, "text", None)
+                            if isinstance(text, str) and text:
+                                parts.append(text)
+                                if log_fh:
+                                    log_fh.write(text)
+                                    log_fh.write("\n")
+                                    log_fh.flush()
                                 _record_agent_activity(
-                                    log_fh, " ".join(result_parts)
+                                    None,
+                                    f"Response: {_compact_agent_activity(text)}",
                                 )
-                                if is_error:
-                                    result_error.append(True)
-                        if result_error:
-                            # An error ResultMessage (e.g. API 429 quota
-                            # exhaustion) must not be treated as success:
-                            # callers would mark the task complete and skip it
-                            # on resume with no usable output.
-                            tail = _compact_agent_activity(" ".join(parts), 500)
-                            raise RuntimeError(
-                                "Agent ended with an error result: "
-                                + (tail or "no error output")
+                                continue
+
+                            tool_name = getattr(block, "name", None)
+                            tool_input = getattr(block, "input", None)
+                            tool_id = getattr(block, "id", None)
+                            if isinstance(tool_name, str) and tool_name:
+                                if isinstance(tool_id, str):
+                                    tool_names[tool_id] = tool_name
+                                detail = _tool_input_summary(tool_name, tool_input)
+                                _record_agent_activity(
+                                    log_fh,
+                                    f"Started {tool_name}"
+                                    + (f": {detail}" if detail else ""),
+                                )
+                                continue
+
+                            tool_use_id = getattr(block, "tool_use_id", None)
+                            if isinstance(tool_use_id, str):
+                                completed_tool = tool_names.get(
+                                    tool_use_id, "tool call"
+                                )
+                                outcome = (
+                                    "failed"
+                                    if getattr(block, "is_error", False)
+                                    else "completed"
+                                )
+                                _record_agent_activity(
+                                    log_fh,
+                                    f"{completed_tool} {outcome}",
+                                )
+
+                    message_type = type(message).__name__
+                    if message_type == "SystemMessage":
+                        subtype = _compact_agent_activity(
+                            getattr(message, "subtype", "session"), 100
+                        )
+                        activity = AGENT_NOISY_SYSTEM_EVENTS.get(subtype)
+                        if activity:
+                            now = time.monotonic()
+                            last_activity = last_system_activity_at.get(
+                                subtype, 0.0
                             )
-                        return "\n".join(parts)
-                    except Exception as exc:
-                        if result_error:
-                            # The SDK often raises a ProcessError carrying a
-                            # debug-level stderr dump right after an error
-                            # ResultMessage; the agent's own error text is far
-                            # more useful for diagnosing the failure.
-                            tail = _compact_agent_activity(" ".join(parts), 500)
-                            raise RuntimeError(
-                                "Agent ended with an error result: "
-                                + (tail or "no error output")
-                            ) from exc
-                        raise
-                    finally:
-                        _AGENT_PROCESS_REGISTRAR.reset(token)
-
-                return await collect_messages(text_parts)
-            except Exception as exc:
-                last_exc = exc
-                if _is_non_retryable_agent_error(exc):
-                    logger.error("Agent call failed with a non-retryable error: %s", exc)
-                    raise
-                if attempt < AGENT_MAX_RETRIES - 1:
-                    delay = AGENT_RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "Agent call failed (attempt %d/%d), retrying in %ds: %s",
-                        attempt + 1, AGENT_MAX_RETRIES, delay, exc,
+                            if (
+                                now - last_activity
+                                < AGENT_SYSTEM_ACTIVITY_INTERVAL_SECONDS
+                            ):
+                                continue
+                            last_system_activity_at[subtype] = now
+                            _record_agent_activity(log_fh, activity)
+                        else:
+                            _record_agent_activity(
+                                log_fh, f"Session event: {subtype}"
+                            )
+                    elif message_type == "ResultMessage":
+                        record_agent_usage(
+                            config,
+                            getattr(message, "usage", None),
+                            getattr(message, "total_cost_usd", None),
+                        )
+                        turns = getattr(message, "num_turns", None)
+                        duration_ms = getattr(message, "duration_ms", None)
+                        is_error = bool(getattr(message, "is_error", False))
+                        result_parts = [
+                            "Agent result",
+                            "error" if is_error else "complete",
+                        ]
+                        if turns is not None:
+                            result_parts.append(f"turns={turns}")
+                        if duration_ms is not None:
+                            result_parts.append(
+                                f"duration={float(duration_ms) / 1000:.1f}s"
+                            )
+                        _record_agent_activity(
+                            log_fh, " ".join(result_parts)
+                        )
+                        if is_error:
+                            result_error.append(True)
+                if result_error:
+                    # An error ResultMessage (e.g. API 429 quota
+                    # exhaustion) must not be treated as success:
+                    # callers would mark the task complete and skip it
+                    # on resume with no usable output.
+                    tail = _compact_agent_activity(" ".join(parts), 500)
+                    raise RuntimeError(
+                        "Agent ended with an error result: "
+                        + (tail or "no error output")
                     )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error("Agent call failed after %d attempts: %s", AGENT_MAX_RETRIES, exc)
+                return "\n".join(parts)
+            except Exception as exc:
+                if result_error:
+                    # The SDK often raises a ProcessError carrying a
+                    # debug-level stderr dump right after an error
+                    # ResultMessage; the agent's own error text is far
+                    # more useful for diagnosing the failure.
+                    tail = _compact_agent_activity(" ".join(parts), 500)
+                    raise RuntimeError(
+                        "Agent ended with an error result: "
+                        + (tail or "no error output")
+                    ) from exc
+                raise
+            finally:
+                _AGENT_PROCESS_REGISTRAR.reset(token)
 
-        raise last_exc  # type: ignore[misc]
+        async def attempt() -> str:
+            text_parts: list[str] = []
+            return await collect_messages(text_parts)
+
+        return await _run_with_retries(attempt, log_fh, label="Agent")
     finally:
         if log_fh and not log_fh.closed:
             log_fh.close()
@@ -1014,158 +1042,135 @@ async def _run_codex_agent(
 
     log_fh = _open_agent_log(log_file)
     run_control = run_control or _AgentRunControl()
-    last_exc: Exception | None = None
     try:
-        for attempt in range(AGENT_MAX_RETRIES):
-            try:
-                if log_fh and attempt > 0:
-                    log_fh.write(f"\n--- retry attempt {attempt + 1} ---\n\n")
-                    log_fh.flush()
-
-                async def run_codex_turn() -> str:
-                    app_server_values: dict[str, Any] = dict(
-                        codex_bin=codex_bin,
+        async def run_codex_turn() -> str:
+            app_server_values: dict[str, Any] = dict(
+                codex_bin=codex_bin,
+                cwd=cwd,
+                env=run_control.subprocess_env(),
+            )
+            if sandbox is not None:
+                app_server_values["env"].update(sandbox.wrapper_env(cwd))
+            if config.provider_mode == "custom":
+                base_url, api_key = _custom_provider_values(config)
+                app_server_values["config_overrides"] = (
+                    'model_provider="codeauditor"',
+                    'model_providers.codeauditor.name="CodeAuditor custom provider"',
+                    f"model_providers.codeauditor.base_url={json.dumps(base_url)}",
+                    'model_providers.codeauditor.env_key="CODEAUDITOR_PROVIDER_API_KEY"',
+                    'model_providers.codeauditor.wire_api="responses"',
+                )
+                app_server_values["env"][
+                    "CODEAUDITOR_PROVIDER_API_KEY"
+                ] = api_key
+            app_server_config = codex_sdk.app_server_config_cls(
+                **app_server_values
+            )
+            async with codex_sdk.async_codex_cls(config=app_server_config) as codex:
+                codex_client = getattr(codex, "_client", None)
+                sync_client = getattr(codex_client, "_sync", None)
+                run_control.register_process(getattr(sync_client, "_proc", None))
+                if codex_sdk.flavor == "openai_codex":
+                    thread = await codex.thread_start(
+                        approval_mode=approval_setting,
                         cwd=cwd,
-                        env=run_control.subprocess_env(),
+                        model=selected_model,
+                        service_tier="flex",
                     )
-                    if sandbox is not None:
-                        app_server_values["env"].update(sandbox.wrapper_env(cwd))
-                    if config.provider_mode == "custom":
-                        base_url, api_key = _custom_provider_values(config)
-                        app_server_values["config_overrides"] = (
-                            'model_provider="codeauditor"',
-                            'model_providers.codeauditor.name="CodeAuditor custom provider"',
-                            f"model_providers.codeauditor.base_url={json.dumps(base_url)}",
-                            'model_providers.codeauditor.env_key="CODEAUDITOR_PROVIDER_API_KEY"',
-                            'model_providers.codeauditor.wire_api="responses"',
-                        )
-                        app_server_values["env"][
-                            "CODEAUDITOR_PROVIDER_API_KEY"
-                        ] = api_key
-                    app_server_config = codex_sdk.app_server_config_cls(
-                        **app_server_values
+                    turn = await thread.turn(
+                        prompt,
+                        approval_mode=approval_setting,
+                        cwd=cwd,
+                        effort=codex_effort,
+                        model=selected_model,
+                        sandbox_policy=sandbox_policy,
                     )
-                    async with codex_sdk.async_codex_cls(config=app_server_config) as codex:
-                        codex_client = getattr(codex, "_client", None)
-                        sync_client = getattr(codex_client, "_sync", None)
-                        run_control.register_process(getattr(sync_client, "_proc", None))
-                        if codex_sdk.flavor == "openai_codex":
-                            thread = await codex.thread_start(
-                                approval_mode=approval_setting,
-                                cwd=cwd,
-                                model=selected_model,
-                                service_tier="flex",
-                            )
-                            turn = await thread.turn(
-                                prompt,
-                                approval_mode=approval_setting,
-                                cwd=cwd,
-                                effort=codex_effort,
-                                model=selected_model,
-                                sandbox_policy=sandbox_policy,
-                            )
-                        else:
-                            thread = await codex.thread_start(
-                                approval_policy=approval_setting,
-                                cwd=cwd,
-                                model=selected_model,
-                                service_tier="flex",
-                            )
-                            turn_input = (
-                                codex_sdk.text_input_cls(prompt)
-                                if codex_sdk.text_input_cls is not None
-                                else prompt
-                            )
-                            turn = await thread.turn(
-                                turn_input,
-                                approval_policy=approval_setting,
-                                cwd=cwd,
-                                effort=codex_effort,
-                                model=selected_model,
-                                sandbox_policy=sandbox_policy,
-                            )
-
-                        stream = turn.stream()
-                        completed = None
-                        text_parts: list[str] = []
-                        token_usage: dict[str, Any] | None = None
-                        try:
-                            async for event in stream:
-                                payload = event.payload
-                                if event.method.lower().endswith("tokenusage/updated"):
-                                    token_usage = _codex_usage_dict(payload) or token_usage
-                                activity = _codex_item_activity(
-                                    event.method, payload
-                                )
-                                if activity:
-                                    _record_agent_activity(log_fh, activity)
-                                if (
-                                    event.method == "item/agentMessage/delta"
-                                    and getattr(payload, "turn_id", None) == turn.id
-                                ):
-                                    delta = getattr(payload, "delta", "")
-                                    if delta:
-                                        text_parts.append(delta)
-                                        if log_fh:
-                                            log_fh.write(delta)
-                                            log_fh.flush()
-                                    continue
-                                if (
-                                    event.method == "turn/completed"
-                                    and getattr(getattr(payload, "turn", None), "id", None) == turn.id
-                                ):
-                                    completed = payload
-                        finally:
-                            await stream.aclose()
-
-                        if completed is None:
-                            raise RuntimeError("turn completed event not received")
-
-                        turn_obj = getattr(completed, "turn", None)
-                        if turn_obj is not None:
-                            status = getattr(turn_obj, "status", None)
-                            status_val = getattr(status, "value", str(status)) if status else ""
-                            # The SDK's TurnStatus is completed | interrupted |
-                            # failed | in_progress. Anything but ``completed``
-                            # (for example an interrupted turn) must not be
-                            # reported as a successful agent invocation.
-                            if status_val and status_val != "completed":
-                                error = getattr(turn_obj, "error", None)
-                                error_msg = getattr(error, "message", "") if error else ""
-                                if error_msg:
-                                    raise RuntimeError(error_msg)
-                                raise RuntimeError(
-                                    f"turn ended with status {status_val}"
-                                )
-                        if token_usage is None and turn_obj is not None:
-                            token_usage = _codex_usage_dict(
-                                getattr(turn_obj, "usage", None)
-                            )
-                        # Codex reports tokens but no dollar cost.
-                        record_agent_usage(config, token_usage, None)
-
-                        if log_fh:
-                            log_fh.write("\n")
-                            log_fh.flush()
-                        return "".join(text_parts)
-
-                return await run_codex_turn()
-            except Exception as exc:
-                last_exc = exc
-                if _is_non_retryable_agent_error(exc):
-                    logger.error("Codex agent call failed with a non-retryable error: %s", exc)
-                    raise
-                if attempt < AGENT_MAX_RETRIES - 1:
-                    delay = AGENT_RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "Codex agent call failed (attempt %d/%d), retrying in %ds: %s",
-                        attempt + 1, AGENT_MAX_RETRIES, delay, exc,
-                    )
-                    await asyncio.sleep(delay)
                 else:
-                    logger.error("Codex agent call failed after %d attempts: %s", AGENT_MAX_RETRIES, exc)
+                    thread = await codex.thread_start(
+                        approval_policy=approval_setting,
+                        cwd=cwd,
+                        model=selected_model,
+                        service_tier="flex",
+                    )
+                    turn_input = (
+                        codex_sdk.text_input_cls(prompt)
+                        if codex_sdk.text_input_cls is not None
+                        else prompt
+                    )
+                    turn = await thread.turn(
+                        turn_input,
+                        approval_policy=approval_setting,
+                        cwd=cwd,
+                        effort=codex_effort,
+                        model=selected_model,
+                        sandbox_policy=sandbox_policy,
+                    )
 
-        raise last_exc  # type: ignore[misc]
+                stream = turn.stream()
+                completed = None
+                text_parts: list[str] = []
+                token_usage: dict[str, Any] | None = None
+                try:
+                    async for event in stream:
+                        payload = event.payload
+                        if event.method.lower().endswith("tokenusage/updated"):
+                            token_usage = _codex_usage_dict(payload) or token_usage
+                        activity = _codex_item_activity(
+                            event.method, payload
+                        )
+                        if activity:
+                            _record_agent_activity(log_fh, activity)
+                        if (
+                            event.method == "item/agentMessage/delta"
+                            and getattr(payload, "turn_id", None) == turn.id
+                        ):
+                            delta = getattr(payload, "delta", "")
+                            if delta:
+                                text_parts.append(delta)
+                                if log_fh:
+                                    log_fh.write(delta)
+                                    log_fh.flush()
+                            continue
+                        if (
+                            event.method == "turn/completed"
+                            and getattr(getattr(payload, "turn", None), "id", None) == turn.id
+                        ):
+                            completed = payload
+                finally:
+                    await stream.aclose()
+
+                if completed is None:
+                    raise RuntimeError("turn completed event not received")
+
+                turn_obj = getattr(completed, "turn", None)
+                if turn_obj is not None:
+                    status = getattr(turn_obj, "status", None)
+                    status_val = getattr(status, "value", str(status)) if status else ""
+                    # The SDK's TurnStatus is completed | interrupted |
+                    # failed | in_progress. Anything but ``completed``
+                    # (for example an interrupted turn) must not be
+                    # reported as a successful agent invocation.
+                    if status_val and status_val != "completed":
+                        error = getattr(turn_obj, "error", None)
+                        error_msg = getattr(error, "message", "") if error else ""
+                        if error_msg:
+                            raise RuntimeError(error_msg)
+                        raise RuntimeError(
+                            f"turn ended with status {status_val}"
+                        )
+                if token_usage is None and turn_obj is not None:
+                    token_usage = _codex_usage_dict(
+                        getattr(turn_obj, "usage", None)
+                    )
+                # Codex reports tokens but no dollar cost.
+                record_agent_usage(config, token_usage, None)
+
+                if log_fh:
+                    log_fh.write("\n")
+                    log_fh.flush()
+                return "".join(text_parts)
+
+        return await _run_with_retries(run_codex_turn, log_fh, label="Codex agent")
     finally:
         if log_fh and not log_fh.closed:
             log_fh.close()

@@ -243,8 +243,72 @@ async function loadAgentSettings() {
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   agentSettings = data;
   updateAgentSettingsSummary();
+  renderSecretKeyRow();
   return data;
 }
+
+// ── Provider encryption key backup ──────────────────────────────────────────
+const secretKeyDialog = $("secret-key-dialog");
+
+function renderSecretKeyRow() {
+  const info = (agentSettings && agentSettings.secret_key) || {};
+  $("s-secret-key-row").hidden = !info.file_available;
+}
+
+async function acknowledgeSecretKeyBackup() {
+  const res = await fetch("/api/settings/secret-key/backup-ack", {
+    method: "POST",
+  });
+  if (res.ok) {
+    const data = await res.json();
+    if (agentSettings) agentSettings.secret_key = data.secret_key;
+    renderSecretKeyRow();
+  }
+  return res.ok;
+}
+
+async function downloadSecretKeyFile() {
+  const errorBox = $("secret-key-error");
+  errorBox.textContent = "";
+  try {
+    const res = await fetch("/api/settings/secret-key", { cache: "no-store" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+    const text = await res.text();
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "code-auditor-secret-key.key";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    // Downloading the file is the backup action; stop prompting for this key.
+    await acknowledgeSecretKeyBackup();
+    secretKeyDialog.close();
+  } catch (error) {
+    errorBox.textContent = `Could not download the key: ${error.message || error}`;
+  }
+}
+
+function maybePromptSecretKeyBackup(info) {
+  if (!info || !info.prompt_required) return;
+  $("secret-key-path").textContent =
+    "The key file stays on the server; keep your downloaded copy somewhere safe.";
+  $("secret-key-error").textContent = "";
+  if (!secretKeyDialog.open) secretKeyDialog.showModal();
+}
+
+$("btn-secret-key-download").addEventListener("click", downloadSecretKeyFile);
+$("btn-download-secret-key").addEventListener("click", downloadSecretKeyFile);
+$("btn-secret-key-ack").addEventListener("click", async () => {
+  await acknowledgeSecretKeyBackup();
+  secretKeyDialog.close();
+});
+$("btn-secret-key-later").addEventListener("click", () => secretKeyDialog.close());
 
 function renderAgentSettingsForm() {
   if (!agentSettings) return;
@@ -386,6 +450,7 @@ $("settings-form").addEventListener("submit", async (event) => {
     }
     agentSettings = data;
     updateAgentSettingsSummary();
+    renderSecretKeyRow();
     const updatedJobs = Number(data.active_jobs_updated || 0);
     if (updatedJobs > 0) {
       $("agent-settings-summary").textContent +=
@@ -395,6 +460,10 @@ $("settings-form").addEventListener("submit", async (event) => {
       }, 5000);
     }
     settingsDialog.close();
+    // A newly created key file must be backed up before it is relied upon.
+    if (data.secret_key_created) {
+      maybePromptSecretKeyBackup(data.secret_key);
+    }
   } catch (error) {
     errorBox.textContent = `Failed to save settings: ${error.message || error}`;
   } finally {
@@ -5066,6 +5135,9 @@ async function startApplication() {
   ]);
   await refreshJobSnapshot();
   route();
+  // Ask for a key-file backup when the key was created without an interactive
+  // save (for example by migrating a legacy settings.json provider).
+  if (agentSettings) maybePromptSecretKeyBackup(agentSettings.secret_key);
   await Promise.all([loadRepos(), loadWikis(), refreshTrashCount()]);
   connectGlobalJobEvents();
   initScrollTopButton();

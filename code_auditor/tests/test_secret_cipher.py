@@ -130,3 +130,59 @@ def test_secret_key_env_override_avoids_a_key_file(
 
     assert not key_path.exists()
     assert store.get_provider_settings()["claude"]["api_key"] == "env-secret"
+
+
+def test_created_flag_and_backup_acknowledgement(tmp_path: Path) -> None:
+    key_path = tmp_path / "provider.key"
+    cipher = SecretCipher(str(key_path))
+
+    assert cipher.created is False
+    cipher.encrypt("first")
+    assert cipher.created is True
+    assert cipher.key_file_exists() is True
+    assert cipher.backup_acknowledged() is False
+
+    assert cipher.acknowledge_backup() is True
+    assert cipher.backup_acknowledged() is True
+    # Reusing the same key keeps the acknowledgement valid.
+    SecretCipher(str(key_path)).encrypt("second")
+    assert SecretCipher(str(key_path)).backup_acknowledged() is True
+
+
+def test_replacing_the_key_invalidates_the_backup_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    key_path = tmp_path / "provider.key"
+    cipher = SecretCipher(str(key_path))
+    cipher.encrypt("first")
+    cipher.acknowledge_backup()
+    assert cipher.backup_acknowledged() is True
+
+    # Rotate the key behind CodeAuditor's back.
+    key_path.write_bytes(Fernet.generate_key())
+    rotated = SecretCipher(str(key_path))
+    assert rotated.backup_acknowledged() is False
+
+
+def test_save_provider_settings_reports_key_creation(tmp_path: Path) -> None:
+    store = AuditStore(str(tmp_path / "audits.db"))
+    first = store.save_provider_settings(
+        "claude",
+        mode="custom",
+        base_url="https://models.example.test/v1",
+        api_key="one",
+        model="m",
+    )
+    second = store.save_provider_settings(
+        "claude",
+        mode="custom",
+        base_url="https://models.example.test/v1",
+        api_key="two",
+        model="m",
+    )
+    assert first is True
+    assert second is False
+    assert store.secret_key_info()["prompt_required"] is True
+    assert store.acknowledge_secret_key_backup() is True
+    assert store.secret_key_info()["prompt_required"] is False
+

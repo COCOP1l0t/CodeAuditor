@@ -1026,8 +1026,11 @@ class AuditStore:
         base_url: str,
         api_key: str,
         model: str,
-    ) -> None:
+    ) -> bool:
+        """Persist a provider. Returns True when this call created the key file."""
+        created_before = self._secret_cipher.created
         encrypted_key = self._secret_cipher.encrypt(api_key)
+        created_now = self._secret_cipher.created and not created_before
         with self._connect() as conn:
             conn.execute(
                 """
@@ -1043,6 +1046,33 @@ class AuditStore:
                 """,
                 (backend, mode, base_url, encrypted_key, model, time.time()),
             )
+        return created_now
+
+    def secret_key_info(self) -> dict[str, object]:
+        """Describe the provider encryption key for the Web settings UI."""
+        if self._secret_cipher.uses_env_key:
+            return {
+                "external": True,
+                "file_available": False,
+                "backup_acknowledged": True,
+                "prompt_required": False,
+            }
+        available = self._secret_cipher.key_file_exists()
+        acknowledged = available and self._secret_cipher.backup_acknowledged()
+        return {
+            "external": False,
+            "file_available": available,
+            "backup_acknowledged": acknowledged,
+            "prompt_required": available and not acknowledged,
+        }
+
+    def read_secret_key(self) -> str | None:
+        """Return the managed key file text for download, or None if unavailable."""
+        return self._secret_cipher.read_key_text()
+
+    def acknowledge_secret_key_backup(self) -> bool:
+        """Record that the operator stored the key file; False when not managed."""
+        return self._secret_cipher.acknowledge_backup()
 
     def create_auth_session(
         self,

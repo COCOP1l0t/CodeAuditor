@@ -1052,7 +1052,44 @@ def create_app(
 
     @app.get("/api/settings")
     def get_agent_settings() -> dict:
-        return settings.public_agent_settings()
+        return {
+            **settings.public_agent_settings(),
+            "secret_key": store.secret_key_info(),
+        }
+
+    @app.get("/api/settings/secret-key")
+    def download_secret_key() -> Response:
+        """Download the managed provider encryption key for offline backup."""
+        key_text = store.read_secret_key()
+        if key_text is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No managed encryption key file is available. The key is "
+                    "either provided by CODE_AUDITOR_SECRET_KEY or has not "
+                    "been created yet."
+                ),
+            )
+        return Response(
+            key_text + "\n",
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": (
+                    'attachment; filename="code-auditor-secret-key.key"'
+                ),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/settings/secret-key/backup-ack")
+    def acknowledge_secret_key_backup() -> dict:
+        """Record that the operator stored the encryption key file."""
+        if not store.acknowledge_secret_key_backup():
+            raise HTTPException(
+                status_code=404,
+                detail="No managed encryption key file is available to acknowledge.",
+            )
+        return {"secret_key": store.secret_key_info()}
 
     @app.get("/api/dashboard")
     def get_dashboard() -> dict:
@@ -1116,7 +1153,7 @@ def create_app(
         app.state.web_settings = settings
         provider = settings.provider()
         # Provider credentials live in the database, never in settings.json.
-        await asyncio.to_thread(
+        secret_key_created = await asyncio.to_thread(
             store.save_provider_settings,
             settings.backend,
             mode=provider.mode,
@@ -1133,6 +1170,8 @@ def create_app(
         )
         response = settings.public_agent_settings()
         response["active_jobs_updated"] = len(switched_jobs)
+        response["secret_key_created"] = bool(secret_key_created)
+        response["secret_key"] = store.secret_key_info()
         return response
 
     @app.post("/api/audit", status_code=202)

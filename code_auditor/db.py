@@ -282,6 +282,14 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_digest);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS provider_settings (
+    backend TEXT PRIMARY KEY CHECK(backend IN ('claude', 'codex')),
+    mode TEXT NOT NULL DEFAULT 'local' CHECK(mode IN ('local', 'custom')),
+    base_url TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    updated_at REAL
+);
 """
 
 _OUTPUT_DIR_DATE_RE = re.compile(r"audit-output-(\d{4})(\d{2})(\d{2})")
@@ -939,6 +947,54 @@ class AuditStore:
             conn.execute(
                 "UPDATE users SET last_login_at = ? WHERE id = ?",
                 (time.time() if now is None else now, user_id),
+            )
+
+    # ── Agent provider settings ───────────────────────────────────────────
+
+    def get_provider_settings(self) -> dict[str, dict[str, str]]:
+        """Return any explicitly configured custom provider per backend.
+
+        Provider credentials live in the database rather than settings.json so
+        the local CLI configuration stays authoritative and the API key is not
+        written to a world-readable config file.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT backend, mode, base_url, api_key, model FROM provider_settings"
+            ).fetchall()
+        return {
+            str(row["backend"]): {
+                "mode": str(row["mode"] or "local"),
+                "base_url": str(row["base_url"] or ""),
+                "api_key": str(row["api_key"] or ""),
+                "model": str(row["model"] or ""),
+            }
+            for row in rows
+        }
+
+    def save_provider_settings(
+        self,
+        backend: str,
+        *,
+        mode: str,
+        base_url: str,
+        api_key: str,
+        model: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_settings (
+                    backend, mode, base_url, api_key, model, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(backend) DO UPDATE SET
+                    mode = excluded.mode,
+                    base_url = excluded.base_url,
+                    api_key = excluded.api_key,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (backend, mode, base_url, api_key, model, time.time()),
             )
 
     def create_auth_session(

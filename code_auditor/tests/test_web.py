@@ -1749,8 +1749,13 @@ def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> N
     assert body["providers"]["codex"]["api_key_configured"] is True
     assert body["active_jobs_updated"] == 0
     assert "secret-key" not in saved.text
+    # The API key is persisted in the database, never in settings.json.
     stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    assert stored["providers"]["codex"]["api_key"] == "secret-key"
+    assert "providers" not in stored
+    assert "secret-key" not in json.dumps(stored)
+    provider_row = app.state.store.get_provider_settings()["codex"]
+    assert provider_row["api_key"] == "secret-key"
+    assert provider_row["mode"] == "custom"
 
     preserved = client.put(
         "/api/settings",

@@ -197,34 +197,42 @@ def local_codex_model(config_path: str | None = None) -> str | None:
     return None
 
 
+def _default_model(backend: AgentBackend) -> str:
+    return DEFAULT_CODEX_MODEL if backend == "codex" else DEFAULT_CLAUDE_MODEL
+
+
+def _default_poc_model(backend: AgentBackend) -> str:
+    return DEFAULT_CODEX_POC_MODEL if backend == "codex" else DEFAULT_CLAUDE_POC_MODEL
+
+
 def resolve_agent_model(config: AuditConfig, model: str | None = None) -> str:
     """Resolve the effective model id for one agent invocation.
 
-    Priority: explicit per-call model, then the selected provider's model or
-    local CLI configuration, then the built-in backend default.
+    The local CLI configuration is authoritative for the ``local`` provider
+    mode: CodeAuditor must never override the model the operator configured in
+    ``~/.claude/settings.json`` or ``~/.codex/config.toml`` with a stored
+    value. ``config.model`` is only consulted for an explicitly configured
+    ``custom`` provider, which supplies its own endpoint and model.
     """
     if model:
         return model
-    if config.backend == "claude" and config.provider_mode == "local":
-        return local_claude_model() or config.model or DEFAULT_CLAUDE_MODEL
-    if config.backend == "codex" and config.provider_mode == "local":
-        return config.model or local_codex_model() or DEFAULT_CODEX_MODEL
+    if config.provider_mode == "custom":
+        return config.model or _default_model(config.backend)
     if config.backend == "claude":
-        return config.model or DEFAULT_CLAUDE_MODEL
-    return config.model or DEFAULT_CODEX_MODEL
+        return local_claude_model() or DEFAULT_CLAUDE_MODEL
+    return local_codex_model() or DEFAULT_CODEX_MODEL
 
 
 def select_poc_model(config: AuditConfig) -> str:
-    if config.backend == "claude" and config.provider_mode == "local":
+    if config.provider_mode == "custom":
+        return config.model or _default_poc_model(config.backend)
+    if config.backend == "claude":
         return (
-            local_claude_model(keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"))
-            or config.model
+            local_claude_model(
+                keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL")
+            )
             or DEFAULT_CLAUDE_POC_MODEL
         )
-    if config.backend == "claude":
-        return config.model or DEFAULT_CLAUDE_POC_MODEL
-    if config.model:
-        return config.model
     if config.backend == "codex":
         return local_codex_model() or DEFAULT_CODEX_POC_MODEL
     raise ValueError(f"Unsupported agent backend: {config.backend}")

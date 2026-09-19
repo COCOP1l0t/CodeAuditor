@@ -17,10 +17,13 @@ from code_auditor import agent
 from code_auditor import config as config_module
 from code_auditor.__main__ import _build_parser
 from code_auditor.config import (
+    DEFAULT_CLAUDE_MODEL,
     DEFAULT_CLAUDE_POC_MODEL,
+    DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_POC_MODEL,
     AgentBackend,
     AuditConfig,
+    resolve_agent_model,
     select_poc_model,
 )
 from code_auditor.sandbox import DockerScratch
@@ -188,16 +191,20 @@ def test_main_exits_130_on_keyboard_interrupt(
 
 
 @pytest.mark.parametrize(
-    ("backend", "config_model", "expected_model"),
+    ("backend", "provider_mode", "config_model", "expected_model"),
     [
-        ("claude", None, DEFAULT_CLAUDE_POC_MODEL),
-        ("codex", None, DEFAULT_CODEX_POC_MODEL),
-        ("claude", "custom-global-model", "custom-global-model"),
-        ("codex", "custom-global-model", "custom-global-model"),
+        ("claude", "local", None, DEFAULT_CLAUDE_POC_MODEL),
+        ("codex", "local", None, DEFAULT_CODEX_POC_MODEL),
+        # A stored model must never override the local CLI configuration.
+        ("claude", "local", "stale-stored-model", DEFAULT_CLAUDE_POC_MODEL),
+        ("codex", "local", "stale-stored-model", DEFAULT_CODEX_POC_MODEL),
+        ("claude", "custom", "custom-global-model", "custom-global-model"),
+        ("codex", "custom", "custom-global-model", "custom-global-model"),
     ],
 )
-def test_select_poc_model_prefers_global_model_override(
+def test_select_poc_model_resolution(
     backend: AgentBackend,
+    provider_mode: str,
     config_model: str | None,
     expected_model: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -205,15 +212,62 @@ def test_select_poc_model_prefers_global_model_override(
     # Isolate from the developer's real ~/.claude/settings.json.
     monkeypatch.setattr(config_module, "local_claude_model", lambda **_: None)
     monkeypatch.setattr(config_module, "local_codex_model", lambda **_: None)
-    monkeypatch.setattr(config_module, "local_codex_model", lambda **_: None)
     config = AuditConfig(
         target="/tmp/project",
         output_dir="/tmp/output",
         backend=backend,
+        provider_mode=provider_mode,  # type: ignore[arg-type]
         model=config_model,
     )
 
     assert select_poc_model(config) == expected_model
+
+
+def test_resolve_agent_model_ignores_stored_model_in_local_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local CLI configuration wins; a stored model must not override it."""
+    monkeypatch.setattr(config_module, "local_claude_model", lambda **_: None)
+    monkeypatch.setattr(config_module, "local_codex_model", lambda **_: None)
+    stored_claude = AuditConfig(
+        target="/tmp/p",
+        output_dir="/tmp/o",
+        backend="claude",
+        model="stored-claude-model",
+    )
+    stored_codex = AuditConfig(
+        target="/tmp/p",
+        output_dir="/tmp/o",
+        backend="codex",
+        model="stored-codex-model",
+    )
+    assert resolve_agent_model(stored_claude) == DEFAULT_CLAUDE_MODEL
+    assert resolve_agent_model(stored_codex) == DEFAULT_CODEX_MODEL
+
+    # A custom provider's explicit model is still used.
+    custom = AuditConfig(
+        target="/tmp/p",
+        output_dir="/tmp/o",
+        backend="codex",
+        provider_mode="custom",
+        model="custom-model",
+    )
+    assert resolve_agent_model(custom) == "custom-model"
+
+
+def test_resolve_agent_model_prefers_local_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        config_module, "local_codex_model", lambda **_: "local-codex-model"
+    )
+    config = AuditConfig(
+        target="/tmp/p",
+        output_dir="/tmp/o",
+        backend="codex",
+        model="stored-codex-model",
+    )
+    assert resolve_agent_model(config) == "local-codex-model"
 
 
 def test_select_poc_model_prefers_local_claude_config(

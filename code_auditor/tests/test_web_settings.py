@@ -138,7 +138,7 @@ def test_load_web_settings_renames_legacy_web_config(tmp_path: Path) -> None:
     assert os.stat(settings_path).st_mode & 0o777 == 0o600
 
 
-def test_update_agent_settings_persists_custom_provider_without_public_key(
+def test_update_agent_settings_keeps_credentials_out_of_settings_json(
     tmp_path: Path,
 ) -> None:
     settings = load_web_settings(str(tmp_path / "settings.json"))
@@ -163,8 +163,10 @@ def test_update_agent_settings_persists_custom_provider_without_public_key(
         "api_key_configured": True,
     }
     assert "secret-token" not in json.dumps(updated.public_agent_settings())
+    # The API key is never written to settings.json.
     stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    assert stored["providers"]["codex"]["api_key"] == "secret-token"
+    assert "providers" not in stored
+    assert "secret-token" not in json.dumps(stored)
     assert os.stat(tmp_path / "settings.json").st_mode & 0o777 == 0o600
 
     preserved = update_agent_settings(
@@ -175,6 +177,60 @@ def test_update_agent_settings_persists_custom_provider_without_public_key(
         model="secure-coder-v2",
     )
     assert preserved.codex_provider.api_key == "secret-token"
+
+
+def test_provider_credentials_round_trip_through_the_database(tmp_path: Path) -> None:
+    from code_auditor.db import AuditStore
+    from code_auditor.web.server import _apply_provider_settings
+
+    store = AuditStore(str(tmp_path / "audits.db"))
+    store.save_provider_settings(
+        "codex",
+        mode="custom",
+        base_url="https://models.example.test/v1",
+        api_key="secret-token",
+        model="secure-coder",
+    )
+
+    reloaded = load_web_settings(str(tmp_path / "settings.json"))
+    applied = _apply_provider_settings(reloaded, store)
+
+    assert applied.codex_provider.mode == "custom"
+    assert applied.codex_provider.api_key == "secret-token"
+    assert applied.codex_provider.model == "secure-coder"
+    public = applied.public_agent_settings()["providers"]["codex"]
+    assert public["api_key_configured"] is True
+    assert "secret-token" not in json.dumps(public)
+
+
+def test_legacy_settings_provider_is_migrated_into_the_database(tmp_path: Path) -> None:
+    from code_auditor.db import AuditStore
+    from code_auditor.web.server import _apply_provider_settings
+
+    config_path = tmp_path / "settings.json"
+    raw = WebSettings.for_state_dir(str(tmp_path)).serialized()
+    raw["providers"] = {
+        "claude": {},
+        "codex": {
+            "mode": "custom",
+            "base_url": "https://legacy.example.test/v1",
+            "api_key": "legacy-key",
+            "model": "legacy-model",
+        },
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    legacy = load_web_settings(str(config_path))
+    assert legacy.codex_provider.api_key == "legacy-key"
+
+    store = AuditStore(str(tmp_path / "audits.db"))
+    applied = _apply_provider_settings(legacy, store)
+
+    assert applied.codex_provider.api_key == "legacy-key"
+    stored = store.get_provider_settings()
+    assert stored["codex"]["api_key"] == "legacy-key"
+    # The credentials are stripped from settings.json after migration.
+    assert "providers" not in json.loads(config_path.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize(

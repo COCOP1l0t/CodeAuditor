@@ -13,6 +13,7 @@ import sqlite3
 import stat
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Callable, Literal
@@ -72,9 +73,11 @@ from .local_directories import (
 from .progress import install_web_log_handler
 from .settings import (
     DEFAULT_SETTINGS_PATH,
+    ModelProviderSettings,
     WebSettings,
     WebSettingsError,
     load_web_settings,
+    persist_web_settings,
     update_agent_settings,
 )
 from .terminal import serve_poc_terminal
@@ -645,6 +648,56 @@ def _cve_references(request: CveImportRequest) -> list[dict[str, str]]:
     )
 
 
+def _apply_provider_settings(settings: WebSettings, store: AuditStore) -> WebSettings:
+    """Load provider settings from SQLite, migrating any legacy settings.json copy.
+
+    The local CLI configuration remains authoritative for the ``local`` mode;
+    only an explicitly configured custom provider (endpoint + API key + model)
+    is persisted, and that lives in the database rather than settings.json.
+    """
+    stored = store.get_provider_settings()
+    migrated = False
+    providers: dict[str, ModelProviderSettings] = {}
+    for name in ("claude", "codex"):
+        row = stored.get(name)
+        if row is None:
+            legacy = settings.provider(name)
+            if legacy != ModelProviderSettings():
+                store.save_provider_settings(
+                    name,
+                    mode=legacy.mode,
+                    base_url=legacy.base_url,
+                    api_key=legacy.api_key,
+                    model=legacy.model,
+                )
+                row = {
+                    "mode": legacy.mode,
+                    "base_url": legacy.base_url,
+                    "api_key": legacy.api_key,
+                    "model": legacy.model,
+                }
+                migrated = True
+        providers[name] = ModelProviderSettings(
+            mode=row["mode"] if row else "local",  # type: ignore[arg-type]
+            base_url=row["base_url"] if row else "",
+            api_key=row["api_key"] if row else "",
+            model=row["model"] if row else "",
+        )
+    updated = replace(
+        settings,
+        claude_provider=providers["claude"],
+        codex_provider=providers["codex"],
+    )
+    if migrated:
+        try:
+            persist_web_settings(updated)
+        except OSError as exc:
+            logger.warning(
+                "Could not rewrite settings.json after provider migration: %s", exc
+            )
+    return updated
+
+
 def create_app(
     db_path: str | None = None,
     *,
@@ -656,6 +709,7 @@ def create_app(
         db_path or DEFAULT_DB_PATH,
         managed_results_dir=settings.results_dir,
     )
+    settings = _apply_provider_settings(settings, store)
 
     async def purge_disclosure_trash() -> None:
         while True:
@@ -1061,6 +1115,15 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app.state.web_settings = settings
         provider = settings.provider()
+        # Provider credentials live in the database, never in settings.json.
+        await asyncio.to_thread(
+            store.save_provider_settings,
+            settings.backend,
+            mode=provider.mode,
+            base_url=provider.base_url,
+            api_key=provider.api_key,
+            model=provider.model,
+        )
         switched_jobs = manager.hot_switch_agent_settings(
             backend=settings.backend,  # type: ignore[arg-type]
             model=provider.model if provider.mode == "custom" else None,

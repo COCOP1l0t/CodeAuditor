@@ -177,12 +177,16 @@
             API key <span class="required">*</span>
             <input id="s-api-key" type="password" maxlength="8192"
                    autocomplete="new-password" placeholder="Enter API key" />
-            <span id="s-api-key-hint" class="hint">The key is stored server-side and is never returned to the browser.</span>
+            <span id="s-api-key-hint" class="hint">The key is stored server-side encrypted at rest and is never returned to the browser.</span>
           </label>
           <label id="s-clear-key-label" class="settings-checkbox" hidden>
             <input id="s-clear-key" type="checkbox" />
             Remove the stored API key
           </label>
+        </div>
+        <div id="s-secret-key-row" class="button-row" hidden>
+          <button type="button" id="btn-download-secret-key" class="btn">Download encryption key</button>
+          <span class="hint">Back this file up; a lost key makes the stored API key undecryptable.</span>
         </div>
         <fieldset class="settings-sandbox">
           <legend>Stage 5/6 execution</legend>
@@ -227,6 +231,22 @@
           <button type="button" id="btn-settings-cancel" class="btn">Cancel</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="secret-key-dialog" aria-labelledby="secret-key-title">
+      <h2 id="secret-key-title">Back up the encryption key</h2>
+      <p>
+        A custom provider API key is stored in this server's database encrypted
+        with a key file. <strong>Download and store that file now.</strong>
+        If it is lost, the saved API key cannot be decrypted and must be
+        entered again.
+      </p>
+      <p id="secret-key-path" class="dim"></p>
+      <p id="secret-key-error" class="error" role="alert"></p>
+      <div class="button-row">
+        <button type="button" id="btn-secret-key-download" class="btn btn-start">Download key file</button>
+        <button type="button" id="btn-secret-key-ack" class="btn">I have stored it</button>
+        <button type="button" id="btn-secret-key-later" class="btn">Remind me later</button>
+      </div>
     </dialog>
     <dialog id="new-audit-dialog" aria-labelledby="new-audit-title">
     <section class="panel" id="config-panel">

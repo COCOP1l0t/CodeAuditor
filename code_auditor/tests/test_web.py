@@ -1749,8 +1749,13 @@ def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> N
     assert body["providers"]["codex"]["api_key_configured"] is True
     assert body["active_jobs_updated"] == 0
     assert "secret-key" not in saved.text
+    # The API key is persisted in the database, never in settings.json.
     stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    assert stored["providers"]["codex"]["api_key"] == "secret-key"
+    assert "providers" not in stored
+    assert "secret-key" not in json.dumps(stored)
+    provider_row = app.state.store.get_provider_settings()["codex"]
+    assert provider_row["api_key"] == "secret-key"
+    assert provider_row["mode"] == "custom"
 
     preserved = client.put(
         "/api/settings",
@@ -1763,6 +1768,94 @@ def test_api_settings_persists_provider_without_returning_api_key(tmp_path) -> N
     )
     assert preserved.status_code == 200
     assert app.state.web_settings.codex_provider.api_key == "secret-key"
+
+
+def test_api_exposes_provider_secret_key_for_backup(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    client = TestClient(app)
+
+    created = client.put(
+        "/api/settings",
+        json={
+            "backend": "codex",
+            "mode": "custom",
+            "base_url": "https://models.example.test/v1",
+            "api_key": "secret-key",
+            "model": "coder-model",
+        },
+    )
+    assert created.status_code == 200
+    body = created.json()
+    assert body["secret_key_created"] is True
+    assert body["secret_key"]["file_available"] is True
+    assert body["secret_key"]["prompt_required"] is True
+    assert body["secret_key"]["external"] is False
+
+    download = client.get("/api/settings/secret-key")
+    assert download.status_code == 200
+    assert download.headers["cache-control"] == "no-store"
+    assert "attachment" in download.headers["content-disposition"]
+    key_text = download.text.strip()
+    assert key_text
+
+    # The downloaded key is exactly the file the server encrypts with.
+    with sqlite3.connect(str(tmp_path / "history.db")) as conn:
+        stored = conn.execute(
+            "SELECT api_key FROM provider_settings WHERE backend = 'codex'"
+        ).fetchone()[0]
+    from cryptography.fernet import Fernet
+
+    assert Fernet(key_text.encode()).decrypt(stored.removeprefix("enc:v1:")) == b"secret-key"
+
+    acked = client.post("/api/settings/secret-key/backup-ack")
+    assert acked.status_code == 200
+    assert acked.json()["secret_key"]["backup_acknowledged"] is True
+    assert acked.json()["secret_key"]["prompt_required"] is False
+    assert client.get("/api/settings").json()["secret_key"]["prompt_required"] is False
+
+    # Re-saving the same provider must not claim a new key was created.
+    again = client.put(
+        "/api/settings",
+        json={
+            "backend": "codex",
+            "mode": "custom",
+            "base_url": "https://models.example.test/v1",
+            "model": "coder-model",
+        },
+    )
+    assert again.status_code == 200
+    assert again.json()["secret_key_created"] is False
+
+
+def test_api_secret_key_is_external_with_env_override(
+    tmp_path, monkeypatch
+) -> None:
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("CODE_AUDITOR_SECRET_KEY", Fernet.generate_key().decode())
+    app = create_app(
+        db_path=str(tmp_path / "history.db"),
+        web_settings=WebSettings.for_state_dir(
+            str(tmp_path), sandbox_mode="local-worktree"
+        ),
+    )
+    client = TestClient(app)
+
+    saved = client.put(
+        "/api/settings",
+        json={
+            "backend": "claude",
+            "mode": "custom",
+            "base_url": "https://models.example.test/v1",
+            "api_key": "env-key",
+            "model": "m",
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["secret_key"]["external"] is True
+    assert saved.json()["secret_key"]["prompt_required"] is False
+    assert saved.json()["secret_key_created"] is False
+    assert client.get("/api/settings/secret-key").status_code == 404
 
 
 def test_api_settings_hot_switches_active_jobs(tmp_path, monkeypatch) -> None:

@@ -113,11 +113,12 @@ class WebSettings:
                 "reproductions_dir": os.path.join(root, "reproductions"),
                 "sandbox_mode": sandbox_mode,
                 "sandbox_runtime": sandbox_runtime,
-                "providers": {"claude": {}, "codex": {}},
             },
         )
 
     def serialized(self) -> dict[str, Any]:
+        # Provider credentials and the custom model live in the database (see
+        # AuditStore.get_provider_settings); settings.json never stores them.
         return {
             "backend": self.backend,
             "log_level": self.log_level,
@@ -128,10 +129,6 @@ class WebSettings:
             "reproductions_dir": self.reproductions_dir,
             "sandbox_mode": self.sandbox_mode,
             "sandbox_runtime": self.sandbox_runtime,
-            "providers": {
-                "claude": self.claude_provider.serialized(),
-                "codex": self.codex_provider.serialized(),
-            },
         }
 
     def provider(self, backend: str | None = None) -> ModelProviderSettings:
@@ -222,7 +219,6 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
     raw.pop("discovered_path", None)
     # model is now resolved from ~/.claude/settings.json at agent call time.
     removed_model = raw.pop("model", None) is not None
-    added_providers = "providers" not in raw
     added_sandbox_mode = "sandbox_mode" not in raw
     added_sandbox_runtime = "sandbox_runtime" not in raw
     unknown = sorted(set(raw) - _CONFIG_KEYS)
@@ -231,7 +227,7 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
             f"Unknown web settings: {', '.join(unknown)}"
         )
     if (
-        removed_legacy_paths or removed_model or added_providers
+        removed_legacy_paths or removed_model
         or added_sandbox_mode or added_sandbox_runtime
     ) and not migrated_legacy_file:
         _write_settings_file(config_path, {**defaults, **raw})
@@ -287,7 +283,9 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
     ):
         managed_paths[key] = _managed_path(raw.get(key), key, state_dir)
 
-    providers = raw.get("providers")
+    # ``providers`` is optional: provider credentials now live in the database.
+    # A legacy settings.json value is still accepted so it can be migrated.
+    providers = raw.get("providers") or {}
     if not isinstance(providers, dict):
         raise WebSettingsError("providers must be a JSON object.")
     unknown_providers = sorted(set(providers) - set(_BACKENDS))
@@ -315,6 +313,12 @@ def _validate_settings(config_path: str, raw: dict[str, Any]) -> WebSettings:
         claude_provider=validated_providers["claude"],
         codex_provider=validated_providers["codex"],
     )
+
+
+def persist_web_settings(settings: WebSettings) -> None:
+    """Atomically write the non-secret settings to settings.json."""
+    _write_settings_file(settings.config_path, settings.serialized())
+    os.chmod(settings.config_path, 0o600)
 
 
 def update_agent_settings(

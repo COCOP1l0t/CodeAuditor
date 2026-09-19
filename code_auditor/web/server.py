@@ -13,6 +13,7 @@ import sqlite3
 import stat
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Callable, Literal
@@ -72,9 +73,11 @@ from .local_directories import (
 from .progress import install_web_log_handler
 from .settings import (
     DEFAULT_SETTINGS_PATH,
+    ModelProviderSettings,
     WebSettings,
     WebSettingsError,
     load_web_settings,
+    persist_web_settings,
     update_agent_settings,
 )
 from .terminal import serve_poc_terminal
@@ -645,6 +648,56 @@ def _cve_references(request: CveImportRequest) -> list[dict[str, str]]:
     )
 
 
+def _apply_provider_settings(settings: WebSettings, store: AuditStore) -> WebSettings:
+    """Load provider settings from SQLite, migrating any legacy settings.json copy.
+
+    The local CLI configuration remains authoritative for the ``local`` mode;
+    only an explicitly configured custom provider (endpoint + API key + model)
+    is persisted, and that lives in the database rather than settings.json.
+    """
+    stored = store.get_provider_settings()
+    migrated = False
+    providers: dict[str, ModelProviderSettings] = {}
+    for name in ("claude", "codex"):
+        row = stored.get(name)
+        if row is None:
+            legacy = settings.provider(name)
+            if legacy != ModelProviderSettings():
+                store.save_provider_settings(
+                    name,
+                    mode=legacy.mode,
+                    base_url=legacy.base_url,
+                    api_key=legacy.api_key,
+                    model=legacy.model,
+                )
+                row = {
+                    "mode": legacy.mode,
+                    "base_url": legacy.base_url,
+                    "api_key": legacy.api_key,
+                    "model": legacy.model,
+                }
+                migrated = True
+        providers[name] = ModelProviderSettings(
+            mode=row["mode"] if row else "local",  # type: ignore[arg-type]
+            base_url=row["base_url"] if row else "",
+            api_key=row["api_key"] if row else "",
+            model=row["model"] if row else "",
+        )
+    updated = replace(
+        settings,
+        claude_provider=providers["claude"],
+        codex_provider=providers["codex"],
+    )
+    if migrated:
+        try:
+            persist_web_settings(updated)
+        except OSError as exc:
+            logger.warning(
+                "Could not rewrite settings.json after provider migration: %s", exc
+            )
+    return updated
+
+
 def create_app(
     db_path: str | None = None,
     *,
@@ -656,6 +709,7 @@ def create_app(
         db_path or DEFAULT_DB_PATH,
         managed_results_dir=settings.results_dir,
     )
+    settings = _apply_provider_settings(settings, store)
 
     async def purge_disclosure_trash() -> None:
         while True:
@@ -998,7 +1052,44 @@ def create_app(
 
     @app.get("/api/settings")
     def get_agent_settings() -> dict:
-        return settings.public_agent_settings()
+        return {
+            **settings.public_agent_settings(),
+            "secret_key": store.secret_key_info(),
+        }
+
+    @app.get("/api/settings/secret-key")
+    def download_secret_key() -> Response:
+        """Download the managed provider encryption key for offline backup."""
+        key_text = store.read_secret_key()
+        if key_text is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No managed encryption key file is available. The key is "
+                    "either provided by CODE_AUDITOR_SECRET_KEY or has not "
+                    "been created yet."
+                ),
+            )
+        return Response(
+            key_text + "\n",
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": (
+                    'attachment; filename="code-auditor-secret-key.key"'
+                ),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/settings/secret-key/backup-ack")
+    def acknowledge_secret_key_backup() -> dict:
+        """Record that the operator stored the encryption key file."""
+        if not store.acknowledge_secret_key_backup():
+            raise HTTPException(
+                status_code=404,
+                detail="No managed encryption key file is available to acknowledge.",
+            )
+        return {"secret_key": store.secret_key_info()}
 
     @app.get("/api/dashboard")
     def get_dashboard() -> dict:
@@ -1061,6 +1152,15 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app.state.web_settings = settings
         provider = settings.provider()
+        # Provider credentials live in the database, never in settings.json.
+        secret_key_created = await asyncio.to_thread(
+            store.save_provider_settings,
+            settings.backend,
+            mode=provider.mode,
+            base_url=provider.base_url,
+            api_key=provider.api_key,
+            model=provider.model,
+        )
         switched_jobs = manager.hot_switch_agent_settings(
             backend=settings.backend,  # type: ignore[arg-type]
             model=provider.model if provider.mode == "custom" else None,
@@ -1070,6 +1170,8 @@ def create_app(
         )
         response = settings.public_agent_settings()
         response["active_jobs_updated"] = len(switched_jobs)
+        response["secret_key_created"] = bool(secret_key_created)
+        response["secret_key"] = store.secret_key_info()
         return response
 
     @app.post("/api/audit", status_code=202)

@@ -43,6 +43,11 @@ from .reproduction_status import (
     REPRODUCED_STATUSES,
     read_reproduction_status,
 )
+from .secret_cipher import (
+    ENCRYPTED_PREFIX,
+    SecretCipher,
+    SecretCipherError,
+)
 from .utils import (
     is_nonfatal_sandbox_cleanup_error,
     natural_sort_key,
@@ -282,6 +287,14 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_digest);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS provider_settings (
+    backend TEXT PRIMARY KEY CHECK(backend IN ('claude', 'codex')),
+    mode TEXT NOT NULL DEFAULT 'local' CHECK(mode IN ('local', 'custom')),
+    base_url TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    updated_at REAL
+);
 """
 
 _OUTPUT_DIR_DATE_RE = re.compile(r"audit-output-(\d{4})(\d{2})(\d{2})")
@@ -809,12 +822,20 @@ class AuditStore:
         db_path: str = DEFAULT_DB_PATH,
         *,
         managed_results_dir: str | None = None,
+        secret_key_path: str | None = None,
     ) -> None:
         self.db_path = os.path.realpath(os.path.expanduser(db_path))
         self.managed_results_dir = (
             os.path.realpath(os.path.expanduser(managed_results_dir))
             if managed_results_dir
             else None
+        )
+        # Provider API keys are encrypted at rest with a host-owned key kept
+        # beside the database (override with CODE_AUDITOR_SECRET_KEY).
+        self._secret_cipher = SecretCipher(
+            os.path.realpath(os.path.expanduser(secret_key_path))
+            if secret_key_path
+            else f"{self.db_path}.secret-key"
         )
         parent = os.path.dirname(self.db_path)
         if parent:
@@ -940,6 +961,118 @@ class AuditStore:
                 "UPDATE users SET last_login_at = ? WHERE id = ?",
                 (time.time() if now is None else now, user_id),
             )
+
+    # ── Agent provider settings ───────────────────────────────────────────
+
+    def get_provider_settings(self) -> dict[str, dict[str, str]]:
+        """Return any explicitly configured custom provider per backend.
+
+        Provider credentials live in the database rather than settings.json so
+        the local CLI configuration stays authoritative and the API key is not
+        written to a world-readable config file. The API key is decrypted for
+        the caller; a legacy plaintext row is upgraded to ciphertext in place.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT backend, mode, base_url, api_key, model FROM provider_settings"
+            ).fetchall()
+        settings: dict[str, dict[str, str]] = {}
+        legacy: list[str] = []
+        for row in rows:
+            backend = str(row["backend"])
+            stored_key = str(row["api_key"] or "")
+            if stored_key and not stored_key.startswith(ENCRYPTED_PREFIX):
+                # Written before encryption was introduced.
+                legacy.append(backend)
+                api_key = stored_key
+            else:
+                try:
+                    api_key = self._secret_cipher.decrypt(stored_key)
+                except SecretCipherError as exc:
+                    logger.warning(
+                        "Cannot decrypt the stored %s API key; re-enter it in "
+                        "the Web settings: %s",
+                        backend,
+                        exc,
+                    )
+                    api_key = ""
+            settings[backend] = {
+                "mode": str(row["mode"] or "local"),
+                "base_url": str(row["base_url"] or ""),
+                "api_key": api_key,
+                "model": str(row["model"] or ""),
+            }
+        for backend in legacy:
+            entry = settings[backend]
+            try:
+                self.save_provider_settings(
+                    backend,
+                    mode=entry["mode"],
+                    base_url=entry["base_url"],
+                    api_key=entry["api_key"],
+                    model=entry["model"],
+                )
+            except SecretCipherError as exc:
+                logger.warning(
+                    "Could not encrypt the stored %s API key: %s", backend, exc
+                )
+        return settings
+
+    def save_provider_settings(
+        self,
+        backend: str,
+        *,
+        mode: str,
+        base_url: str,
+        api_key: str,
+        model: str,
+    ) -> bool:
+        """Persist a provider. Returns True when this call created the key file."""
+        created_before = self._secret_cipher.created
+        encrypted_key = self._secret_cipher.encrypt(api_key)
+        created_now = self._secret_cipher.created and not created_before
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_settings (
+                    backend, mode, base_url, api_key, model, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(backend) DO UPDATE SET
+                    mode = excluded.mode,
+                    base_url = excluded.base_url,
+                    api_key = excluded.api_key,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (backend, mode, base_url, encrypted_key, model, time.time()),
+            )
+        return created_now
+
+    def secret_key_info(self) -> dict[str, object]:
+        """Describe the provider encryption key for the Web settings UI."""
+        if self._secret_cipher.uses_env_key:
+            return {
+                "external": True,
+                "file_available": False,
+                "backup_acknowledged": True,
+                "prompt_required": False,
+            }
+        available = self._secret_cipher.key_file_exists()
+        acknowledged = available and self._secret_cipher.backup_acknowledged()
+        return {
+            "external": False,
+            "file_available": available,
+            "backup_acknowledged": acknowledged,
+            "prompt_required": available and not acknowledged,
+        }
+
+    def read_secret_key(self) -> str | None:
+        """Return the managed key file text for download, or None if unavailable."""
+        return self._secret_cipher.read_key_text()
+
+    def acknowledge_secret_key_backup(self) -> bool:
+        """Record that the operator stored the key file; False when not managed."""
+        return self._secret_cipher.acknowledge_backup()
 
     def create_auth_session(
         self,

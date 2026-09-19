@@ -534,3 +534,38 @@ def test_reproduction_status_negation_and_affirmation() -> None:
         )
         == "reproduced"
     )
+
+
+def test_stage4_validator_enforces_the_cvss_disclosure_threshold(tmp_path) -> None:
+    def finding(cvss: object):
+        path = tmp_path / f"finding-{cvss}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "id": "H-01",
+                    "title": "Length underflow reaches memcpy",
+                    "location": "src/parser.c:parse_packet",
+                    "data_flow_trace": {
+                        "entry_point": "src/net.c:read_packet",
+                        "propagation_chain": ["len - header_size"],
+                        "neutralizing_checks": "none",
+                        "sink": "memcpy",
+                    },
+                    "cwe_id": ["CWE-191"],
+                    "vulnerability_class": ["integer underflow"],
+                    "trigger": "Send a packet shorter than the header.",
+                    "cvss_score": cvss,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    below = validate_stage4_file(str(finding("3.9")))
+    assert any("below the 4.0" in issue.description for issue in below)
+
+    at_threshold = validate_stage4_file(str(finding("4.0")))
+    assert not any("4.0" in issue.description for issue in at_threshold)
+
+    missing_value = validate_stage4_file(str(finding(None)))
+    assert any("numeric value" in issue.description for issue in missing_value)

@@ -108,7 +108,12 @@ class BoundedEventQueue:
 
 
 class EventBus:
-    """Fan-out event bus with a replay buffer for late-joining SSE clients."""
+    """Fan-out event bus with a replay buffer for late-joining SSE clients.
+
+    Every published event carries a monotonically increasing ``_eid`` so SSE
+    clients can resume from their last received id (``Last-Event-ID``) instead
+    of replaying the whole backlog on every reconnect.
+    """
 
     def __init__(
         self,
@@ -119,6 +124,7 @@ class EventBus:
         self._max_subscriber_events = max_subscriber_events
         self._subscribers: set[BoundedEventQueue] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._next_event_id = 0
 
     def bind_loop(self) -> None:
         """Capture the running event loop (call from async context)."""
@@ -128,6 +134,8 @@ class EventBus:
             self._loop = None
 
     def clear(self) -> None:
+        # Keep the id counter monotonic so a resuming client can never mistake
+        # a post-clear event for one it has already seen.
         self._buffer.clear()
 
     def backlog(self) -> list[dict]:
@@ -144,13 +152,17 @@ class EventBus:
 
     def publish(self, event: dict) -> None:
         event.setdefault("ts", time.time())
-        self._buffer.append(event)
+        self._next_event_id += 1
+        # Copy before tagging: the same event dict is fanned out to several
+        # buses, and each bus needs its own stable id.
+        stored = {**event, "_eid": self._next_event_id}
+        self._buffer.append(stored)
         if not self._subscribers:
             return
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._deliver, event)
+            self._loop.call_soon_threadsafe(self._deliver, stored)
         else:
-            self._deliver(event)
+            self._deliver(stored)
 
     def _deliver(self, event: dict) -> None:
         for queue in self._subscribers:

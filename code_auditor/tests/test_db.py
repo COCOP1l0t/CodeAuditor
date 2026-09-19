@@ -478,6 +478,11 @@ def test_scan_output_dir_missing_dir_returns_empty(tmp_path) -> None:
         "vulnerabilities": [],
         "pocs": [],
         "disclosures": [],
+        "unreadable_keys": {
+            "analysis_units": [],
+            "findings": [],
+            "vulnerabilities": [],
+        },
     }
 
 
@@ -577,6 +582,49 @@ def test_persist_artifacts_is_idempotent(tmp_path) -> None:
     run = store.get_run(run_id)
     assert run is not None
     assert len(run["vulnerabilities"]) == 1
+
+
+def test_persist_artifacts_keeps_rows_for_unparseable_files(tmp_path) -> None:
+    """A half-written artifact must not look like a deleted one."""
+    out = _make_output_dir(tmp_path)
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.record_run(_make_config(tmp_path, out), status=RUN_DONE)
+    assert len(store.get_run(run_id)["vulnerabilities"]) == 1
+
+    # Simulate the non-atomic Stage 4 rewrite being observed mid-write.
+    (out / "stage4-vulnerabilities" / "H-01.json").write_text(
+        '{"id": "H-01", "title": "partial', encoding="utf-8"
+    )
+    store.persist_artifacts(run_id, str(out))
+
+    run = store.get_run(run_id)
+    assert len(run["vulnerabilities"]) == 1
+    assert run["vulns_count"] == 1
+
+    # Once the file is readable again the row is refreshed as usual.
+    (out / "stage4-vulnerabilities" / "H-01.json").write_text(
+        json.dumps(
+            {
+                "id": "H-01",
+                "title": "Buffer overflow in parser",
+                "location": "src/parser.c:parse",
+                "trigger": "Crafted input packet",
+                "data_flow_trace": {
+                    "entry_point": "handle_packet",
+                    "propagation_chain": ["handle_packet", "parse"],
+                    "neutralizing_checks": "none",
+                    "sink": "memcpy",
+                },
+                "cwe_id": ["CWE-120"],
+                "vulnerability_class": ["buffer-overflow"],
+                "cvss_score": "8.1",
+                "severity": "High",
+            }
+        ),
+        encoding="utf-8",
+    )
+    store.persist_artifacts(run_id, str(out))
+    assert len(store.get_run(run_id)["vulnerabilities"]) == 1
 
 
 def test_get_run_only_returns_reproduced_vulnerabilities(tmp_path) -> None:

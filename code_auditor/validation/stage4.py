@@ -89,21 +89,45 @@ def validate_stage4_file(file_path: str) -> list[ValidationIssue]:
             fix='Set "data_flow_trace" to a JSON object with the required subfields.',
         ))
 
-    cvss_raw = data.get("cvss_score")
-    if cvss_raw is not None:
-        try:
-            cvss = float(cvss_raw)
-            if not (0.0 <= cvss <= 10.0):
-                validation_issues.append(ValidationIssue(
-                    description=f'CVSS score out of range: {cvss}.',
-                    expected="A number between 0.0 and 10.0.",
-                    fix='Set "cvss_score" to a value between 0.0 and 10.0.',
-                ))
-        except (TypeError, ValueError):
+    if "cvss_score" in data:
+        cvss_raw = data["cvss_score"]
+        if cvss_raw is None:
             validation_issues.append(ValidationIssue(
-                description=f'Invalid cvss_score: "{cvss_raw}".',
-                expected="A numeric CVSS v3.1 base score (e.g. \"7.5\").",
-                fix='Set "cvss_score" to a numeric string like "7.5".',
+                description='"cvss_score" must be a numeric value.',
+                expected="A CVSS v3.1 base score of at least 4.0.",
+                fix='Set "cvss_score" to a value between 4.0 and 10.0.',
             ))
+        else:
+            try:
+                cvss = float(cvss_raw)
+            except (TypeError, ValueError):
+                validation_issues.append(ValidationIssue(
+                    description=f'Invalid cvss_score: "{cvss_raw}".',
+                    expected="A numeric CVSS v3.1 base score (e.g. \"7.5\").",
+                    fix='Set "cvss_score" to a numeric string like "7.5".',
+                ))
+            else:
+                if not (0.0 <= cvss <= 10.0):
+                    validation_issues.append(ValidationIssue(
+                        description=f'CVSS score out of range: {cvss}.',
+                        expected="A number between 0.0 and 10.0.",
+                        fix='Set "cvss_score" to a value between 0.0 and 10.0.',
+                    ))
+                elif cvss < 4.0:
+                    # The Stage 4 prompt writes output only for confirmed
+                    # vulnerabilities at or above the disclosure threshold;
+                    # enforce it so sub-threshold findings do not consume
+                    # Stage 5/6 agent work.
+                    validation_issues.append(ValidationIssue(
+                        description=(
+                            f"CVSS score {cvss:.1f} is below the 4.0 disclosure "
+                            "threshold."
+                        ),
+                        expected="A confirmed vulnerability with CVSS >= 4.0.",
+                        fix=(
+                            "Do not emit an output file for a finding below CVSS "
+                            "4.0; delete this file or raise the score if it is wrong."
+                        ),
+                    ))
 
     return validation_issues

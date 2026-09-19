@@ -633,15 +633,25 @@ def _parse_vuln(
 
 def scan_output_dir(
     output_dir: str, repo_url: str = ""
-) -> dict[str, list[dict[str, Any]]]:
-    """Parse stage 2-6 artifacts under an output directory."""
+) -> dict[str, Any]:
+    """Parse stage 2-6 artifacts under an output directory.
+
+    ``unreadable_keys`` records artifacts that exist on disk but could not be
+    parsed (for example a half-written Stage 4 file). Callers must not treat
+    them as deleted.
+    """
     base = Path(output_dir)
-    result: dict[str, list[dict[str, Any]]] = {
+    result: dict[str, Any] = {
         "analysis_units": [],
         "findings": [],
         "vulnerabilities": [],
         "pocs": [],
         "disclosures": [],
+        "unreadable_keys": {
+            "analysis_units": [],
+            "findings": [],
+            "vulnerabilities": [],
+        },
     }
     if not base.is_dir():
         return result
@@ -652,8 +662,10 @@ def scan_output_dir(
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
+                result["unreadable_keys"]["analysis_units"].append(path.stem)
                 continue
             if not isinstance(data, dict):
+                result["unreadable_keys"]["analysis_units"].append(path.stem)
                 continue
             result["analysis_units"].append(
                 {
@@ -673,6 +685,8 @@ def scan_output_dir(
         finding = _parse_finding(path, base)
         if finding:
             result["findings"].append(finding)
+        else:
+            result["unreadable_keys"]["findings"].append(path.stem)
 
     vuln_dir = base / "stage4-vulnerabilities"
     if vuln_dir.is_dir():
@@ -680,6 +694,8 @@ def scan_output_dir(
             vuln = _parse_vuln(path, base, repo_url)
             if vuln:
                 result["vulnerabilities"].append(vuln)
+            else:
+                result["unreadable_keys"]["vulnerabilities"].append(path.stem)
 
     pocs_dir = base / "stage5-pocs"
     if pocs_dir.is_dir():
@@ -2478,18 +2494,24 @@ class AuditStore:
             # INSERT OR REPLACE mirrors the filesystem but never drops rows for
             # artifacts that disappeared (for example a purged PoC). Left in
             # place they make the stored counts, the list-endpoint counts, and
-            # the detail view disagree and keep pointing at deleted files.
+            # the detail view disagree and keep pointing at deleted files. A
+            # file that still exists but failed to parse is protected instead:
+            # a transient read of a half-written artifact must not delete rows.
+            unreadable = artifacts.get("unreadable_keys", {})
             self._prune_missing_artifacts(
                 conn, run_id, "analysis_units", "au_id",
                 [str(au["au_id"]) for au in artifacts["analysis_units"]],
+                unreadable.get("analysis_units", []),
             )
             self._prune_missing_artifacts(
                 conn, run_id, "findings", "finding_key",
                 [str(item["finding_key"]) for item in artifacts["findings"]],
+                unreadable.get("findings", []),
             )
             self._prune_missing_artifacts(
                 conn, run_id, "vulnerabilities", "vuln_id",
                 [str(item["vuln_id"]) for item in artifacts["vulnerabilities"]],
+                unreadable.get("vulnerabilities", []),
             )
             self._prune_missing_artifacts(
                 conn, run_id, "pocs", "vuln_id",
@@ -2499,6 +2521,36 @@ class AuditStore:
                 conn, run_id, "disclosures", "vuln_id",
                 [str(item["vuln_id"]) for item in artifacts["disclosures"]],
             )
+            # Derive the counters from the retained rows so a transient read
+            # failure cannot make them disagree with what is stored.
+            findings_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM findings WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()["count"]
+            )
+            vulns_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM vulnerabilities WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()["count"]
+            )
+            reproduced = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM pocs "
+                    "WHERE run_id = ? AND status IN ("
+                    + ",".join("?" * len(REPRODUCED_STATUSES))
+                    + ")",
+                    (run_id, *sorted(REPRODUCED_STATUSES)),
+                ).fetchone()["count"]
+            )
+            disclosures_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM disclosures "
+                    "WHERE run_id = ? AND report_path != ''",
+                    (run_id,),
+                ).fetchone()["count"]
+            )
             conn.execute(
                 """
                 UPDATE runs SET findings_count = ?, vulns_count = ?,
@@ -2506,10 +2558,10 @@ class AuditStore:
                 WHERE id = ?
                 """,
                 (
-                    len(artifacts["findings"]),
-                    len(artifacts["vulnerabilities"]),
+                    findings_count,
+                    vulns_count,
                     reproduced,
-                    sum(1 for d in artifacts["disclosures"] if d["report_path"]),
+                    disclosures_count,
                     run_id,
                 ),
             )
@@ -2522,14 +2574,23 @@ class AuditStore:
         table: str,
         key_column: str,
         keys: list[str],
+        protected_keys: list[str] | None = None,
     ) -> None:
-        """Delete this run's artifact rows whose scan key is no longer present."""
-        if keys:
-            placeholders = ",".join("?" * len(keys))
+        """Delete this run's artifact rows whose scan key is no longer present.
+
+        ``protected_keys`` are artifacts that still exist on disk but could not
+        be parsed; they are kept so a transient failure cannot destroy rows.
+        """
+        retained = list(keys)
+        if protected_keys:
+            retained.extend(str(key) for key in protected_keys)
+        retained = sorted(set(retained))
+        if retained:
+            placeholders = ",".join("?" * len(retained))
             conn.execute(
                 f"DELETE FROM {table} WHERE run_id = ? "
                 f"AND {key_column} NOT IN ({placeholders})",
-                (run_id, *keys),
+                (run_id, *retained),
             )
         else:
             conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))

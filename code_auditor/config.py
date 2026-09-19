@@ -128,8 +128,10 @@ class AuditConfig:
     backends_used: list[str] = field(default_factory=list, repr=False)
     models_used: list[str] = field(default_factory=list, repr=False)
     # Web jobs attach a runtime-only observer so History can publish and
-    # persist a newly used backend/model as soon as the invocation starts.
-    agent_history_changed: Callable[[], None] | None = field(default=None, repr=False)
+    # persist a newly used backend/model as soon as the invocation starts. It
+    # may return an awaitable so the Web job can persist the SQLite update off
+    # the event loop.
+    agent_history_changed: Callable[[], Any] | None = field(default=None, repr=False)
     # Runtime-only accumulator of token/cost usage across agent invocations.
     # Keys: agent_calls, input_tokens, output_tokens,
     # cache_creation_input_tokens, cache_read_input_tokens, cost_usd.

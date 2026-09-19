@@ -195,11 +195,28 @@ class AgentSettingsRequest(StrictRequest):
 
 
 def _sse(event: dict) -> str:
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    payload = {key: value for key, value in event.items() if key != "_eid"}
+    event_id = event.get("_eid")
+    prefix = f"id: {event_id}\n" if isinstance(event_id, int) else ""
+    return f"{prefix}data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _sse_stream(bus) -> StreamingResponse:
-    """Replay the bus backlog, then stream live events until disconnect."""
+def _parse_last_event_id(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sse_stream(bus, last_event_id: str | None = None) -> StreamingResponse:
+    """Replay the bus backlog, then stream live events until disconnect.
+
+    ``Last-Event-ID`` lets a reconnecting ``EventSource`` resume after the last
+    frame it processed instead of replaying (and duplicating) the whole buffer.
+    """
+    resume_after = _parse_last_event_id(last_event_id)
 
     async def stream():
         # Subscribe inside the generator: an async generator that is never
@@ -211,6 +228,13 @@ def _sse_stream(bus) -> StreamingResponse:
         queue = bus.subscribe()
         try:
             for event in backlog:
+                event_id = event.get("_eid")
+                if (
+                    resume_after is not None
+                    and isinstance(event_id, int)
+                    and event_id <= resume_after
+                ):
+                    continue
                 yield _sse(event)
             while True:
                 event = await queue.get()
@@ -848,7 +872,7 @@ def create_app(
         return response
 
     @app.get("/", include_in_schema=False)
-    async def index() -> FileResponse:
+    def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -857,7 +881,8 @@ def create_app(
     async def auth_status(request: Request) -> dict[str, object]:
         user = await _session_user(request)
         return {
-            "setup_required": store.auth_user_count() == 0,
+            # Keep the SQLite read off the event loop; see the auth middleware.
+            "setup_required": await asyncio.to_thread(store.auth_user_count) == 0,
             "authenticated": user is not None,
             "user": user,
         }
@@ -956,7 +981,7 @@ def create_app(
         return {"logged_out": True}
 
     @app.get("/api/config")
-    async def get_config() -> dict:
+    def get_config() -> dict:
         return {
             "defaults": {
                 "max_parallel": settings.max_parallel,
@@ -972,7 +997,7 @@ def create_app(
         }
 
     @app.get("/api/settings")
-    async def get_agent_settings() -> dict:
+    def get_agent_settings() -> dict:
         return settings.public_agent_settings()
 
     @app.get("/api/dashboard")
@@ -1133,29 +1158,32 @@ def create_app(
         return job
 
     @app.post("/api/audit/{run_id}/stop")
-    async def stop_audit(run_id: int) -> dict:
+    def stop_audit(run_id: int) -> dict:
         job = _audit_job_or_404(run_id)
         if not job.stop():
             raise HTTPException(status_code=409, detail="That audit is not running.")
         return job.status()
 
     @app.get("/api/audit/{run_id}/status")
-    async def audit_status(run_id: int) -> dict:
+    def audit_status(run_id: int) -> dict:
         return _audit_job_or_404(run_id).status()
 
     @app.get("/api/audit/{run_id}/processes")
-    async def audit_processes(run_id: int) -> dict:
+    def audit_processes(run_id: int) -> dict:
         try:
             return _audit_job_or_404(run_id).process_tree()
         except JobConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/audit/{run_id}/events")
-    async def audit_events(run_id: int) -> StreamingResponse:
-        return _sse_stream(_audit_job_or_404(run_id).bus)
+    def audit_events(
+        run_id: int,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
+        return _sse_stream(_audit_job_or_404(run_id).bus, last_event_id)
 
     @app.get("/api/jobs")
-    async def list_jobs() -> dict:
+    def list_jobs() -> dict:
         """Active and recently finished jobs (sidebar + History live badges)."""
         return {
             "jobs": jobs_snapshot(),
@@ -1163,9 +1191,11 @@ def create_app(
         }
 
     @app.get("/api/jobs/events")
-    async def job_events() -> StreamingResponse:
+    def job_events(
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
         """Run-tagged lifecycle events for every job."""
-        return _sse_stream(manager.bus)
+        return _sse_stream(manager.bus, last_event_id)
 
     # ── Standalone reproduction ────────────────────────────────────────────
 
@@ -1515,7 +1545,7 @@ def create_app(
         return output_dir
 
     @app.post("/api/reproduction/{job_key}/stop")
-    async def stop_reproduction(job_key: str) -> dict:
+    def stop_reproduction(job_key: str) -> dict:
         job = _reproduction_job_or_404(job_key)
         if not job.stop():
             raise HTTPException(
@@ -1524,29 +1554,32 @@ def create_app(
         return job.status()
 
     @app.get("/api/reproduction/{job_key}/status")
-    async def reproduction_status(job_key: str) -> dict:
+    def reproduction_status(job_key: str) -> dict:
         job = manager.get_job(job_key)
         if job is not None and job.kind == JOB_REPRODUCTION:
             return job.status()
         return _reproduction_record_or_404(job_key)
 
     @app.get("/api/reproduction/{job_key}/events")
-    async def reproduction_events(job_key: str) -> StreamingResponse:
-        return _sse_stream(_reproduction_job_or_404(job_key).bus)
+    def reproduction_events(
+        job_key: str,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
+        return _sse_stream(_reproduction_job_or_404(job_key).bus, last_event_id)
 
     @app.get("/api/reproduction/{job_key}/results")
-    async def reproduction_results(job_key: str) -> dict:
+    def reproduction_results(job_key: str) -> dict:
         return _scan_results(_reproduction_output_or_404(job_key))
 
     @app.get("/api/reproduction/{job_key}/agent-log")
-    async def reproduction_agent_log(
+    def reproduction_agent_log(
         job_key: str,
         download: bool = Query(default=False),
     ):
         return _agent_log_response(_reproduction_output_or_404(job_key), download)
 
     @app.get("/api/reproduction/{job_key}/results/file")
-    async def reproduction_result_file(
+    def reproduction_result_file(
         job_key: str,
         path: str = Query(min_length=1, max_length=4096),
     ) -> PlainTextResponse:
@@ -1699,7 +1732,8 @@ def create_app(
 
     @app.post("/api/history/{run_id}/resume", status_code=202)
     async def resume_history_run(run_id: int) -> dict:
-        _get_history_run(run_id)
+        # History reads touch SQLite and the filesystem; keep them off the loop.
+        await asyncio.to_thread(_get_history_run, run_id)
         await require_sandbox_environment(
             settings.backend, settings.sandbox_mode, settings.sandbox_runtime
         )

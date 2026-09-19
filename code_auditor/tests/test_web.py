@@ -179,6 +179,42 @@ async def test_event_bus_bounds_twenty_thousand_slow_client_events() -> None:
     bus.unsubscribe(queue)
 
 
+async def test_sse_stream_resumes_after_last_event_id() -> None:
+    from code_auditor.web.server import _sse_stream
+
+    bus = EventBus()
+    bus.publish({"type": "log", "message": "one"})
+    bus.publish({"type": "log", "message": "two"})
+    bus.publish({"type": "log", "message": "three"})
+
+    resumed = _sse_stream(bus, "1")
+    iterator = resumed.body_iterator
+    try:
+        first = await asyncio.wait_for(iterator.__anext__(), timeout=1)
+        second = await asyncio.wait_for(iterator.__anext__(), timeout=1)
+    finally:
+        await iterator.aclose()
+    # Events already delivered are not replayed on reconnect.
+    assert "id: 2" in first and "two" in first
+    assert "id: 3" in second and "three" in second
+
+    fresh = _sse_stream(bus)
+    fresh_iterator = fresh.body_iterator
+    try:
+        frames = [
+            await asyncio.wait_for(fresh_iterator.__anext__(), timeout=1)
+            for _ in range(3)
+        ]
+    finally:
+        await fresh_iterator.aclose()
+    # A first-time client still receives the full replay buffer.
+    assert ["id: 1" in frames[0], "id: 2" in frames[1], "id: 3" in frames[2]] == [
+        True,
+        True,
+        True,
+    ]
+
+
 # ── AuditJobManager ──────────────────────────────────────────────────────────
 
 

@@ -568,7 +568,7 @@ class AuditJob:
         config.sandbox_job_key = self.job_key or None
         config.agent_history_changed = self._agent_history_changed
 
-    def _agent_history_changed(self) -> None:
+    async def _agent_history_changed(self) -> None:
         """Persist and publish a backend/model when its invocation starts."""
         config = self.config
         if config is None:
@@ -579,7 +579,10 @@ class AuditJob:
             and self.run_id is not None
         ):
             try:
-                updated = self.store.update_running_run_agent_history(
+                # The SQLite write runs off the event loop so a locked writer
+                # cannot stall streaming; publishing stays on the loop.
+                updated = await asyncio.to_thread(
+                    self.store.update_running_run_agent_history,
                     self.run_id,
                     backends_used=list(config.backends_used),
                     models_used=list(config.models_used),

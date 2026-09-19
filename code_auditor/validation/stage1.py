@@ -1,9 +1,73 @@
 from __future__ import annotations
 
 import json
+import re
 
 from ..config import ValidationIssue
 from .common import read_file_or_issues
+
+# Headings Stage 2 parses out of the two auditing directives; a directive that
+# lost them silently degrades the focus/criteria injected into Stages 2-4.
+_DIRECTIVE_SECTIONS = {
+    "auditing-focus.md": (
+        "## Explicit In-Scope and Out-of-Scope Modules",
+        "## Historical Hot Spots",
+    ),
+    "vulnerability-criteria.md": (
+        "## Explicit In-Scope and Out-of-Scope Issue Types",
+    ),
+}
+
+
+def _heading_present(content: str, heading: str) -> bool:
+    pattern = re.compile(rf"^\s*{re.escape(heading)}\s*$", re.MULTILINE)
+    return pattern.search(content) is not None
+
+
+def validate_stage1_directive(file_path: str, filename: str) -> list[ValidationIssue]:
+    """Validate one auditing directive file exists, is non-empty, and has its sections."""
+    content, issues = read_file_or_issues(file_path)
+    if issues:
+        return issues
+    if not content.strip():
+        return [
+            ValidationIssue(
+                description=f"{filename} is empty.",
+                expected="A concise, actionable auditing directive.",
+                fix=f"Write the {filename} directive with its required Markdown sections.",
+            )
+        ]
+    missing = [
+        heading
+        for heading in _DIRECTIVE_SECTIONS.get(filename, ())
+        if not _heading_present(content, heading)
+    ]
+    if missing:
+        return [
+            ValidationIssue(
+                description=f"{filename} is missing required section(s): "
+                + ", ".join(missing),
+                expected="Every section the downstream stages parse must be present.",
+                fix=f"Add the missing section heading(s) to {filename}.",
+            )
+        ]
+    return []
+
+
+def validate_stage1_outputs(
+    research_record_path: str,
+    auditing_focus_path: str,
+    vuln_criteria_path: str,
+) -> list[ValidationIssue]:
+    """Validate all three Stage 1 outputs before the stage is checkpointed."""
+    issues = list(validate_stage1_file(research_record_path))
+    issues.extend(
+        validate_stage1_directive(auditing_focus_path, "auditing-focus.md")
+    )
+    issues.extend(
+        validate_stage1_directive(vuln_criteria_path, "vulnerability-criteria.md")
+    )
+    return issues
 
 
 def validate_stage1_file(file_path: str) -> list[ValidationIssue]:

@@ -1215,7 +1215,9 @@ async def run_agent(
         history_changed = True
     if history_changed and config.agent_history_changed is not None:
         try:
-            config.agent_history_changed()
+            changed = config.agent_history_changed()
+            if inspect.isawaitable(changed):
+                await changed
         except Exception as exc:
             # History reporting is observational and must never prevent the
             # selected agent invocation from running.

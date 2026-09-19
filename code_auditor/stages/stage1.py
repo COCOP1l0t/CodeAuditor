@@ -9,7 +9,8 @@ from ..checkpoint import CheckpointManager
 from ..config import AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
-from ..validation.stage1 import validate_stage1_file
+from ..utils import format_validation_issues
+from ..validation.stage1 import validate_stage1_file, validate_stage1_outputs
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage1")
@@ -33,11 +34,22 @@ async def run_stage1(
     vuln_criteria_path = os.path.join(details_dir, "vulnerability-criteria.md")
 
     if checkpoint.is_complete(_TASK_KEY):
-        logger.info("Stage 1 already complete, loading existing output.")
-        return Stage1Output(
-            research_record_path=research_record_path,
-            auditing_focus_path=auditing_focus_path,
-            vuln_criteria_path=vuln_criteria_path,
+        issues = validate_stage1_outputs(
+            research_record_path, auditing_focus_path, vuln_criteria_path
+        )
+        if not issues:
+            logger.info("Stage 1 already complete and validated, loading existing output.")
+            return Stage1Output(
+                research_record_path=research_record_path,
+                auditing_focus_path=auditing_focus_path,
+                vuln_criteria_path=vuln_criteria_path,
+            )
+        # A file-existence checkpoint is not enough: a corrupt record or a
+        # missing directive must trigger a re-run instead of silently degrading
+        # the focus/criteria injected into Stages 2-4.
+        logger.warning(
+            "Stage 1: checkpointed output is invalid; rerunning.\n%s",
+            format_validation_issues(issues),
         )
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -64,10 +76,18 @@ async def run_stage1(
         log_file=os.path.join(details_dir, "agent.log"),
     )
 
-    if not passed:
-        logger.warning("Stage 1 validation did not fully pass, continuing with best-effort output.")
-
-    checkpoint.mark_complete(_TASK_KEY)
+    issues = validate_stage1_outputs(
+        research_record_path, auditing_focus_path, vuln_criteria_path
+    )
+    if not passed or issues:
+        # Do not record a completed checkpoint: the record file's existence is
+        # the Stage 1 marker, so the next resume re-validates and re-runs.
+        logger.warning(
+            "Stage 1 validation did not fully pass; a resume will re-run it.\n%s",
+            format_validation_issues(issues),
+        )
+    else:
+        checkpoint.mark_complete(_TASK_KEY)
     logger.info("Stage 1 complete. Research record: %s", research_record_path)
     return Stage1Output(
         research_record_path=research_record_path,

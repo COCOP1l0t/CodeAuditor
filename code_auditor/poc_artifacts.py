@@ -22,6 +22,22 @@ FALSE_POSITIVE_SUFFIX = "_fp"
 _VULN_DIR_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 
 
+def validate_vuln_id(value: object) -> str | None:
+    """Return ``value`` when it is a well-formed vulnerability ID, else ``None``.
+
+    Vulnerability IDs become ``stage4-vulnerabilities/<id>.json`` filenames,
+    ``stage5-pocs/<id>/`` and ``stage6-disclosures/<id>/`` directory components,
+    and checkpoint marker names. Only the shared
+    :data:`_VULN_DIR_RE`/``db._VULN_ID_PATTERN`` grammar is therefore accepted;
+    anything else (path separators, ``:``, unicode, empty or over-long values)
+    is rejected at the boundary instead of being encoded into an ambiguous
+    artifact or marker name.
+    """
+    if not isinstance(value, str) or _VULN_DIR_RE.fullmatch(value) is None:
+        return None
+    return value
+
+
 def stage5_vuln_id(
     dir_name: str, *, allow_false_positive: bool = False
 ) -> str | None:
@@ -37,9 +53,7 @@ def stage5_vuln_id(
     candidate = (
         dir_name[: -len(FALSE_POSITIVE_SUFFIX)] if is_false_positive else dir_name
     )
-    if not candidate or _VULN_DIR_RE.fullmatch(candidate) is None:
-        return None
-    return candidate
+    return validate_vuln_id(candidate)
 
 
 def resolve_stage5_report_path(

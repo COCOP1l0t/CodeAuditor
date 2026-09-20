@@ -13,6 +13,7 @@ from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, select_poc_model
 from ..disclosures import build_dedupe_key, display_list, single_line
 from ..logger import get_logger
+from ..poc_artifacts import stage5_vuln_id
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
 from ..reproduction_status import (
@@ -51,13 +52,12 @@ def _task_key(vuln_id: str) -> str:
 def _vuln_id_from_report(report_path: str) -> str | None:
     """Extract vulnerability ID from a stage 5 report path.
 
-    Expects paths like .../stage5-pocs/{vuln_id}/report.md
+    Expects paths like .../stage5-pocs/{vuln_id}/report.md. The directory name
+    is validated with the shared Stage 5 id rules, so a false-positive or
+    malformed directory can never become a disclosure directory or checkpoint
+    marker name.
     """
-    parent = Path(report_path).parent
-    name = parent.name
-    if name.endswith("_fp"):
-        return None
-    return name
+    return stage5_vuln_id(Path(report_path).parent.name)
 
 
 def _find_finding_file(vuln_id: str, output_dir: str) -> str | None:

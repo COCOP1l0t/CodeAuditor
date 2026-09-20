@@ -8,7 +8,11 @@ from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, select_poc_model
 from ..logger import get_logger
-from ..poc_artifacts import ASAN_REPORT_FILENAME, TRIGGER_GRAPH_FILENAME
+from ..poc_artifacts import (
+    ASAN_REPORT_FILENAME,
+    TRIGGER_GRAPH_FILENAME,
+    validate_vuln_id,
+)
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
 from ..reproduction_status import is_failed_status, read_reproduction_status
@@ -44,10 +48,18 @@ def _read_vuln_id(file_path: str) -> str | None:
     try:
         with open(file_path) as f:
             data = json.load(f)
-        return data.get("id")
+        raw_id = data.get("id") if isinstance(data, dict) else None
     except Exception as e:
         logger.warning("Failed to read vuln id from %s: %s", file_path, e)
         return None
+    vuln_id = validate_vuln_id(raw_id)
+    if vuln_id is None:
+        # The id becomes a PoC directory name and a checkpoint marker, so a
+        # malformed one must not be encoded into either.
+        logger.warning(
+            "Ignoring %s with unusable vulnerability id %r.", file_path, raw_id
+        )
+    return vuln_id
 
 
 def _resolve_reproduction_report(poc_dir: str) -> str | None:

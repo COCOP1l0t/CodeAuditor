@@ -1256,6 +1256,15 @@ class AuditStore:
         matched on ``(project, dedupe_key)`` using the project of the CVE that
         owns the link. Without the project predicate a link could be justified
         by an unrelated project's disclosure that happens to share the key.
+
+        The project comparison is case-insensitive on purpose. Every other
+        identity check in this module normalizes case (``import_cve`` and
+        ``list_cves`` ``casefold``, ``set_disclosed_status`` and
+        ``update_disclosed_entry`` use ``lower``), and a CVE row written by an
+        earlier build may carry a differently-cased project (``QEMU``) than the
+        Disclosure it belongs to (``qemu``). An exact match here deletes those
+        links on every store open, and the cascading ``cves`` cleanup below then
+        removes the CVE record itself.
         """
         conn.execute(
             """
@@ -1265,9 +1274,9 @@ class AuditStore:
                 WHERE disclosed_bugs.dedupe_key = cve_links.dedupe_key
                   AND disclosed_bugs.review_status = 'confirmed'
                   AND disclosed_bugs.deleted_at IS NULL
-                  AND disclosed_bugs.project = (
+                  AND lower(disclosed_bugs.project) = lower((
                       SELECT project FROM cves WHERE cves.cve_id = cve_links.cve_id
-                  )
+                  ))
             )
             """
         )

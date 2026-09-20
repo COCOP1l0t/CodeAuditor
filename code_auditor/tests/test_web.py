@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -374,12 +375,22 @@ async def test_manager_hot_switch_appends_actual_backend_after_prior_and_persist
     claude_started = asyncio.Event()
     release_claude = asyncio.Event()
 
-    async def fake_codex_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+    async def fake_codex_agent(*_args, on_invocation_started=None, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+        # The real runner signals the owning job once the provider round-trip
+        # starts, which is what records "backends used" while still in flight.
+        if on_invocation_started is not None:
+            started = on_invocation_started()
+            if inspect.isawaitable(started):
+                await started
         codex_started.set()
         await release_codex.wait()
         return "codex-result"
 
-    async def fake_claude_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+    async def fake_claude_agent(*_args, on_invocation_started=None, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+        if on_invocation_started is not None:
+            started = on_invocation_started()
+            if inspect.isawaitable(started):
+                await started
         claude_started.set()
         await release_claude.wait()
         return "claude-result"

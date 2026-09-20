@@ -140,7 +140,10 @@ class AuditConfig:
 
 def local_claude_model(
     settings_path: str | None = None,
-    keys: tuple[str, ...] = ("ANTHROPIC_MODEL",),
+    keys: tuple[str, ...] = (
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    ),
 ) -> str | None:
     """Read the model id from the local Claude config, fresh on every call.
 
@@ -149,6 +152,15 @@ def local_claude_model(
     ``ANTHROPIC_DEFAULT_*_MODEL`` variants) to the provider's current model
     id. Reading it at each call keeps audits on the configured model even
     when the provider renames ids — a stored copy goes stale.
+
+    ``ANTHROPIC_MODEL`` is the operator's explicit choice and wins. Setups that
+    only configure a gateway plus the per-tier variables (a common way to point
+    Claude Code at another provider) have no ``ANTHROPIC_MODEL`` at all; falling
+    straight through to the built-in default would then send that provider a
+    model id it does not serve, so ``ANTHROPIC_DEFAULT_SONNET_MODEL`` — the tier
+    the audit stages run on — is used before the built-in default. PoC stages
+    pass ``ANTHROPIC_DEFAULT_OPUS_MODEL`` first, which still takes precedence
+    for them.
     """
     path = settings_path or os.path.join(
         os.path.expanduser("~"), ".claude", "settings.json"

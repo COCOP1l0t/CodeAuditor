@@ -141,6 +141,22 @@ function busyReproductionJob() {
   return busyJobs().find((j) => j.kind === "reproduction") || null;
 }
 
+// FastAPI reports validation failures as an object or a list of error objects
+// (``{"detail": [...]}``). Rendering that into a template literal yields
+// "[object Object]" instead of the reason, so flatten it before display.
+function errorDetail(detail) {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => (item && (item.msg || item.detail)) || String(item))
+      .join("; ");
+  }
+  if (detail && typeof detail === "object") {
+    return detail.msg || detail.detail || JSON.stringify(detail);
+  }
+  return "";
+}
+
 // ── Config form ─────────────────────────────────────────────────────────────
 async function loadConfig() {
   try {
@@ -443,10 +459,7 @@ $("settings-form").addEventListener("submit", async (event) => {
     });
     const data = await res.json();
     if (!res.ok) {
-      const detail = Array.isArray(data.detail)
-        ? data.detail.map((item) => item.msg || String(item)).join("; ")
-        : data.detail;
-      throw new Error(detail || `HTTP ${res.status}`);
+      throw new Error(errorDetail(data.detail) || `HTTP ${res.status}`);
     }
     agentSettings = data;
     updateAgentSettingsSummary();
@@ -2578,7 +2591,50 @@ $("btn-refresh-sandbox-executions").addEventListener("click", () => {
   if (detailRunId != null) void loadSandboxExecutions(detailRunId);
 });
 
+// A run detail rebuild is not re-entrant. `loadRunDetail` opens the run's SSE
+// stream and the heartbeat/lifecycle paths call it again from that stream's
+// terminal event, so a resumed run that fails moments after starting used to
+// ping-pong: rebuild -> connect -> replayed terminal event -> rebuild. Each
+// pass also re-ran the history/status/process-tree fetches, which saturated
+// both the page and the server. Coalesce callers per run and rate-limit the
+// rebuild; the pending pass is scheduled, never dropped, so the page still
+// settles on the correct live/static state.
+const DETAIL_RELOAD_MIN_INTERVAL_MS = 400;
+let detailLoadRunId = null;
+let detailLoadInFlight = false;
+let detailReloadTimer = null;
+const detailLoadCompletedAt = new Map();
+
+function scheduleRunDetailReload(runId) {
+  const numericId = String(runId);
+  if (detailReloadTimer !== null) return;
+  const last = detailLoadCompletedAt.get(numericId) || 0;
+  const wait = Math.max(0, DETAIL_RELOAD_MIN_INTERVAL_MS - (Date.now() - last));
+  detailReloadTimer = window.setTimeout(() => {
+    detailReloadTimer = null;
+    void loadRunDetail(numericId);
+  }, wait);
+}
+
 async function loadRunDetail(runId) {
+  const requested = String(runId);
+  if (detailLoadInFlight) {
+    // Coalesce a repeated request for the run already loading; a request for a
+    // different run must still be honoured, so it becomes the pending pass.
+    scheduleRunDetailReload(requested);
+    return;
+  }
+  detailLoadInFlight = true;
+  detailLoadRunId = requested;
+  try {
+    await reloadRunDetail(runId);
+  } finally {
+    detailLoadInFlight = false;
+    detailLoadCompletedAt.set(requested, Date.now());
+  }
+}
+
+async function reloadRunDetail(runId) {
   stopAuditProcessTree();
   const resumeButton = $("btn-run-resume");
   resumeButton.hidden = true;
@@ -5017,7 +5073,9 @@ async function authJson(path, payload) {
     // Preserve a useful generic error for non-JSON server failures.
   }
   if (!response.ok) {
-    throw new Error(body.detail || `Request failed (${response.status})`);
+    throw new Error(
+      errorDetail(body.detail) || `Request failed (${response.status})`
+    );
   }
   return body;
 }

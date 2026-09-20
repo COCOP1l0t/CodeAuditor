@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import signal
@@ -301,6 +302,159 @@ def test_local_claude_model_reads_env_keys(tmp_path) -> None:
         )
         == "opus-model"
     )
+
+
+def test_local_claude_model_falls_back_to_the_sonnet_tier(tmp_path) -> None:
+    """A gateway-only config lists per-tier models but no ``ANTHROPIC_MODEL``.
+
+    Falling through to the built-in default there sends the gateway a model id
+    it does not serve (observed as ``400 A supported model is required.``), so
+    the tier the audit stages run on must be used instead.
+    """
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"env": {"ANTHROPIC_BASE_URL": "https://gateway.example", '
+        '"ANTHROPIC_DEFAULT_SONNET_MODEL": "gw-sonnet", '
+        '"ANTHROPIC_DEFAULT_OPUS_MODEL": "gw-opus"}}',
+        encoding="utf-8",
+    )
+
+    assert config_module.local_claude_model(str(settings)) == "gw-sonnet"
+    # PoC stages ask for the opus tier first and keep their own precedence.
+    assert (
+        config_module.local_claude_model(
+            str(settings),
+            keys=("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"),
+        )
+        == "gw-opus"
+    )
+
+
+def test_local_claude_model_prefers_the_explicit_model_over_the_tier(tmp_path) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"env": {"ANTHROPIC_MODEL": "explicit", '
+        '"ANTHROPIC_DEFAULT_SONNET_MODEL": "gw-sonnet"}}',
+        encoding="utf-8",
+    )
+
+    assert config_module.local_claude_model(str(settings)) == "explicit"
+
+
+def test_local_claude_model_returns_none_without_any_model(tmp_path) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"env": {"ANTHROPIC_BASE_URL": "https://gateway.example"}}',
+        encoding="utf-8",
+    )
+
+    assert config_module.local_claude_model(str(settings)) is None
+
+
+def test_run_agent_records_nothing_when_the_model_never_answered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rejected request must not enter "Backends used"/"Models used".
+
+    A gateway that answers HTTP 400 for an unserved model id never returns an
+    assistant turn, so listing the selected model would claim a model ran that
+    never did.
+    """
+
+    async def run_case() -> None:
+        async def rejecting_agent(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError(
+                "Agent ended with an error result: API Error: 400 "
+                "A supported model is required."
+            )
+
+        monkeypatch.setattr(agent, "_run_claude_agent", rejecting_agent)
+        monkeypatch.setattr(
+            config_module, "local_claude_model", lambda **_: "unserved-model"
+        )
+
+        config = AuditConfig(
+            target=str(tmp_path), output_dir=str(tmp_path / "out"), backend="claude"
+        )
+        with pytest.raises(RuntimeError):
+            await agent.run_agent("prompt", config, cwd=str(tmp_path))
+
+        assert config.backends_used == []
+        assert config.models_used == []
+
+    asyncio.run(run_case())
+
+
+def test_run_agent_records_the_backend_once_the_invocation_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An invocation that started but never answered still counts as used.
+
+    This mirrors the hot-switch contract: the caller can report the backend it
+    actually started with while that call is still in flight. The reverse — a
+    request rejected before any round-trip — stays unrecorded (see the test
+    above).
+    """
+
+    async def run_case() -> None:
+        async def started_but_failed_agent(  # type: ignore[no-untyped-def]
+            _prompt, _invocation, *_args, on_invocation_started=None, **_kwargs
+        ):
+            assert on_invocation_started is not None
+            result = on_invocation_started()
+            if inspect.isawaitable(result):
+                await result
+            raise RuntimeError("turn ended with status failed")
+
+        monkeypatch.setattr(agent, "_run_claude_agent", started_but_failed_agent)
+        monkeypatch.setattr(
+            config_module, "local_claude_model", lambda **_: "started-model"
+        )
+
+        config = AuditConfig(
+            target=str(tmp_path), output_dir=str(tmp_path / "out"), backend="claude"
+        )
+        with pytest.raises(RuntimeError):
+            await agent.run_agent("prompt", config, cwd=str(tmp_path))
+
+        assert config.backends_used == ["claude"]
+        assert config.models_used == ["started-model"]
+
+    asyncio.run(run_case())
+
+
+def test_run_agent_records_the_model_once_it_answers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def run_case() -> None:
+        async def answering_agent(*_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            return "agent answer"
+
+        monkeypatch.setattr(agent, "_run_claude_agent", answering_agent)
+        monkeypatch.setattr(
+            config_module, "local_claude_model", lambda **_: "served-model"
+        )
+
+        config = AuditConfig(
+            target=str(tmp_path), output_dir=str(tmp_path / "out"), backend="claude"
+        )
+        result = await agent.run_agent("prompt", config, cwd=str(tmp_path))
+
+        assert result == "agent answer"
+        assert config.backends_used == ["claude"]
+        assert config.models_used == ["served-model"]
+
+    asyncio.run(run_case())
+
+
+def test_usage_has_tokens_distinguishes_rejection_from_partial_failure() -> None:
+    # A rejection reports no token activity at all.
+    assert not agent._usage_has_tokens(None)
+    assert not agent._usage_has_tokens({})
+    assert not agent._usage_has_tokens({"input_tokens": 0, "output_tokens": 0})
+    # An invocation that answered and then failed did consume tokens.
+    assert agent._usage_has_tokens({"input_tokens": 120, "output_tokens": 0})
+    assert agent._usage_has_tokens({"output_tokens": 5})
 
 
 def test_local_codex_model_reads_active_profile(tmp_path: Path) -> None:

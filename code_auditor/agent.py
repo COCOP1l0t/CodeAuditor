@@ -49,6 +49,9 @@ _NON_RETRYABLE_AGENT_ERROR_PATTERN = re.compile(
     r"no left credit|insufficient\s*(credit|balance|quota)|quota exceeded"
     r"|invalid\s*api[\s_-]*key|authentication failed|unauthorized"
     r"|supported api model names|invalid[ _-]model|model not found|unknown model"
+    # Gateways answer an unserved model id with a bare validation message such
+    # as "A supported model is required." Retrying that only burns attempts.
+    r"|supported model is required|is not supported for (?:this|the) (?:model|account)"
     # Require an HTTP/status context so a bare "401"/"403" quoted in the
     # agent's own output cannot make a retryable failure fail fast.
     r"|\b(?:http|status(?:\s*code)?|error(?:\s*code)?)\s*[:=]?\s*(?:401|403)\b",
@@ -58,6 +61,23 @@ _NON_RETRYABLE_AGENT_ERROR_PATTERN = re.compile(
 
 def _is_non_retryable_agent_error(exc: BaseException) -> bool:
     return bool(_NON_RETRYABLE_AGENT_ERROR_PATTERN.search(str(exc)))
+
+
+def _usage_has_tokens(usage: object) -> bool:
+    """Whether a provider's usage payload reports any real token activity.
+
+    Used to tell a rejected request (no tokens, nothing billed) from an
+    invocation that answered and then failed part-way.
+    """
+    if not isinstance(usage, dict):
+        return False
+    for value in usage.values():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value > 0:
+            return True
+    return False
+
 
 class _KillableProcess(Protocol):
     def kill(self) -> object:
@@ -783,6 +803,7 @@ async def _run_claude_agent(
     log_file: str | None = None,
     run_control: _AgentRunControl | None = None,
     sandbox: DockerScratch | None = None,
+    on_invocation_started: Callable[[], Any] | None = None,
 ) -> str:
     ClaudeCodeOptions, query = _load_claude_sdk()
     tools = allowed_tools or DEFAULT_TOOLS
@@ -835,10 +856,19 @@ async def _run_claude_agent(
             tool_names: dict[str, str] = {}
             last_system_activity_at: dict[str, float] = {}
             result_error: list[bool] = []
+            announced = False
             try:
                 async for message in query(prompt=prompt, options=options):
                     if message is None:
                         continue
+                    if not announced and on_invocation_started is not None:
+                        # First real feedback from the provider: only now has
+                        # this backend/model actually been used. A request the
+                        # provider rejected outright never reaches this point.
+                        announced = True
+                        started = on_invocation_started()
+                        if inspect.isawaitable(started):
+                            await started
                     content = getattr(message, "content", None)
                     if isinstance(content, list):
                         for block in content:
@@ -907,14 +937,22 @@ async def _run_claude_agent(
                                 log_fh, f"Session event: {subtype}"
                             )
                     elif message_type == "ResultMessage":
-                        record_agent_usage(
-                            config,
-                            getattr(message, "usage", None),
-                            getattr(message, "total_cost_usd", None),
-                        )
+                        is_error = bool(getattr(message, "is_error", False))
+                        # Count this invocation's usage only when the provider
+                        # actually answered. A rejected request (an unserved
+                        # model id, a failed login) still arrives as an error
+                        # ResultMessage with zero turns and no tokens, and
+                        # counting it inflated the run's "Models used"/call
+                        # totals with a model that never ran.
+                        message_usage = getattr(message, "usage", None)
+                        if not is_error or _usage_has_tokens(message_usage):
+                            record_agent_usage(
+                                config,
+                                message_usage,
+                                getattr(message, "total_cost_usd", None),
+                            )
                         turns = getattr(message, "num_turns", None)
                         duration_ms = getattr(message, "duration_ms", None)
-                        is_error = bool(getattr(message, "is_error", False))
                         result_parts = [
                             "Agent result",
                             "error" if is_error else "complete",
@@ -1008,6 +1046,7 @@ async def _run_codex_agent(
     log_file: str | None = None,
     run_control: _AgentRunControl | None = None,
     sandbox: DockerScratch | None = None,
+    on_invocation_started: Callable[[], Any] | None = None,
 ) -> str:
     codex_sdk = _load_codex_sdk()
     if codex_sdk.flavor == "codex_app_server" and codex_sdk.app_server_client_cls is not None:
@@ -1070,6 +1109,9 @@ async def _run_codex_agent(
                 codex_client = getattr(codex, "_client", None)
                 sync_client = getattr(codex_client, "_sync", None)
                 run_control.register_process(getattr(sync_client, "_proc", None))
+                # The backend/model is recorded from the stream below, once the
+                # turn reports feedback; a session that never answers (for
+                # example a rejected model id) must not count as used.
                 if codex_sdk.flavor == "openai_codex":
                     thread = await codex.thread_start(
                         approval_mode=approval_setting,
@@ -1110,9 +1152,16 @@ async def _run_codex_agent(
                 completed = None
                 text_parts: list[str] = []
                 token_usage: dict[str, Any] | None = None
+                announced = False
                 try:
                     async for event in stream:
                         payload = event.payload
+                        if not announced and on_invocation_started is not None:
+                            # First event of the turn: the model is answering.
+                            announced = True
+                            started = on_invocation_started()
+                            if inspect.isawaitable(started):
+                                await started
                         if event.method.lower().endswith("tokenusage/updated"):
                             token_usage = _codex_usage_dict(payload) or token_usage
                         activity = _codex_item_activity(
@@ -1162,8 +1211,10 @@ async def _run_codex_agent(
                     token_usage = _codex_usage_dict(
                         getattr(turn_obj, "usage", None)
                     )
-                # Codex reports tokens but no dollar cost.
-                record_agent_usage(config, token_usage, None)
+                # Codex reports tokens but no dollar cost. Skip a turn that
+                # produced neither text nor tokens: it never reached the model.
+                if text_parts or _usage_has_tokens(token_usage):
+                    record_agent_usage(config, token_usage, None)
 
                 if log_fh:
                     log_fh.write("\n")
@@ -1206,22 +1257,6 @@ async def run_agent(
         raise ValueError(f"Unsupported agent backend: {invocation_config.backend}")
 
     selected_model = resolve_agent_model(invocation_config, model)
-    history_changed = False
-    if invocation_config.backend not in config.backends_used:
-        config.backends_used.append(invocation_config.backend)
-        history_changed = True
-    if selected_model not in config.models_used:
-        config.models_used.append(selected_model)
-        history_changed = True
-    if history_changed and config.agent_history_changed is not None:
-        try:
-            changed = config.agent_history_changed()
-            if inspect.isawaitable(changed):
-                await changed
-        except Exception as exc:
-            # History reporting is observational and must never prevent the
-            # selected agent invocation from running.
-            logger.warning("Failed to publish live agent usage history: %s", exc)
     subagent_id = uuid4().hex[:8]
     started_at = time.monotonic()
     status = "failed"
@@ -1236,6 +1271,31 @@ async def run_agent(
         log_file or "-",
     )
 
+    async def register_used_backend_and_model() -> None:
+        """Record this backend/model only now that it has answered.
+
+        Registering before the call would list a model that was merely
+        selected: a gateway rejecting the id (HTTP 400) or an unauthenticated
+        CLI never produces an answer, and the run history then claims a model
+        was used that never ran. ``History used`` must describe what answered.
+        """
+        history_changed = False
+        if invocation_config.backend not in config.backends_used:
+            config.backends_used.append(invocation_config.backend)
+            history_changed = True
+        if selected_model not in config.models_used:
+            config.models_used.append(selected_model)
+            history_changed = True
+        if history_changed and config.agent_history_changed is not None:
+            try:
+                changed = config.agent_history_changed()
+                if inspect.isawaitable(changed):
+                    await changed
+            except Exception as exc:
+                # History reporting is observational and must never prevent the
+                # selected agent invocation from running.
+                logger.warning("Failed to publish live agent usage history: %s", exc)
+
     try:
         if invocation_config.backend == "codex":
             agent_call = _run_codex_agent(
@@ -1249,6 +1309,7 @@ async def run_agent(
                 log_file=log_file,
                 run_control=run_control,
                 sandbox=sandbox,
+                on_invocation_started=register_used_backend_and_model,
             )
         else:
             agent_call = _run_claude_agent(
@@ -1262,6 +1323,7 @@ async def run_agent(
                 log_file=log_file,
                 run_control=run_control,
                 sandbox=sandbox,
+                on_invocation_started=register_used_backend_and_model,
             )
 
         result = await _await_agent_with_semantic_timeout(
@@ -1273,6 +1335,7 @@ async def run_agent(
             sandbox=sandbox,
         )
         status = "killed_after_status_check" if run_control.killed_after_status_check else "completed"
+        await register_used_backend_and_model()
         return result
     except asyncio.CancelledError:
         status = "cancelled"

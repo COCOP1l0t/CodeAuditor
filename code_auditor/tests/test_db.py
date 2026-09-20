@@ -2140,6 +2140,83 @@ def test_store_startup_removes_cve_links_from_nonconfirmed_disclosures(
     assert reopened.list_cves() == []
 
 
+def test_store_startup_keeps_cve_links_when_project_case_differs(tmp_path) -> None:
+    """A differently-cased CVE project must not delete a legitimately linked CVE.
+
+    Legacy rows stored the CVE project verbatim (``QEMU``) while the owning
+    Disclosure is keyed lower-case (``qemu``). Startup link validation used an
+    exact project comparison, so every such link looked unconfirmed and was
+    deleted along with its cascading ``cves`` row.
+    """
+    out = _make_disclosure_output(tmp_path / "qemu")
+    db_path = tmp_path / "history.db"
+    store = AuditStore(str(db_path))
+    store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    key = store.list_disclosed()[0]["dedupe_key"]
+    assert store.set_disclosed_status("qemu", key, "confirmed")
+    imported = store.import_cve(
+        {
+            "cve_id": "CVE-2026-8341",
+            "cve_url": "https://www.cve.org/CVERecord?id=CVE-2026-8341",
+            "dedupe_keys": [key],
+        }
+    )
+    assert imported["project"] == "qemu"
+    # Reproduce the legacy on-disk casing without going through import_cve,
+    # which now always stores the Disclosure's own project spelling.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE cves SET project = 'QEMU' WHERE cve_id = 'CVE-2026-8341'")
+
+    reopened = AuditStore(str(db_path))
+    with reopened._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM cve_links").fetchone()[0] == 1
+    cves = reopened.list_cves()
+    assert [cve["cve_id"] for cve in cves] == ["CVE-2026-8341"]
+    # The case-insensitive read path still resolves the link to its evidence.
+    assert cves[0]["confirmed_disclosures"][0]["dedupe_key"] == key
+    assert cves[0]["pocs"][0]["vuln_id"] == "H-01"
+    assert reopened.list_disclosed()[0]["cves"] == [
+        {
+            "cve_id": "CVE-2026-8341",
+            "cve_url": "https://www.cve.org/CVERecord?id=CVE-2026-8341",
+        }
+    ]
+
+
+def test_store_startup_still_removes_cve_links_for_a_wrong_project(tmp_path) -> None:
+    """Case-insensitive matching must not weaken the project ownership check."""
+    out = _make_disclosure_output(tmp_path / "qemu")
+    db_path = tmp_path / "history.db"
+    store = AuditStore(str(db_path))
+    store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    key = store.list_disclosed()[0]["dedupe_key"]
+    assert store.set_disclosed_status("qemu", key, "confirmed")
+    store.import_cve(
+        {
+            "cve_id": "CVE-2026-8341",
+            "cve_url": "https://www.cve.org/CVERecord?id=CVE-2026-8341",
+            "dedupe_keys": [key],
+        }
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE cves SET project = 'virtualbox' WHERE cve_id = 'CVE-2026-8341'"
+        )
+
+    reopened = AuditStore(str(db_path))
+    assert reopened.list_cves() == []
+    with reopened._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM cve_links").fetchone()[0] == 0
+
+
 def test_cve_import_candidates_only_include_confirmed_disclosures(tmp_path) -> None:
     out = _make_disclosure_output(tmp_path / "qemu")
     store = AuditStore(str(tmp_path / "history.db"))

@@ -39,6 +39,19 @@ def test_unknown_model_error_is_non_retryable() -> None:
     assert _is_non_retryable_agent_error(exc)
 
 
+def test_gateway_rejects_the_model_without_retrying() -> None:
+    """A gateway's bare "supported model is required" must not be retried.
+
+    A gateway that serves a single model id answers an unserved one with HTTP
+    400 before any work happens, so retrying only re-sends the same request.
+    """
+    exc = RuntimeError(
+        "Agent ended with an error result: API Error: 400 "
+        "A supported model is required."
+    )
+    assert _is_non_retryable_agent_error(exc)
+
+
 def test_sanitize_task_error_text_strips_sdk_debug_lines() -> None:
     raw = (
         "Command failed with exit code 1 (exit code: 1)\n"

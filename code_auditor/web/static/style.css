@@ -1559,22 +1559,6 @@ button.tab {
   font-size: 0.85rem;
 }
 
-#history-table {
-  min-width: 1460px;
-  table-layout: fixed;
-}
-
-.col-history-id { width: 54px; }
-.col-history-target { width: 150px; }
-.col-history-commit { width: 85px; }
-.col-history-started { width: 180px; }
-.col-history-duration { width: 105px; }
-.col-history-status { width: 105px; }
-.col-history-backends { width: 220px; }
-.col-history-usage { width: 220px; }
-.col-history-reproduced { width: 135px; }
-.col-history-actions { width: 105px; }
-
 #history-table th,
 #history-table td,
 #run-vulns-table th,
@@ -1588,9 +1572,6 @@ button.tab {
 
 #history-table th,
 #history-table td {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   vertical-align: middle;
 }
 
@@ -2045,17 +2026,8 @@ tr.run-row:hover {
 #cves-table,
 #trash-table {
   width: 100%;
-  table-layout: fixed;
   border-collapse: collapse;
   font-size: 0.85rem;
-}
-
-#cves-table {
-  min-width: 1250px;
-}
-
-#trash-table {
-  min-width: 900px;
 }
 
 #disclosures-table th,
@@ -2079,7 +2051,6 @@ tr.run-row:hover {
   font-weight: 650;
   letter-spacing: 0.07em;
   text-transform: uppercase;
-  white-space: nowrap;
 }
 
 .sort-button {
@@ -2606,10 +2577,6 @@ th[aria-sort="descending"] .sort-button::after {
   white-space: normal;
 }
 
-#trash-table .col-trash-select {
-  width: 3.2rem;
-}
-
 #trash-table .selection-cell {
   text-align: center;
 }
@@ -2781,31 +2748,60 @@ th[aria-sort="descending"] .sort-button::after {
   padding: 0.15rem 0.35rem;
 }
 
-/* Proportional defaults keep the eight columns inside the shell at any width, so
-   the table never forces the bottom scrollbar. The Actions column stays auto and
-   absorbs the remainder plus any sub-pixel rounding. Dragging a header divider
-   (see .column-resizer) rewrites these inline; double-click restores them. */
-.col-disclosure-status { width: 10%; }
-.col-disclosure-project { width: 8%; }
-.col-disclosure-title { width: 22%; }
-.col-disclosure-cve { width: 10%; }
-.col-disclosure-cwe { width: 11%; }
-.col-disclosure-commit { width: 7%; }
-.col-disclosure-date { width: 8%; }
-.col-disclosure-actions { width: auto; }
+/* Content sizes columns until a divider is moved. Manual widths are stored as
+   proportions so the table still follows its container when the viewport changes. */
+table.resizable-table {
+  width: 100%;
+  /* Keep narrow screens readable; the shell scrolls instead of stacking
+     long descriptions into one-character lines. */
+  min-width: calc(var(--table-column-count) * 6rem);
+  border-collapse: collapse;
+  table-layout: auto;
+  font-size: 0.85rem;
+}
 
-/* Column resizing for the Disclosure table. Each header except the last carries
-   an invisible divider hit area straddling its right border; the adjacent-column
-   logic in app.js:wireResizableTable keeps the total at 100%, so dragging never
-   introduces a scrollbar. */
-#disclosures-table th {
+table.resizable-table--manual {
+  table-layout: fixed;
+}
+
+table.resizable-table th,
+table.resizable-table td {
+  min-width: 56px;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+table.resizable-table th {
   position: relative;
+  padding-right: 0.9rem;
+  color: var(--dim);
+  font-size: 0.7rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+table.resizable-table :is(.row-actions, .status-control) {
+  flex-wrap: wrap;
+  white-space: normal;
+  row-gap: 0.3rem;
+}
+
+table.resizable-table :is(button, select, .badge, .sev-badge, .table-link-list > *) {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .column-resizer {
   position: absolute;
   top: 0;
-  right: -5px;
+  right: 0;
   width: 10px;
   height: 100%;
   z-index: 2;
@@ -2823,7 +2819,7 @@ th[aria-sort="descending"] .sort-button::after {
   width: 2px;
   margin-left: -1px;
   border-radius: 1px;
-  background: transparent;
+  background: var(--border);
   transition: background 120ms ease;
 }
 
@@ -2834,35 +2830,14 @@ body.column-resizing .column-resizer::after {
 }
 
 .column-resizer:focus-visible {
-  outline: none;
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 body.column-resizing {
   cursor: col-resize;
   user-select: none;
 }
-
-/* Narrow shells wrap the action buttons instead of widening the table. */
-#disclosures-table .row-actions {
-  flex-wrap: wrap;
-  white-space: normal;
-  row-gap: 0.3rem;
-}
-
-.col-cve-id { width: 160px; }
-.col-cve-project { width: 125px; }
-.col-cve-score { width: 72px; }
-.col-cve-severity { width: 105px; }
-.col-cve-public { width: 265px; }
-.col-cve-local { width: 375px; }
-.col-cve-actions { width: 215px; }
-
-.col-trash-deleted { width: 155px; }
-.col-trash-expiry { width: 180px; }
-.col-trash-project { width: 130px; }
-.col-trash-title { width: 360px; }
-.col-trash-status { width: 110px; }
-.col-trash-actions { width: 100px; }
 
 .badge-disc-confirmed {
   color: #56d364;

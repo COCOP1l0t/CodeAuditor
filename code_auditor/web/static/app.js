@@ -3107,9 +3107,31 @@ function wireSortableTable(tableId, state, reload) {
 
 function wireResizableTable(tableId) {
   const table = $(tableId);
-  const columns = [...table.querySelectorAll("colgroup col")];
-  const headers = [...table.querySelectorAll("thead th")];
-  if (columns.length !== headers.length || columns.length < 2) return;
+  if (!table || table.classList.contains("resizable-table")) return;
+  const headers = [...(table.tHead?.rows[0]?.cells || [])];
+  if (headers.length < 2) return;
+  let colgroup = table.querySelector(":scope > colgroup");
+  if (!colgroup) {
+    colgroup = document.createElement("colgroup");
+    headers.forEach(() => colgroup.appendChild(document.createElement("col")));
+    table.insertBefore(colgroup, table.tHead);
+  }
+  const columns = [...colgroup.children];
+  if (columns.length !== headers.length) return;
+
+  if (!table.parentElement.classList.contains("table-shell")) {
+    const shell = document.createElement("div");
+    shell.className = "table-shell";
+    shell.tabIndex = 0;
+    shell.setAttribute(
+      "aria-label",
+      table.closest("section")?.querySelector("h2")?.textContent.trim() || "Table"
+    );
+    table.before(shell);
+    shell.appendChild(table);
+  }
+  table.classList.add("resizable-table");
+  table.style.setProperty("--table-column-count", headers.length);
 
   const columnWidths = () =>
     headers.map((header) => header.getBoundingClientRect().width);
@@ -3117,27 +3139,37 @@ function wireResizableTable(tableId) {
   const applyWidths = (widths) => {
     const total = widths.reduce((sum, width) => sum + width, 0);
     if (total <= 0) return;
+    // Freeze the measured auto layout only after a manual adjustment. Ratios
+    // keep the user's allocation responsive to the available viewport width.
+    table.classList.add("resizable-table--manual");
     columns.forEach((column, index) => {
       column.style.width = `${(widths[index] / total) * 100}%`;
     });
   };
 
+  const resetWidths = () => {
+    table.classList.remove("resizable-table--manual");
+    columns.forEach((column) => column.style.removeProperty("width"));
+  };
+
   const resizeBoundary = (index, startWidths, delta) => {
     const widths = [...startWidths];
-    const combined = widths[index] + widths[index + 1];
-    const requestedMinimums = [56, 56];
-    const minimumScale = Math.min(
-      1,
-      combined / (requestedMinimums[0] + requestedMinimums[1])
-    );
-    const leftMinimum = requestedMinimums[0] * minimumScale;
-    const rightMinimum = requestedMinimums[1] * minimumScale;
-    const boundedDelta = Math.max(
-      leftMinimum - widths[index],
-      Math.min(delta, widths[index + 1] - rightMinimum)
-    );
-    widths[index] += boundedDelta;
-    widths[index + 1] -= boundedDelta;
+    const direction = delta >= 0 ? 1 : -1;
+    const growing = direction > 0 ? index : index + 1;
+    let remaining = Math.abs(delta);
+    // Borrow from further columns when the immediate neighbour is already at
+    // its minimum (for example AU next to Files), keeping every divider useful.
+    for (
+      let donor = direction > 0 ? index + 1 : index;
+      donor >= 0 && donor < widths.length && remaining > 0;
+      donor += direction
+    ) {
+      const minimum = Math.min(56, startWidths[donor]);
+      const taken = Math.min(remaining, Math.max(0, widths[donor] - minimum));
+      widths[donor] -= taken;
+      widths[growing] += taken;
+      remaining -= taken;
+    }
     applyWidths(widths);
   };
 
@@ -3149,14 +3181,16 @@ function wireResizableTable(tableId) {
     resizer.setAttribute("aria-orientation", "vertical");
     resizer.setAttribute(
       "aria-label",
-      `Resize ${header.textContent.trim()} column`
+      `Resize ${header.textContent.trim() || "selection"} column`
     );
-    resizer.title = "Drag to resize columns; double-click to reset";
+    resizer.title = "Drag or use arrow keys to resize; double-click or press Home for automatic widths";
     header.appendChild(resizer);
+    resizer.addEventListener("click", (event) => event.stopPropagation());
 
     resizer.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
       event.preventDefault();
+      event.stopPropagation();
       const startX = event.clientX;
       const startWidths = columnWidths();
       resizer.setPointerCapture(event.pointerId);
@@ -3171,14 +3205,24 @@ function wireResizableTable(tableId) {
         resizer.removeEventListener("pointermove", move);
         resizer.removeEventListener("pointerup", finish);
         resizer.removeEventListener("pointercancel", finish);
+        resizer.removeEventListener("lostpointercapture", finish);
+        if (resizer.hasPointerCapture(event.pointerId)) {
+          resizer.releasePointerCapture(event.pointerId);
+        }
         document.body.classList.remove("column-resizing");
       };
       resizer.addEventListener("pointermove", move);
       resizer.addEventListener("pointerup", finish);
       resizer.addEventListener("pointercancel", finish);
+      resizer.addEventListener("lostpointercapture", finish);
     });
 
     resizer.addEventListener("keydown", (event) => {
+      if (event.key === "Home") {
+        event.preventDefault();
+        resetWidths();
+        return;
+      }
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
       event.preventDefault();
       resizeBoundary(
@@ -3188,8 +3232,10 @@ function wireResizableTable(tableId) {
       );
     });
 
-    resizer.addEventListener("dblclick", () => {
-      columns.forEach((column) => column.style.removeProperty("width"));
+    resizer.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      resetWidths();
     });
   });
 }
@@ -4356,8 +4402,8 @@ function renderCveProjectOptions(projects) {
 $("cve-project").addEventListener("change", loadCves);
 
 wireSortableTable("disclosures-table", disclosureSort, loadDisclosures);
-wireResizableTable("disclosures-table");
 wireSortableTable("cves-table", cveSort, loadCves);
+document.querySelectorAll("table[id]").forEach((table) => wireResizableTable(table.id));
 
 function addCveReferenceRow(reference = {}) {
   const row = document.createElement("div");

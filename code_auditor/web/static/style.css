@@ -1553,7 +1553,6 @@ button.tab {
 
 #history-table,
 #run-vulns-table,
-#sandbox-executions-table,
 #target-aus-table {
   width: 100%;
   border-collapse: collapse;
@@ -1580,8 +1579,6 @@ button.tab {
 #history-table td,
 #run-vulns-table th,
 #run-vulns-table td,
-#sandbox-executions-table th,
-#sandbox-executions-table td,
 #target-aus-table th,
 #target-aus-table td {
   text-align: left;
@@ -1599,7 +1596,6 @@ button.tab {
 
 #history-table th,
 #run-vulns-table th,
-#sandbox-executions-table th,
 #target-aus-table th {
   color: var(--dim);
   font-size: 0.7rem;
@@ -2254,6 +2250,22 @@ th[aria-sort="descending"] .sort-button::after {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.65rem;
+}
+
+.settings-field-label {
+  margin: 0.9rem 0 0.4rem;
+  color: var(--fg);
+  font-size: 0.85rem;
+  font-weight: 620;
+}
+
+.settings-network-field {
+  display: block;
+  margin-top: 0.9rem;
+}
+
+.settings-network-field[hidden] {
+  display: none;
 }
 
 .settings-radio-option {
@@ -3424,10 +3436,4 @@ dialog {
     animation: none;
     opacity: 1;
   }
-}
-#sandbox-executions-panel .table-wrap { overflow-x: auto; margin-top: 0.75rem; }
-#sandbox-executions-table { min-width: 720px; }
-#sandbox-executions-table td:nth-child(4) {
-  max-width: 20rem;
-  overflow-wrap: anywhere;
 }

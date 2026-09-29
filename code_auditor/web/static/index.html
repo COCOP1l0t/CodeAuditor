@@ -190,37 +190,37 @@
         </div>
         <fieldset class="settings-sandbox">
           <legend>Stage 5/6 execution</legend>
-          <label>Container runtime
-            <select id="s-sandbox-runtime">
-              <option value="docker-default">Docker default</option>
-              <option value="runc">runc</option>
-              <option value="runsc">gVisor (runsc)</option>
-            </select>
-            <span class="hint">Applies to new tasks and resumed executions. gVisor must be registered on the server.</span>
-          </label>
-          <div class="settings-radio-list">
-            <label class="settings-radio-option" data-sandbox-option="docker-networked">
-              <input type="radio" name="sandbox-mode" value="docker-networked" required />
+          <p class="settings-field-label" id="s-sandbox-kind-label">Sandbox</p>
+          <div class="settings-radio-list" role="radiogroup" aria-labelledby="s-sandbox-kind-label">
+            <label class="settings-radio-option" data-sandbox-kind="docker">
+              <input type="radio" name="sandbox-kind" value="docker" required />
               <span>
-                <strong>Docker sandbox with network</strong>
-                <small>Disposable workspace with Docker bridge networking for build dependencies.</small>
+                <strong>Docker</strong>
+                <small>Disposable container using the server's default Docker runtime.</small>
               </span>
             </label>
-            <label class="settings-radio-option" data-sandbox-option="docker-isolated">
-              <input type="radio" name="sandbox-mode" value="docker-isolated" required />
+            <label class="settings-radio-option" data-sandbox-kind="gvisor">
+              <input type="radio" name="sandbox-kind" value="gvisor" required />
               <span>
-                <strong>Docker sandbox without network</strong>
-                <small>Disables networking for both the Agent CLI and target; network model APIs will be unavailable.</small>
+                <strong>gVisor</strong>
+                <small>Same container image, run under the registered runsc runtime.</small>
               </span>
             </label>
-            <label class="settings-radio-option" data-sandbox-option="local-worktree">
-              <input type="radio" name="sandbox-mode" value="local-worktree" required />
+            <label class="settings-radio-option" data-sandbox-kind="local-worktree">
+              <input type="radio" name="sandbox-kind" value="local-worktree" required />
               <span>
                 <strong>Local worktree</strong>
-                <small>Run on the server host in a detached Git worktree, without Docker isolation.</small>
+                <small>Run on the server host in a detached Git worktree, without container isolation.</small>
               </span>
             </label>
           </div>
+          <label id="s-sandbox-network-label" class="settings-network-field">Container network
+            <select id="s-sandbox-network">
+              <option value="networked">Bridge network — build dependencies and remote model APIs</option>
+              <option value="isolated">No network — blocks remote model APIs</option>
+            </select>
+            <span class="hint">Only applies to the Docker and gVisor sandboxes.</span>
+          </label>
           <p id="s-sandbox-status" class="settings-sandbox-status" aria-live="polite">
             Checking this server environment…
           </p>
@@ -435,17 +435,6 @@
         </div>
         <p id="run-resume-message" class="registry-message dim" role="status"></p>
         <div id="run-meta" class="meta-grid"></div>
-      </section>
-      <section class="panel" id="sandbox-executions-panel">
-        <h2>Container executions</h2>
-        <p class="dim" id="sandbox-executions-status">Loading recorded environments…</p>
-        <button type="button" class="btn" id="btn-refresh-sandbox-executions">Refresh</button>
-        <div class="table-wrap">
-          <table id="sandbox-executions-table">
-            <thead><tr><th>Task</th><th>Started</th><th>Runtime</th><th>Image ID</th><th>State / exit</th><th>Cleanup</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
       </section>
       <section class="panel" id="stages-panel">
         <h2>Stages</h2>

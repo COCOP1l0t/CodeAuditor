@@ -1964,7 +1964,11 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="f-local-directory-path"' in res.text
     assert 'id="btn-choose-local-directory"' in res.text
     assert 'id="f-wiki-select"' in res.text
-    assert res.text.count('name="sandbox-mode"') == 3
+    assert res.text.count('name="sandbox-kind"') == 3
+    assert 'value="docker"' in res.text
+    assert 'value="gvisor"' in res.text
+    assert 'id="s-sandbox-network"' in res.text
+    assert 'id="s-sandbox-runtime"' not in res.text
     assert 'data-route="cves"' in res.text
     assert 'data-route="trash"' in res.text
     assert 'id="btn-cve-import"' in res.text

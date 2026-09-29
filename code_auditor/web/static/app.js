@@ -63,7 +63,6 @@ let historyServerFiltering = null;
 let liveDetailRunId = null;
 // Run id currently displayed on the run detail page (live or static).
 let detailRunId = null;
-let sandboxExecutionsSequence = 0;
 let detailEventSource = null;
 let processTreeTimer = null;
 let processTreeRunId = null;
@@ -215,14 +214,16 @@ function agentBackendLabel(backend) {
   return backend === "codex" ? "Codex SDK" : "Claude Agent SDK";
 }
 
-function sandboxModeLabel(mode) {
-  if (mode === "docker-isolated") return "Docker sandbox · offline";
-  if (mode === "local-worktree") return "local worktree · no sandbox";
-  return "Docker sandbox · networked";
-}
-
-function sandboxRuntimeLabel(runtime) {
-  return runtime === "runsc" ? "gVisor" : runtime === "runc" ? "runc" : "Docker default";
+function sandboxKindLabel(settings) {
+  const mode = settings?.sandbox_mode || "docker-networked";
+  if (mode === "local-worktree") return "Local worktree · no sandbox";
+  const runtime =
+    (settings?.sandbox_runtime || "docker-default") === "runsc"
+      ? "gVisor"
+      : "Docker";
+  return mode === "docker-isolated"
+    ? `${runtime} · offline`
+    : `${runtime} · networked`;
 }
 
 function formatBytes(bytes) {
@@ -245,9 +246,7 @@ function updateAgentSettingsSummary() {
   const providerSummary = provider.mode === "custom"
     ? `${agentBackendLabel(backend)} · ${provider.model || "custom provider"}`
     : `${agentBackendLabel(backend)} · local CLI configuration`;
-  const runtime = agentSettings.sandbox_mode === "local-worktree" ? ""
-    : ` · ${sandboxRuntimeLabel(agentSettings.sandbox_runtime)}`;
-  const summary = `${providerSummary} · ${sandboxModeLabel(agentSettings.sandbox_mode)}${runtime}`;
+  const summary = `${providerSummary} · ${sandboxKindLabel(agentSettings)}`;
   $("agent-settings-summary").textContent = summary;
   $("f-agent-summary").textContent = summary;
   renderDashboardRuntime();
@@ -344,32 +343,87 @@ function renderAgentSettingsForm() {
   $("s-api-key").placeholder = provider.api_key_configured
     ? "Stored key (leave blank to keep)"
     : "Enter API key";
-  const sandboxMode = agentSettings.sandbox_mode || "docker-networked";
-  $("s-sandbox-runtime").value = agentSettings.sandbox_runtime || "docker-default";
-  for (const input of document.querySelectorAll('input[name="sandbox-mode"]')) {
-    input.checked = input.value === sandboxMode;
+  const storedMode = agentSettings.sandbox_mode || "docker-networked";
+  const kind = sandboxKindFromSettings(agentSettings);
+  $("s-sandbox-network").value =
+    storedMode === "docker-isolated" ? "isolated" : "networked";
+  for (const input of document.querySelectorAll('input[name="sandbox-kind"]')) {
+    input.checked = input.value === kind;
   }
+  updateSandboxNetworkAvailability();
   updateAgentSettingsMode();
   void loadSandboxCapability(backend);
 }
 
+// The persisted settings keep two orthogonal fields (sandbox_mode for
+// networked/isolated/local-worktree and sandbox_runtime for docker-default/
+// runsc). The dialog presents the single sandbox choice a reader reasons about
+// and derives both fields from it.
+function sandboxKindFromSettings(settings) {
+  const mode = settings?.sandbox_mode || "docker-networked";
+  if (mode === "local-worktree") return "local-worktree";
+  return (settings?.sandbox_runtime || "docker-default") === "runsc"
+    ? "gvisor"
+    : "docker";
+}
+
+function selectedSandboxKind() {
+  const checked = document.querySelector('input[name="sandbox-kind"]:checked');
+  return checked ? checked.value : "docker";
+}
+
+function sandboxRuntimeForKind(kind) {
+  return kind === "gvisor" ? "runsc" : "docker-default";
+}
+
+// One sandbox choice maps onto the two persisted settings fields. The local
+// worktree sends no runtime so the remembered container runtime survives a
+// round trip through that mode.
+function sandboxSubmissionFields(kind, network) {
+  if (kind === "local-worktree") {
+    return { sandbox_mode: "local-worktree" };
+  }
+  return {
+    sandbox_mode: network === "isolated" ? "docker-isolated" : "docker-networked",
+    sandbox_runtime: sandboxRuntimeForKind(kind),
+  };
+}
+
+// Container networking only means something for the Docker and gVisor
+// sandboxes; the local worktree has no container network to configure.
+function updateSandboxNetworkAvailability() {
+  const container = selectedSandboxKind() !== "local-worktree";
+  $("s-sandbox-network-label").hidden = !container;
+  $("s-sandbox-network").disabled = !container;
+}
+
 let sandboxCapabilityRequest = 0;
 
-function setDockerSandboxOptionsAvailable(available) {
-  for (const mode of ["docker-networked", "docker-isolated"]) {
-    const input = document.querySelector(
-      `input[name="sandbox-mode"][value="${mode}"]`
-    );
-    const option = document.querySelector(`[data-sandbox-option="${mode}"]`);
-    input.disabled = !available;
-    option.classList.toggle("is-unavailable", !available);
-  }
+// Only the sandbox kind that was just probed is marked unavailable. gVisor can
+// be missing while the Docker default still works (and vice versa), so
+// blanket-disabling every container option would hide a usable sandbox.
+function setSandboxKindAvailable(kind, available) {
+  const input = document.querySelector(
+    `input[name="sandbox-kind"][value="${kind}"]`
+  );
+  if (!input) return;
+  input.disabled = !available;
+  input
+    .closest("[data-sandbox-kind]")
+    ?.classList.toggle("is-unavailable", !available);
 }
 
 async function loadSandboxCapability(backend) {
   const request = ++sandboxCapabilityRequest;
-  const runtime = $("s-sandbox-runtime").value;
-  setDockerSandboxOptionsAvailable(false);
+  const kind = selectedSandboxKind();
+  if (kind === "local-worktree") {
+    $("s-sandbox-status").dataset.state = "ready";
+    $("s-sandbox-status").textContent =
+      "Local worktree runs on the server host in a detached Git worktree, without Docker isolation.";
+    return;
+  }
+  const runtime = sandboxRuntimeForKind(kind);
+  setSandboxKindAvailable(kind, true);
   $("s-sandbox-status").dataset.state = "checking";
   $("s-sandbox-status").textContent =
     "Checking Docker, image, scratch disk, and Agent runtime on this server…";
@@ -382,17 +436,17 @@ async function loadSandboxCapability(backend) {
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
     if (request !== sandboxCapabilityRequest) return;
     const docker = data.docker || {};
-    setDockerSandboxOptionsAvailable(docker.available === true);
+    setSandboxKindAvailable(kind, docker.available === true);
     $("s-sandbox-status").dataset.state = docker.available ? "ready" : "unavailable";
     $("s-sandbox-status").textContent = docker.available
       ? `${docker.reason} Free scratch space: ${formatBytes(docker.free_bytes || 0)}.`
-      : `Docker sandbox unavailable: ${docker.reason || "environment check failed"}`;
+      : `Sandbox unavailable: ${docker.reason || "environment check failed"}`;
   } catch (error) {
     if (request !== sandboxCapabilityRequest) return;
-    setDockerSandboxOptionsAvailable(false);
+    setSandboxKindAvailable(kind, false);
     $("s-sandbox-status").dataset.state = "unavailable";
     $("s-sandbox-status").textContent =
-      `Docker sandbox check failed: ${error.message || error}`;
+      `Sandbox check failed: ${error.message || error}`;
   }
 }
 
@@ -426,7 +480,12 @@ $("btn-settings").addEventListener("click", async () => {
 $("btn-settings-cancel").addEventListener("click", () => settingsDialog.close());
 $("s-backend").addEventListener("change", renderAgentSettingsForm);
 $("s-mode").addEventListener("change", updateAgentSettingsMode);
-$("s-sandbox-runtime").addEventListener("change", () => loadSandboxCapability($("s-backend").value));
+for (const input of document.querySelectorAll('input[name="sandbox-kind"]')) {
+  input.addEventListener("change", () => {
+    updateSandboxNetworkAvailability();
+    void loadSandboxCapability($("s-backend").value);
+  });
+}
 $("s-clear-key").addEventListener("change", updateAgentSettingsMode);
 
 $("settings-form").addEventListener("submit", async (event) => {
@@ -441,13 +500,15 @@ $("settings-form").addEventListener("submit", async (event) => {
     model: $("s-model").value.trim(),
     clear_api_key: $("s-clear-key").checked,
   };
-  const sandboxMode = document.querySelector('input[name="sandbox-mode"]:checked');
-  if (!sandboxMode || sandboxMode.disabled) {
-    errorBox.textContent = "Select an available Stage 5/6 execution mode.";
+  const sandboxKind = document.querySelector('input[name="sandbox-kind"]:checked');
+  if (!sandboxKind || sandboxKind.disabled) {
+    errorBox.textContent = "Select an available Stage 5/6 sandbox.";
     return;
   }
-  body.sandbox_mode = sandboxMode.value;
-  body.sandbox_runtime = $("s-sandbox-runtime").value;
+  Object.assign(
+    body,
+    sandboxSubmissionFields(sandboxKind.value, $("s-sandbox-network").value)
+  );
   const apiKey = $("s-api-key").value;
   if (apiKey) body.api_key = apiKey;
   saveButton.disabled = true;
@@ -499,9 +560,7 @@ function dashboardAgentLabel() {
 
 function renderDashboardRuntime() {
   $("dashboard-agent").textContent = dashboardAgentLabel();
-  $("dashboard-sandbox").textContent = sandboxModeLabel(
-    agentSettings?.sandbox_mode || "docker-networked"
-  );
+  $("dashboard-sandbox").textContent = sandboxKindLabel(agentSettings);
 }
 
 function dashboardStatusLabel(status) {
@@ -2550,47 +2609,6 @@ $("btn-import").addEventListener("click", async () => {
 });
 
 // ── Run detail view ─────────────────────────────────────────────────────────
-async function loadSandboxExecutions(runId) {
-  const table = $("sandbox-executions-table");
-  const status = $("sandbox-executions-status");
-  const sequence = ++sandboxExecutionsSequence;
-  table.querySelector("tbody").replaceChildren();
-  status.textContent = "Loading recorded environments…";
-  try {
-    const res = await fetch(`/api/history/${runId}/sandbox-executions`, { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    // Ignore a slow response that lost the race against a newer request or a
-    // navigation away from this run.
-    if (sequence !== sandboxExecutionsSequence) return;
-    if (String(detailRunId) !== String(runId)) return;
-    const rows = data.executions || [];
-    status.textContent = rows.length
-      ? `Showing ${rows.length} of ${data.total} launches. Earlier artifacts may have no environment record.`
-      : "No container execution records. The environment of earlier artifacts is unknown.";
-    for (const row of rows) {
-      const tr = document.createElement("tr");
-      const runtime = row.runtime || `Not verified (${row.configured_runtime || "unknown"})`;
-      for (const value of [row.task_name, fmtTime(row.started_at), runtime,
-        row.image_id || "Not verified", `${row.state || "unknown"} / ${row.exit_code ?? "—"}`,
-        row.cleanup || "unknown"]) {
-        const td = document.createElement("td");
-        td.textContent = value;
-        tr.appendChild(td);
-      }
-      table.querySelector("tbody").appendChild(tr);
-    }
-  } catch (error) {
-    if (sequence === sandboxExecutionsSequence && String(detailRunId) === String(runId)) {
-      status.textContent = `Execution records unavailable: ${error.message}`;
-    }
-  }
-}
-
-$("btn-refresh-sandbox-executions").addEventListener("click", () => {
-  if (detailRunId != null) void loadSandboxExecutions(detailRunId);
-});
-
 // A run detail rebuild is not re-entrant. `loadRunDetail` opens the run's SSE
 // stream and the heartbeat/lifecycle paths call it again from that stream's
 // terminal event, so a resumed run that fails moments after starting used to
@@ -2662,7 +2680,6 @@ async function reloadRunDetail(runId) {
   // Decide whether this run has a live job: then the Stages/Logs panels
   // follow its per-run SSE stream; otherwise they show recorded artifacts.
   detailRunId = run.id;
-  void loadSandboxExecutions(run.id);
   let status = null;
   try {
     const res = await fetch(`/api/audit/${run.id}/status`);

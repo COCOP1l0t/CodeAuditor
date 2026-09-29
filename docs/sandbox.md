@@ -147,7 +147,7 @@ Docker 支持 reload 更新 `runtimes`，见 [daemon 配置重载说明](https:/
 
 ### 在 CodeAuditor 中选择 gVisor
 
-在 **Settings → Stage 5/6 execution** 中，将 `Container runtime` 改为 **gVisor (runsc)**，保持所需网络模式并保存。检查失败时不能启用；实际启动遇到 runtime 不可用或检查不匹配也会失败，不会回退到 runc。
+在 **Settings → Stage 5/6 execution** 的 **Sandbox** 中选择 **gVisor**，通过 **Container network** 选择所需网络模式并保存。检查失败时不能启用；实际启动遇到 runtime 不可用或检查不匹配也会失败，不会回退到 runc。
 
 设置保存在 `~/.code_auditor/settings.json`。以下仅列相关字段，其他字段应保留；运行中的 Web 服务优先通过界面修改：
 
@@ -181,7 +181,7 @@ Docker 支持 reload 更新 `runtimes`，见 [daemon 配置重载说明](https:/
 | 断网后模型连接失败 | 选择联网模式；`--network none` 同样隔离模型 API |
 | gVisor 启动或 syscall 失败 | 查看启动错误，结合 [gVisor 兼容性说明](https://gvisor.dev/docs/user_guide/compatibility/)核对工作负载；可显式切换回 runc |
 
-回退 CodeAuditor 的执行方式时，在 Web 中选择 **runc**，保存后用于新任务或恢复执行。保留正在运行的 runsc 容器所依赖的旧安装目录。
+回退 CodeAuditor 的执行方式时，在 Web 中选择 **Docker**，保存后用于新任务或恢复执行；该选项使用 Docker daemon 的默认 runtime，先确认它已设为 runc。保留正在运行的 runsc 容器所依赖的旧安装目录。
 
 撤销 Docker 配置修改前，先确认没有任务继续使用该 runtime，核对脚本输出的备份文件及此后的其他配置改动。可用 `dockerd --validate --config-file <备份路径>` 验证，再恢复对应配置并 reload。若原配置不存在，则没有备份，此时只移除新增的 `runtimes.runsc`，保留后来加入的其他配置。
 
@@ -189,7 +189,7 @@ Docker 支持 reload 更新 `runtimes`，见 [daemon 配置重载说明](https:/
 
 ## Execution implementation reference
 
-Stage 5/6 Docker execution supports `docker-default`, `runc`, and optional gVisor (`runsc`). Choose the runtime in Web Settings; it is persisted as `sandbox_runtime` in the server's settings file. `docker-default` resolves Docker's default when a task prepares its scratch directory. That resolved runtime and the inspected immutable image ID are then passed explicitly to every container for that scratch.
+Stage 5/6 Docker execution supports `docker-default`, `runc`, and optional gVisor (`runsc`). Web Settings presents **Docker** (`docker-default`) and **gVisor** (`runsc`), with container networking configured separately; **Local worktree** runs on the host. The runtime is persisted as `sandbox_runtime` in the server's settings file. `docker-default` resolves Docker's default when a task prepares its scratch directory. That resolved runtime and the inspected immutable image ID are then passed explicitly to every container for that scratch.
 
 New jobs and resumed executions use the selected setting. An active job keeps its runtime setting. Resuming a run preserves earlier execution records and adds records for subsequent container launches; it does not reclassify previously produced artifacts.
 
@@ -215,7 +215,7 @@ Directories have mode `0700`; newly created records and logs have mode `0600`. R
 
 Records include Run/job and invocation identities, source commit, requested and inspected runtime/image identity, available Docker/runtime/kernel versions, requested and inspected resource/network settings, selected security options, exit/OOM state, and cleanup result. Missing version information remains `null`; a local binary version is not assumed to represent the daemon's runtime. Records intentionally omit command arguments, environment variables, credentials, and complete Docker inspect output. Agent logs still contain Agent output and should be treated as sensitive.
 
-History's **Container executions** panel lists the latest 100 launches. Full records are available through the authenticated API:
+The Web UI does not display these records; they stay host-side logs and journal files. Full records are available through the authenticated API (100 launches per page by default):
 
 - `GET /api/history/{run_id}/sandbox-executions?limit=100&offset=0` (maximum page size 500), filtered by Run ID even when output directories are reused.
 - `GET /api/reproduction/{job_key}/sandbox-executions`, for a standalone reproduction job retained by the Web worker.

@@ -88,9 +88,9 @@ docker build -f docker/code-auditor-sandbox.Dockerfile \
   -t code-auditor-sandbox:latest docker
 ```
 
-在 **Settings → Stage 5/6 execution** 中选择 `docker-default`（默认）、`runc` 或可选的 gVisor（`runsc`）。所选 runtime 必须已在服务端 Docker 中注册；不可用时检查或启动失败，不会自动回退。设置对新任务和恢复执行生效。断网模式也会阻断容器内 Agent 对模型 API 的访问。
+在 **Settings → Stage 5/6 execution** 中选择 **Docker**（服务端 Docker 的默认 runtime）、**gVisor**（`runsc`）或 **Local worktree**。容器的桥接联网或断网模式单独选择。所选 runtime 必须已在服务端 Docker 中注册；不可用时检查或启动失败，不会自动回退。设置对新任务和恢复执行生效。断网模式也会阻断容器内 Agent 对模型 API 的访问。
 
-每次新容器启动都会固定镜像 ID，并在 `.sandbox-executions/` 中记录实际检查到的 runtime、资源设置、退出状态及清理验证结果。Agent 日志由宿主机写入，位于容器挂载范围之外，在临时沙箱清理后保留。**History → Container executions** 可查看记录；没有记录的旧产物仍标记为环境未知。详见[沙箱运行与可选 gVisor 验证](docs/sandbox.md)。
+每次新容器启动都会固定镜像 ID，并在 `.sandbox-executions/` 中记录实际检查到的 runtime、资源设置、退出状态及清理验证结果。Agent 日志由宿主机写入，位于容器挂载范围之外，在临时沙箱清理后保留；这些记录不在 Web 前端展示，仅可通过已认证 API 读取，没有记录的旧产物仍标记为环境未知。详见[沙箱运行与可选 gVisor 验证](docs/sandbox.md)。
 
 **Reproduce** 标签页可选择当前 Disclosure，并在拉取远端默认分支 HEAD 后重新测试。系统会固定并记录不可变的测试 SHA，在 Stage 5/6 配置的沙箱中运行已保留的复现材料，再由 Agent 分析当前源码并提出 Disclosure 更新建议。运行结果、证据等级和 Agent 判断分别保存。成功复现只生成本地草稿；点击 **Apply Draft** 才会归档旧版本并安装已校验的草稿，不会自动发送或公开披露。
 

@@ -49,7 +49,42 @@ If and only if the deterministic outcome is `reproduced`, create a refreshed
 Disclosure package under `__OUTPUT_DIR__/disclosure-draft/`. It must contain
 `report.md`, `email.txt`, executable `reproduce.sh`, `disclosure.zip`, and
 `retain-manifest.json`. Base it on the newly observed evidence and tested commit,
-not historical output. Follow the normal Stage 6 report/email/package format;
-keep ZIP members byte-identical to their local counterparts, exclude email.txt
-and generated caches from the ZIP, and list every retained file in the manifest.
-Do not create a disclosure draft for any other outcome.
+not historical output. Keep ZIP members byte-identical to their local
+counterparts, exclude email.txt and generated caches from the ZIP, and list every
+retained file in the manifest. Do not create a disclosure draft for any other
+outcome.
+
+### Refreshed report.md — exact section contract
+
+The refreshed `report.md` is the document that gets sent upstream, so it is held
+to the Stage 6 disclosure format and is validated mechanically. Use exactly these
+level-2 headings, in this order, with non-empty content under each:
+
+`## Summary`, `## Why This Is a Security Issue`, `## Severity Assessment`,
+`## Pre-requisites`, `## Security Impact`, `## Trigger`, `## Root Cause`,
+`## Reproduction` (with nested `### Steps to Reproduce` and `### Observed Result`).
+`## Why This Is a Security Issue` must be present and non-empty even though the
+Stage 5 retest report does not contain that section.
+
+The Stage 5 retest report is an internal artifact. Do not copy its metadata block
+or its heading names into the draft:
+
+- It carries an internal identifier line (for example `- **Finding ID**: C-02`).
+  A disclosure report must contain **no** internal audit identifier anywhere: no
+  `Finding ID`, `Audit ID`, `Vulnerability ID`, or `Internal ID` line, and no
+  `C-01`/`H-02`-style token. Drop the line entirely — do not rename or reword it.
+- Its `## Severity` heading must become `## Severity Assessment`.
+- Its `## Reproduction Steps` heading must become `## Reproduction`, with the
+  steps nested under `### Steps to Reproduce`.
+- Remove internal workspace paths (`/home/.../.code_auditor/`, `/tmp/code-auditor/`,
+  `stage4-vulnerabilities/`, `stage5-pocs/`, `stage6-disclosures/`).
+
+Keep the CVSS v3.1 vector and the written numeric score consistent, keep the
+report self-contained for a reader with no knowledge of the audit, and state
+evidence boundaries explicitly rather than overclaiming.
+
+Before finishing, self-check the draft: every heading above is present and
+non-empty, the CVSS vector and score agree, no internal identifier or workspace
+path remains, `email.txt` has a `Subject:` header and a blank line before the
+body, `disclosure.zip` members match their local counterparts byte for byte, and
+`retain-manifest.json` lists every retained file.

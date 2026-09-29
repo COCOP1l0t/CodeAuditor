@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent import run_agent
-from .config import AuditConfig, select_poc_model
+from .config import AuditConfig, ValidationIssue, select_poc_model
 from .prompts import load_prompt
 from .retention import (
     export_retained_artifacts,
@@ -28,6 +28,12 @@ _DISPOSITIONS = {
 }
 _OUTCOMES = {"reproduced", "not-reproduced", "inconclusive", "error"}
 _MAX_REVIEW_FILE_BYTES = 4 * 1024 * 1024
+_DRAFT_REQUIRED_PATHS = (
+    "report.md",
+    "email.txt",
+    "disclosure.zip",
+    "reproduce.sh",
+)
 
 
 def _load_assessment(path: Path, expected_outcome: str) -> dict[str, Any]:
@@ -64,6 +70,81 @@ def _copy_regular(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination, follow_symlinks=False)
     os.chmod(destination, 0o600)
+
+
+def _persist_draft(
+    source: Path,
+    destination: Path,
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> bool:
+    """Copy a sandbox draft to a durable path before it is validated.
+
+    A draft that fails validation must stay inspectable instead of disappearing
+    with the sandbox, so it is persisted first and validated afterwards. Only
+    regular files are copied (symlinks and other non-regular entries are
+    rejected) and both per-file and total sizes are bounded, so an unusable
+    draft cannot escape the sandbox or fill the disk.
+
+    Returns True when a copy was made.
+    """
+    if source.resolve() == destination.resolve():
+        return False
+    if os.path.lexists(destination):
+        if destination.is_symlink() or not destination.is_dir():
+            raise ValueError("disclosure draft destination is not a real directory")
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True, mode=0o700)
+    total = 0
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        if path.is_symlink():
+            raise ValueError(f"disclosure draft contains a symlink: {relative}")
+        if path.is_dir():
+            (destination / relative).mkdir(mode=0o700, exist_ok=True)
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(
+                f"disclosure draft contains a non-regular file: {relative}"
+            )
+        if info.st_size > max_file_bytes:
+            raise ValueError(f"disclosure draft file exceeds size limit: {relative}")
+        total += info.st_size
+        if total > max_total_bytes:
+            raise ValueError("disclosure draft exceeds the total size limit")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target, follow_symlinks=False)
+        # Preserve the source permission bits, matching the retention exporter:
+        # reproduce.sh must stay owner-executable or the retain manifest rejects
+        # the persisted draft.
+        os.chmod(target, stat.S_IMODE(info.st_mode))
+    return True
+
+
+def _record_draft_issues(draft: Path, issues: list[ValidationIssue]) -> str:
+    """Record why a persisted disclosure draft was rejected."""
+    path = draft.parent / "disclosure-draft-validation.json"
+    payload = {
+        "schema_version": 1,
+        "status": "rejected",
+        "draft": draft.name,
+        "issues": [
+            {
+                "description": issue.description,
+                "expected": issue.expected,
+                "fix": issue.fix,
+            }
+            for issue in issues
+        ],
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.chmod(path, 0o600)
+    return str(path)
 
 
 async def run_reproduction_review(
@@ -181,21 +262,25 @@ async def run_reproduction_review(
                 raise ValueError(
                     "successful latest-source reproduction has no disclosure draft"
                 )
-            issues = validate_stage6_disclosure(str(draft_dir))
+            # Persist before validating: a rejected draft must remain on disk for
+            # inspection and manual repair rather than vanishing with the sandbox.
+            _persist_draft(
+                draft_dir,
+                persistent_draft,
+                max_file_bytes=config.retain_max_file_bytes,
+                max_total_bytes=config.retain_max_total_bytes,
+            )
+            issues = validate_stage6_disclosure(str(persistent_draft))
             if issues:
+                _record_draft_issues(persistent_draft, issues)
                 raise ValueError(
                     "invalid refreshed disclosure draft: "
                     + "; ".join(issue.description for issue in issues)
                 )
-            secure_generated_manifest_mode(str(draft_dir))
+            secure_generated_manifest_mode(str(persistent_draft))
             load_retain_manifest(
-                str(draft_dir),
-                required_paths=(
-                    "report.md",
-                    "email.txt",
-                    "disclosure.zip",
-                    "reproduce.sh",
-                ),
+                str(persistent_draft),
+                required_paths=_DRAFT_REQUIRED_PATHS,
                 max_file_bytes=config.retain_max_file_bytes,
                 max_total_bytes=config.retain_max_total_bytes,
             )
@@ -204,14 +289,9 @@ async def run_reproduction_review(
             # are the same directory; the exporter still atomically replaces
             # it with only the registered regular files.
             export_retained_artifacts(
-                str(draft_dir),
                 str(persistent_draft),
-                required_paths=(
-                    "report.md",
-                    "email.txt",
-                    "disclosure.zip",
-                    "reproduce.sh",
-                ),
+                str(persistent_draft),
+                required_paths=_DRAFT_REQUIRED_PATHS,
                 max_file_bytes=config.retain_max_file_bytes,
                 max_total_bytes=config.retain_max_total_bytes,
             )

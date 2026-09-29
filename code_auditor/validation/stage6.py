@@ -12,14 +12,38 @@ from ..config import ValidationIssue
 from ..cvss import report_score_errors
 from ..disclosures import extract_email_subject
 
-_REQUIRED_REPORT_SECTIONS = [
-    "Summary",
-    "Why This Is a Security Issue",
-    "Severity Assessment",
-    "Security Impact",
-    "Root Cause",
-    "Reproduction",
-]
+# Canonical section -> accepted heading spellings (casefolded). Stage 5 retest
+# reports and other upstream templates name these sections differently, so a
+# substantively complete disclosure is not rejected on wording alone. The first
+# spelling is the canonical one reported in validation messages.
+_REQUIRED_REPORT_SECTIONS: dict[str, tuple[str, ...]] = {
+    "Summary": ("summary", "overview"),
+    "Why This Is a Security Issue": (
+        "why this is a security issue",
+        "why this is a vulnerability",
+        "why it is a security issue",
+        "security issue",
+        "security rationale",
+    ),
+    "Severity Assessment": ("severity assessment", "severity", "severity rating"),
+    "Security Impact": ("security impact", "impact", "security implications"),
+    "Root Cause": ("root cause", "root cause analysis"),
+    "Reproduction": (
+        "reproduction",
+        "steps to reproduce",
+        "reproduction steps",
+        "reproduce",
+        "how to reproduce",
+    ),
+}
+
+# A GitHub Security Advisory style report is accepted as a whole template.
+_GITHUB_REPORT_SECTIONS: dict[str, tuple[str, ...]] = {
+    "Summary": ("summary",),
+    "Details": ("details",),
+    "PoC": ("poc",),
+    "Impact": ("impact",),
+}
 _MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 4096
@@ -91,27 +115,26 @@ def validate_stage6_disclosure(disclosure_dir: str) -> list[ValidationIssue]:
     report = documents.get("report.md")
     if report:
         sections, unclosed = _report_sections(report)
-        github = all(k in sections for k in ("summary", "details", "poc", "impact"))
-        required = (
-            ["Summary", "Details", "PoC", "Impact"]
-            if github
-            else _REQUIRED_REPORT_SECTIONS
+        github = all(
+            any(alias in sections for alias in aliases)
+            for aliases in _GITHUB_REPORT_SECTIONS.values()
         )
-        for section in required:
-            key = section.casefold()
-            if key == "reproduction" and key not in sections:
-                # The prompt's nested heading is "Steps to Reproduce".
-                key = "steps to reproduce"
-            if key not in sections:
+        required = _GITHUB_REPORT_SECTIONS if github else _REQUIRED_REPORT_SECTIONS
+        for section, aliases in required.items():
+            matched = [alias for alias in aliases if alias in sections]
+            if not matched:
                 issue(f"Missing required section in disclosure report: {section}")
-            elif not sections[key]:
+            elif not any(sections[alias] for alias in matched):
                 issue(f"Empty required section in disclosure report: {section}")
         if unclosed:
             issue("Unclosed fenced code block in disclosure report")
         for error in report_score_errors(report, require_vector=not github):
             issue(error)
         if re.search(
-            r"\b(?:Finding|Audit|Vulnerability) ID\b.*\b[CHML]-\d{2}\b", report
+            r"\b(?:finding|audit|vulnerability|vuln|internal)\s+(?:id|identifier)\b"
+            r".*\b[CHML]-\d{2}\b",
+            report,
+            re.IGNORECASE,
         ):
             issue("Internal audit identifier in disclosure report metadata")
         if re.search(

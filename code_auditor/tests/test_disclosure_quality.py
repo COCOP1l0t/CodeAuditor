@@ -105,6 +105,39 @@ def test_empty_section_fails(tmp_path: Path) -> None:
     assert "Empty required section in disclosure report: Summary" in _errors(tmp_path)
 
 
+def test_common_heading_variants_satisfy_template(tmp_path: Path) -> None:
+    # A report derived from a Stage 5 retest uses "Severity" and "Reproduction
+    # Steps"; it must not be rejected for wording alone.
+    _package(
+        tmp_path,
+        report="# Example report\n\n## Summary\nExample.\n\n"
+        "## Why This Is a Security Issue\nBoundary explanation.\n\n"
+        "## Severity\nCVSS v3.1: 7.5 High\n"
+        "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H\n\n"
+        "## Impact\nAvailability.\n\n## Root Cause\nExample.\n\n"
+        "## Reproduction Steps\nStep one.\n",
+    )
+    assert _errors(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "- **Finding ID**: C-02",
+        "- **Audit ID**: H-01",
+        "- Vulnerability ID: M-03",
+        "- Internal identifier: L-04",
+    ],
+)
+def test_internal_audit_identifiers_fail(
+    tmp_path: Path, identifier: str
+) -> None:
+    _package(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    (tmp_path / "report.md").write_text(f"# Example report\n{identifier}\n{report}")
+    assert "Internal audit identifier in disclosure report metadata" in _errors(tmp_path)
+
+
 def test_same_size_changed_archive_file_fails(tmp_path: Path) -> None:
     _package(tmp_path)
     evidence = tmp_path / "evidence.txt"

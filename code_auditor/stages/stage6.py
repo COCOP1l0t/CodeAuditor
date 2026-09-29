@@ -266,40 +266,42 @@ async def _filter_semantic_duplicates(
             inventory.append(entry)
             existing_keys.add(candidate.dedupe_key)
             continue
-        existing_text = "\n\n".join(
-            f"Entry {i + 1}\n"
-            + "\n".join(f"- {key}: {known.get(key, '')}" for key in entry)
-            for i, known in enumerate(inventory)
-        )
-        prompt = load_prompt(
-            "stage6_semantic_dedupe.md",
-            {
-                "candidate_title": candidate.title,
-                "candidate_location": single_line(candidate.finding.get("location")),
-                "candidate_cwe": ", ".join(
-                    display_list(
-                        candidate.finding.get("cwe_id") or candidate.finding.get("cwe")
-                    )
-                ),
-                "candidate_vuln_class": ", ".join(
-                    display_list(candidate.finding.get("vulnerability_class"))
-                ),
-                "candidate_trigger": single_line(candidate.finding.get("trigger")),
-                "candidate_summary": single_line(
-                    candidate.finding.get("summary")
-                    or candidate.finding.get("description")
-                ),
-                "existing_entries": existing_text,
-            },
-        )
-
-        log_file = os.path.join(
-            config.output_dir,
-            "stage6-disclosures",
-            ".dedupe-logs",
-            f"{candidate.vuln_id or 'unknown'}.log",
-        )
+        phase = "prompt preparation"
         try:
+            existing_text = "\n\n".join(
+                f"Entry {i + 1}\n"
+                + "\n".join(f"- {key}: {known.get(key, '')}" for key in entry)
+                for i, known in enumerate(inventory)
+            )
+            prompt = load_prompt(
+                "stage6_semantic_dedupe.md",
+                {
+                    "candidate_title": candidate.title,
+                    "candidate_location": single_line(candidate.finding.get("location")),
+                    "candidate_cwe": ", ".join(
+                        display_list(
+                            candidate.finding.get("cwe_id") or candidate.finding.get("cwe")
+                        )
+                    ),
+                    "candidate_vuln_class": ", ".join(
+                        display_list(candidate.finding.get("vulnerability_class"))
+                    ),
+                    "candidate_trigger": single_line(candidate.finding.get("trigger")),
+                    "candidate_summary": single_line(
+                        candidate.finding.get("summary")
+                        or candidate.finding.get("description")
+                    ),
+                    "existing_entries": existing_text,
+                },
+            )
+
+            log_file = os.path.join(
+                config.output_dir,
+                "stage6-disclosures",
+                ".dedupe-logs",
+                f"{candidate.vuln_id or 'unknown'}.log",
+            )
+            phase = "agent call"
             result = await run_agent(
                 prompt,
                 config,
@@ -308,6 +310,7 @@ async def _filter_semantic_duplicates(
                 effort=_DEFAULT_DEDUPE_EFFORT,
                 log_file=log_file,
             )
+            phase = "response validation"
             json_text = extract_json_object(result)
             if json_text is None:
                 raise json.JSONDecodeError(
@@ -335,15 +338,10 @@ async def _filter_semantic_duplicates(
                 raise ValueError(f"unsupported semantic dedupe decision: {decision!r}")
             if matched_key:
                 raise ValueError("new decision must use an empty matched_dedupe_key")
-        except (json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.warning(
-                "Stage 6: Could not parse semantic dedupe response for %s: %s. Treating as new.",
-                label,
-                exc,
-            )
         except Exception as exc:
             logger.warning(
-                "Stage 6: Semantic dedupe agent failed for %s: %s. Treating as new.",
+                "Stage 6: Semantic dedupe %s failed for %s: %s. Keeping candidate.",
+                phase,
                 label,
                 exc,
             )
@@ -478,43 +476,43 @@ async def _run_disclosure(
             await sandbox.close()
             raise
 
-    stage6_vuln_dir = os.path.join(
-        work_config.output_dir, "stage6-disclosures", vuln_id
-    )
-    disclosure_dir = os.path.join(stage6_vuln_dir, "disclosure")
-    disclosure_report = os.path.join(disclosure_dir, "report.md")
-    os.makedirs(disclosure_dir, exist_ok=True)
-
-    if finding_file:
-        finding_reference = (
-            "The evaluated finding with detailed data-flow trace, CWE, "
-            "and CVSS analysis is at:\n\n"
-            f"`{finding_file}`\n\n"
-            "Read this file for additional context on the vulnerability."
-        )
-    else:
-        finding_reference = (
-            "No evaluated finding file is available. "
-            "Use the vulnerability report for all details."
-        )
-
-    poc_target = work_config.poc_worktree or work_config.target
-
-    prompt = load_prompt(
-        "stage6.md",
-        {
-            "vuln_report_path": work_report_path,
-            "poc_dir": poc_dir,
-            "finding_reference": finding_reference,
-            "target_path": poc_target,
-            "disclosure_dir": disclosure_dir,
-            "vuln_id": vuln_id,
-            "wiki_context": build_wiki_context(config, stage=6),
-        },
-    )
-
-    log_file = os.path.join(stage6_vuln_dir, "agent.log")
     try:
+        stage6_vuln_dir = os.path.join(
+            work_config.output_dir, "stage6-disclosures", vuln_id
+        )
+        disclosure_dir = os.path.join(stage6_vuln_dir, "disclosure")
+        disclosure_report = os.path.join(disclosure_dir, "report.md")
+        os.makedirs(disclosure_dir, exist_ok=True)
+
+        if finding_file:
+            finding_reference = (
+                "The evaluated finding with detailed data-flow trace, CWE, "
+                "and CVSS analysis is at:\n\n"
+                f"`{finding_file}`\n\n"
+                "Read this file for additional context on the vulnerability."
+            )
+        else:
+            finding_reference = (
+                "No evaluated finding file is available. "
+                "Use the vulnerability report for all details."
+            )
+
+        poc_target = work_config.poc_worktree or work_config.target
+
+        prompt = load_prompt(
+            "stage6.md",
+            {
+                "vuln_report_path": work_report_path,
+                "poc_dir": poc_dir,
+                "finding_reference": finding_reference,
+                "target_path": poc_target,
+                "disclosure_dir": disclosure_dir,
+                "vuln_id": vuln_id,
+                "wiki_context": build_wiki_context(config, stage=6),
+            },
+        )
+
+        log_file = os.path.join(stage6_vuln_dir, "agent.log")
         await run_agent(
             prompt,
             work_config,

@@ -181,9 +181,14 @@ def test_stage6_handles_missing_stage4_with_report_fallback(
     assert len(result) == 1
 
 
-def test_run_disclosure_exports_only_retained_files_from_scratch(
+@pytest.mark.parametrize(
+    "prompt_error",
+    [None, ValueError("missing template key"), OSError("unreadable template")],
+)
+def test_run_disclosure_exports_retained_files_and_cleans_up_scratch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    prompt_error: Exception | None,
 ) -> None:
     config, checkpoint, _target, output_dir = _stage6_config(tmp_path)
     config.poc_source_commit = "b" * 40
@@ -274,6 +279,17 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
     monkeypatch.setattr(stage6, "DockerScratch", FakeScratch)
     monkeypatch.setattr(stage6, "run_agent", fake_run_agent)
 
+    if prompt_error is not None:
+        def failed_prompt(*_args, **_kwargs):
+            raise prompt_error
+
+        monkeypatch.setattr(stage6, "load_prompt", failed_prompt)
+        with pytest.raises(type(prompt_error), match=str(prompt_error)):
+            asyncio.run(stage6._run_disclosure(str(report), config, checkpoint))
+        assert instances and instances[0].closed is True
+        assert not checkpoint.is_complete("stage6:H-07")
+        return
+
     result = asyncio.run(stage6._run_disclosure(str(report), config, checkpoint))
 
     persistent = output_dir / "stage6-disclosures" / "H-07" / "disclosure"
@@ -291,9 +307,15 @@ def test_run_disclosure_exports_only_retained_files_from_scratch(
     assert checkpoint.is_complete("stage6:H-07")
 
 
-def test_semantic_dedupe_uses_database_metadata(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("token_source", ["none", "candidate", "inventory"])
+def test_semantic_dedupe_uses_database_metadata(
+    tmp_path: Path, monkeypatch, token_source: str
+) -> None:
     config, _checkpoint, _target, output_dir = _stage6_config(tmp_path)
     finding = _finding()
+    code_identifier = "window.__TAURI_INTERNALS__.invoke"
+    if token_source == "candidate":
+        finding["summary"] = code_identifier
     finding_path = _write_stage4(output_dir, "H-01", finding)
     report = _write_stage5(output_dir, "H-01")
     candidate = stage6._load_candidate(str(report), config, "")
@@ -319,7 +341,7 @@ def test_semantic_dedupe_uses_database_metadata(tmp_path: Path, monkeypatch) -> 
             "cwe": "CWE-191",
             "vulnerability_class": "integer underflow",
             "trigger": finding["trigger"],
-            "summary": finding["summary"],
+            "summary": code_identifier if token_source == "inventory" else finding["summary"],
         },
     )
 
@@ -329,6 +351,77 @@ def test_semantic_dedupe_uses_database_metadata(tmp_path: Path, monkeypatch) -> 
 
     assert result == []
     assert "Existing database row" in prompts[0]
+    if token_source != "none":
+        assert code_identifier in prompts[0]
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("missing template key"), OSError("unreadable template")]
+)
+def test_stage6_continues_after_semantic_prompt_failure(
+    tmp_path: Path, monkeypatch, caplog, error: Exception
+) -> None:
+    config, checkpoint, _, output = _stage6_config(tmp_path)
+    candidates = []
+    for ident in ("H-01", "H-02"):
+        _write_stage4(
+            output, ident, _finding(id=ident, title=ident, trigger=f"wording {ident}")
+        )
+        candidates.append(
+            stage6._load_candidate(str(_write_stage5(output, ident)), config, "")
+        )
+    assert candidates[0].dedupe_key != candidates[1].dedupe_key
+    original_load = stage6.load_prompt
+    prepared = []
+
+    def load_with_failure(name, substitutions):
+        prepared.append(substitutions["candidate_title"])
+        if len(prepared) == 1:
+            raise error
+        return original_load(name, substitutions)
+
+    async def compare(prompt, *_args, **_kwargs):
+        # The retained candidate must remain in the inventory for later items.
+        assert candidates[0].dedupe_key in prompt
+        return json.dumps({
+            "decision": "duplicate",
+            "matched_dedupe_key": candidates[0].dedupe_key,
+            "reason": "Same root cause as the retained first candidate",
+        })
+
+    async def disclose(report_path, *_args):
+        return report_path
+
+    monkeypatch.setattr(stage6, "load_prompt", load_with_failure)
+    monkeypatch.setattr(stage6, "run_agent", compare)
+    monkeypatch.setattr(stage6, "_run_disclosure", disclose)
+    config.known_disclosures = (
+        {"dedupe_key": "sha256:" + "a" * 64, "title": "Historical"},
+    )
+
+    result = asyncio.run(stage6.run_stage6(
+        [candidate.report_path for candidate in candidates], config, checkpoint
+    ))
+
+    assert result == [candidates[0].report_path]
+    assert prepared == ["H-01", "H-02"]
+    assert "prompt preparation failed" in caplog.text
+    assert str(error) in caplog.text
+
+
+def test_semantic_dedupe_propagates_cancellation(tmp_path: Path, monkeypatch) -> None:
+    config, _, _, output = _stage6_config(tmp_path)
+    _write_stage4(output, "H-01", _finding())
+    candidate = stage6._load_candidate(str(_write_stage5(output, "H-01")), config, "")
+
+    async def cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(stage6, "run_agent", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(stage6._filter_semantic_duplicates(
+            [candidate], ({"dedupe_key": "known", "title": "Historical"},), config
+        ))
 
 
 @pytest.mark.parametrize(

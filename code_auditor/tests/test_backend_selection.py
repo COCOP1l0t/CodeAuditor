@@ -1037,7 +1037,7 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
         assert agent.AGENT_PROCESS_MARKER_ENV in codex_env
         assert captured["thread_start_kwargs"]["model"] == "custom-coder"
         assert captured["thread_start_approval_mode"] is FakeApprovalMode.deny_all
-        assert captured["thread_start_kwargs"]["service_tier"] == "flex"
+        assert "service_tier" not in captured["thread_start_kwargs"]
         assert captured["run_approval_mode"] is FakeApprovalMode.deny_all
         assert captured["run_sandbox_policy"] == {"type": "dangerFullAccess"}
         assert "service_tier" not in captured["run_kwargs"]
@@ -1045,7 +1045,7 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
     asyncio.run(run_case())
 
 
-def test_codex_backend_requests_flex_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codex_backend_inherits_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run_case() -> None:
         captured: dict[str, object] = {}
         fake_codex_app_server = types.ModuleType("codex_app_server")
@@ -1157,7 +1157,7 @@ def test_codex_backend_requests_flex_legacy_service_tier(monkeypatch: pytest.Mon
         assert captured["config_overrides"] == ()
         assert agent.AGENT_PROCESS_MARKER_ENV in captured["env"]
         assert captured["thread_start_approval_policy"] == "never"
-        assert captured["thread_start_kwargs"]["service_tier"] == "flex"
+        assert "service_tier" not in captured["thread_start_kwargs"]
         assert "service_tier" not in captured["run_kwargs"]
 
     asyncio.run(run_case())

@@ -1117,7 +1117,6 @@ async def _run_codex_agent(
                         approval_mode=approval_setting,
                         cwd=cwd,
                         model=selected_model,
-                        service_tier="flex",
                     )
                     turn = await thread.turn(
                         prompt,
@@ -1132,7 +1131,6 @@ async def _run_codex_agent(
                         approval_policy=approval_setting,
                         cwd=cwd,
                         model=selected_model,
-                        service_tier="flex",
                     )
                     turn_input = (
                         codex_sdk.text_input_cls(prompt)

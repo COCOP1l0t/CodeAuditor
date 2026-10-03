@@ -68,6 +68,7 @@ let processTreeTimer = null;
 let processTreeRunId = null;
 let processTreePending = false;
 let processTreeGeneration = 0;
+let processTreeSignature = null;
 let selectedProcessPid = null;
 // Reproduction job currently attached to the Reproduction view.
 let activeReproKey = null;
@@ -1580,6 +1581,9 @@ function logBufferFor(pane) {
       head: 0,
       chars: 0,
       trimmed: false,
+      nodes: [],
+      nodeHead: 0,
+      notice: null,
       renderTimer: 0,
     };
     logBuffers.set(pane, state);
@@ -1587,13 +1591,58 @@ function logBufferFor(pane) {
   return state;
 }
 
+const LOG_TRIM_NOTICE = "[older Web logs trimmed — full log remains available]\n";
+
+// True while there is buffered text or trimmed entries the pane has not
+// reconciled yet. Used to avoid scheduling no-op renders on an idle log.
+function logBufferHasPendingWork(state) {
+  return (
+    state.nodeHead < state.head ||
+    state.nodeHead + state.nodes.length < state.entries.length ||
+    (state.trimmed && state.notice === null)
+  );
+}
+
 function renderLogBuffer(pane, state) {
   state.renderTimer = 0;
+  // Log lines are appended as individual text nodes and only removed from the
+  // front. Rewriting the whole pane on a timer (the previous approach) forced
+  // a full relayout of up to MAX_LOG_PANE_CHARS of text ten times a second,
+  // which made a busy run page flicker and pinned a CPU core.
+  while (state.nodes.length && state.nodeHead < state.head) {
+    state.nodes.shift().remove();
+    state.nodeHead += 1;
+  }
+  if (!state.nodes.length) {
+    state.nodeHead = Math.max(state.nodeHead, state.head);
+  }
+  if (state.trimmed && state.notice === null) {
+    state.notice = document.createTextNode(LOG_TRIM_NOTICE);
+    pane.insertBefore(state.notice, pane.firstChild);
+  }
   const pinnedToBottom =
     pane.scrollHeight - pane.scrollTop - pane.clientHeight < 36;
-  const prefix = state.trimmed ? "[older Web logs trimmed — full log remains available]\n" : "";
-  pane.textContent = prefix + state.entries.slice(state.head).join("");
-  if (pinnedToBottom) pane.scrollTop = pane.scrollHeight;
+  let appended = false;
+  while (state.nodeHead + state.nodes.length < state.entries.length) {
+    const node = document.createTextNode(
+      state.entries[state.nodeHead + state.nodes.length]
+    );
+    state.nodes.push(node);
+    pane.appendChild(node);
+    appended = true;
+  }
+  if (appended && pinnedToBottom) pane.scrollTop = pane.scrollHeight;
+  if (logBufferHasPendingWork(state)) {
+    scheduleLogRender(pane, state);
+  }
+}
+
+function scheduleLogRender(pane, state) {
+  if (state.renderTimer) return;
+  state.renderTimer = window.setTimeout(
+    () => renderLogBuffer(pane, state),
+    LOG_RENDER_INTERVAL_MS
+  );
 }
 
 function clearLogBuffer(pane) {
@@ -1603,8 +1652,11 @@ function clearLogBuffer(pane) {
   state.head = 0;
   state.chars = 0;
   state.trimmed = false;
+  state.nodes = [];
+  state.nodeHead = 0;
+  state.notice = null;
   state.renderTimer = 0;
-  pane.textContent = "";
+  pane.replaceChildren();
 }
 
 function appendLogToPane(pane, message) {
@@ -1626,14 +1678,19 @@ function appendLogToPane(pane, message) {
     state.trimmed = true;
   }
   if (state.head > 1024 && state.head > state.entries.length / 2) {
+    // Compact the source array. Drop the rendered nodes for trimmed entries
+    // first so ``nodeHead`` can shift by the same amount and stay aligned.
+    while (state.nodes.length && state.nodeHead < state.head) {
+      state.nodes.shift().remove();
+      state.nodeHead += 1;
+    }
+    const shift = state.head;
     state.entries = state.entries.slice(state.head);
     state.head = 0;
+    state.nodeHead = Math.max(0, state.nodeHead - shift);
   }
-  if (!state.renderTimer) {
-    state.renderTimer = window.setTimeout(
-      () => renderLogBuffer(pane, state),
-      LOG_RENDER_INTERVAL_MS
-    );
+  if (logBufferHasPendingWork(state)) {
+    scheduleLogRender(pane, state);
   }
   return state;
 }
@@ -1744,16 +1801,27 @@ function renderAuditProcessTree(payload, runId) {
   const tree = $("process-tree");
   const empty = $("process-tree-empty");
   $("process-tree-count").textContent = `(${total})`;
-  tree.replaceChildren();
   empty.hidden = total !== 0;
   tree.hidden = total === 0;
 
   if (total === 0) {
     selectedProcessPid = null;
     $("process-command-panel").hidden = true;
+    if (processTreeSignature !== `${runId}|0`) {
+      processTreeSignature = `${runId}|0`;
+      tree.replaceChildren();
+    }
     return;
   }
 
+  // The process tree poll runs every PROCESS_TREE_REFRESH_MS. Skip the DOM
+  // rebuild when the payload is unchanged so a long run does not re-render the
+  // whole tree twice a second for no reason.
+  const signature = `${runId}|${total}|${JSON.stringify(roots)}`;
+  if (signature === processTreeSignature) return;
+  processTreeSignature = signature;
+
+  tree.replaceChildren();
   const runRoot = document.createElement("div");
   runRoot.className = "process-run-root";
   runRoot.textContent = `Audit Run #${runId}`;
@@ -1826,6 +1894,7 @@ function stopAuditProcessTree() {
   processTreeGeneration += 1;
   processTreeRunId = null;
   processTreePending = false;
+  processTreeSignature = null;
   selectedProcessPid = null;
   $("process-tree-panel").hidden = true;
   $("process-tree").replaceChildren();

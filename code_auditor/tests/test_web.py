@@ -2079,6 +2079,7 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "pollDetailHeartbeat" in script.text
     assert "pollAuditProcessTree" in script.text
     assert "renderAuditProcessTree" in script.text
+    assert "processTreeSignature" in script.text
     assert "/processes`" in script.text
     assert "resumeCancelledAudit" in script.text
     assert "BUSY_JOB_STATES" in script.text
@@ -2100,6 +2101,10 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "MAX_LOG_PANE_ENTRIES" in script.text
     assert "LOG_RENDER_INTERVAL_MS" in script.text
     assert "pane.textContent +=" not in script.text
+    # The live log pane appends text nodes incrementally instead of rewriting
+    # the whole buffer on every render tick (which flickered the run page).
+    assert "logBufferHasPendingWork" in script.text
+    assert "state.entries.slice(state.head).join" not in script.text
     assert "pollActiveAgentLog" in script.text
     assert "/agent-log" in script.text
     assert "/api/results" not in script.text

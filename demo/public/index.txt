@@ -1,0 +1,4 @@
+minisvc document root
+
+This directory is the only place the GET command is supposed to read from.
+Files outside it must not be returned to a client.

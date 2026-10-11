@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "target": "demo",
+  "notes": "Machine-readable answer key. Verified end-to-end by demo-check/verify.sh. Kept deliberately small (3 vulnerabilities in 4 source files) so a full audit finishes in roughly 10-20 minutes with max_parallel >= 3.",
+  "expected_findings": [
+    {
+      "id": "V1",
+      "title": "Stack buffer overflow in ECHO handler",
+      "file": "src/handlers.c",
+      "function": "handle_echo",
+      "cwe": ["CWE-121"],
+      "vulnerability_class": "stack buffer overflow",
+      "entry_point": "TCP command ECHO",
+      "trigger": "ECHO with an argument longer than 127 bytes",
+      "poc": "pocs/poc_01_stack_overflow.py",
+      "expected_evidence": "AddressSanitizer: stack-buffer-overflow",
+      "expected_severity": "Critical",
+      "min_cvss": 7.0
+    },
+    {
+      "id": "V2",
+      "title": "Command injection in PING handler",
+      "file": "src/handlers.c",
+      "function": "handle_exec",
+      "cwe": ["CWE-78"],
+      "vulnerability_class": "command injection",
+      "entry_point": "TCP command PING",
+      "trigger": "PING with shell metacharacters, e.g. 127.0.0.1; id",
+      "poc": "pocs/poc_02_command_injection.py",
+      "expected_evidence": "output of the injected command in the response",
+      "expected_severity": "Critical",
+      "min_cvss": 8.0
+    },
+    {
+      "id": "V3",
+      "title": "Path traversal in GET handler",
+      "file": "src/handlers.c",
+      "function": "handle_file",
+      "cwe": ["CWE-22"],
+      "vulnerability_class": "path traversal",
+      "entry_point": "TCP command GET",
+      "trigger": "GET with ../ segments that escape public/",
+      "poc": "pocs/poc_03_path_traversal.py",
+      "expected_evidence": "contents of a file outside public/ (e.g. SECURITY.md)",
+      "expected_severity": "High",
+      "min_cvss": 5.0
+    }
+  ],
+  "expected_non_findings": [
+    {
+      "id": "T1",
+      "file": "src/util.c",
+      "symbol": "util_copy_bounded",
+      "reason": "Bounded copy: length is clamped to cap-1 before the copy. Correct, must not be reported."
+    },
+    {
+      "id": "T2",
+      "file": "src/util.c",
+      "symbol": "util_show_time",
+      "reason": "system() is called with a compile-time constant; no attacker data reaches the shell. Not a sink."
+    },
+    {
+      "id": "T3",
+      "file": "src/handlers.c",
+      "symbol": "handle_hello",
+      "reason": "Reachable handler that looks like ECHO but copies through util_copy_bounded. Correct, must not be reported."
+    }
+  ]
+}

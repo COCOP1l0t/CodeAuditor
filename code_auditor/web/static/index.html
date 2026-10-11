@@ -192,17 +192,24 @@
           <legend>Stage 5/6 execution</legend>
           <p class="settings-field-label" id="s-sandbox-kind-label">Sandbox</p>
           <div class="settings-radio-list" role="radiogroup" aria-labelledby="s-sandbox-kind-label">
-            <label class="settings-radio-option" data-sandbox-kind="docker">
-              <input type="radio" name="sandbox-kind" value="docker" required />
+            <label class="settings-radio-option" data-sandbox-kind="docker-default">
+              <input type="radio" name="sandbox-kind" value="docker-default" required />
               <span>
-                <strong>Docker</strong>
+                <strong>Docker default</strong>
                 <small>Disposable container using the server's default Docker runtime.</small>
               </span>
             </label>
-            <label class="settings-radio-option" data-sandbox-kind="gvisor">
-              <input type="radio" name="sandbox-kind" value="gvisor" required />
+            <label class="settings-radio-option" data-sandbox-kind="runc">
+              <input type="radio" name="sandbox-kind" value="runc" required />
               <span>
-                <strong>gVisor</strong>
+                <strong>runc</strong>
+                <small>Disposable container using the explicitly registered runc runtime.</small>
+              </span>
+            </label>
+            <label class="settings-radio-option" data-sandbox-kind="runsc">
+              <input type="radio" name="sandbox-kind" value="runsc" required />
+              <span>
+                <strong>gVisor / runsc</strong>
                 <small>Same container image, run under the registered runsc runtime.</small>
               </span>
             </label>
@@ -219,7 +226,7 @@
               <option value="networked">Bridge network — build dependencies and remote model APIs</option>
               <option value="isolated">No network — blocks remote model APIs</option>
             </select>
-            <span class="hint">Only applies to the Docker and gVisor sandboxes.</span>
+            <span class="hint">Only applies to container sandboxes.</span>
           </label>
           <p id="s-sandbox-status" class="settings-sandbox-status" aria-live="polite">
             Checking this server environment…

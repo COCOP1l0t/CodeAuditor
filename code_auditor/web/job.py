@@ -15,7 +15,6 @@ import asyncio
 import json
 import os
 import re
-import signal
 import shutil
 import stat
 import subprocess
@@ -42,6 +41,7 @@ from ..config import (
 )
 from ..db import RUN_CANCELLED, RUN_DONE, RUN_FAILED, AuditStore, compute_target_key
 from ..logger import get_logger
+from ..process_supervisor import ProcessJob
 from ..process_tree import (
     CURRENT_AUDIT_PROCESS_MARKER,
     current_audit_subprocess_env,
@@ -191,13 +191,12 @@ def _local_branch_points_to(target: str, branch: str, commit: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == commit
 
 
-async def _terminate_resume_git_process(proc: asyncio.subprocess.Process) -> None:
+async def _terminate_resume_git_process(
+    proc: asyncio.subprocess.Process, process_job: ProcessJob
+) -> None:
     if proc.returncode is not None:
         return
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    process_job.terminate()
     await proc.wait()
 
 
@@ -214,6 +213,7 @@ async def _run_git_command(
     ``context`` names the caller in diagnostics; the two public wrappers below
     differ only in their environment and message context.
     """
+    process_job = ProcessJob()
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
@@ -222,22 +222,29 @@ async def _run_git_command(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
+            start_new_session=os.name != "nt",
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            ),
             env=env,
         )
+        process_job.assign_pid(proc.pid)
     except OSError as exc:
+        process_job.close()
         raise JobValidationError(f"Cannot run git for {context}: {exc}") from exc
     try:
         output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except TimeoutError as exc:
-        await _terminate_resume_git_process(proc)
+        await _terminate_resume_git_process(proc, process_job)
         raise JobValidationError(
             f"Timed out for {context} with `git {' '.join(args)}` "
             f"after {timeout_seconds:g} seconds."
         ) from exc
     except asyncio.CancelledError:
-        await _terminate_resume_git_process(proc)
+        await _terminate_resume_git_process(proc, process_job)
         raise
+    finally:
+        process_job.close()
     text = (output or b"").decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
         raise JobValidationError(

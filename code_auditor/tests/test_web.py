@@ -1541,6 +1541,10 @@ def _write_web_stage6_retention(output_dir: str) -> Path:
         encoding="utf-8",
     )
     manifest.chmod(0o600)
+    if os.name == "nt":
+        from code_auditor.secure_fs import harden_private_file
+
+        harden_private_file(manifest)
     return disclosure
 
 

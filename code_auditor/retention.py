@@ -1,8 +1,10 @@
 """Validation and atomic export for bounded PoC retention manifests."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 from dataclasses import dataclass
@@ -11,9 +13,17 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from .config import DEFAULT_RETAIN_MAX_FILE_BYTES, DEFAULT_RETAIN_MAX_TOTAL_BYTES
+from .secure_fs import (
+    SecureFSError,
+    harden_private_file,
+    private_file_is_secure,
+    require_regular_file,
+    write_private_bytes_atomic,
+)
 
 RETAIN_MANIFEST_FILENAME = "retain-manifest.json"
-RETAIN_MANIFEST_SCHEMA_VERSION = 1
+RETAIN_MANIFEST_SCHEMA_VERSION = 2
+SUPPORTED_RETAIN_MANIFEST_VERSIONS = frozenset({1, 2})
 MAX_RETAIN_MANIFEST_BYTES = 256 * 1024
 MAX_RETAIN_FILES = 256
 DISPOSABLE_DIRECTORY_NAMES = frozenset(
@@ -77,19 +87,12 @@ def secure_generated_manifest_mode(
     files are left untouched so the normal validator still rejects them.
     """
     path = Path(artifact_dir) / RETAIN_MANIFEST_FILENAME
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
-    except OSError:
-        return False
-    try:
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
-            return False
-        os.fchmod(fd, 0o600)
+        require_regular_file(path)
+        harden_private_file(path)
         return True
-    finally:
-        os.close(fd)
+    except (OSError, SecureFSError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,7 @@ class RetainedFile:
     path: str
     role: str
     size: int
+    sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,10 @@ class RetainManifest:
     entrypoint: str
     files: tuple[RetainedFile, ...]
     total_bytes: int
+    schema_version: int = 1
+    platform: str = "linux"
+    interpreter: str = "sh"
+    argv: tuple[str, ...] = ()
 
 
 def allocated_tree_bytes(root: Path) -> int:
@@ -172,16 +180,17 @@ def _safe_relative_path(value: object) -> str:
 def _read_manifest_data(artifact_dir: Path) -> dict[str, Any]:
     manifest_path = artifact_dir / RETAIN_MANIFEST_FILENAME
     try:
-        stat_result = manifest_path.lstat()
+        stat_result = require_regular_file(manifest_path)
     except FileNotFoundError as exc:
         raise RetentionError(f"missing {RETAIN_MANIFEST_FILENAME}") from exc
-    if not stat.S_ISREG(stat_result.st_mode) or stat.S_ISLNK(stat_result.st_mode):
-        raise RetentionError(f"{RETAIN_MANIFEST_FILENAME} must be a regular file")
-    if stat_result.st_nlink != 1:
-        raise RetentionError(f"{RETAIN_MANIFEST_FILENAME} must not be hard-linked")
-    if stat.S_IMODE(stat_result.st_mode) & 0o077:
+    except SecureFSError as exc:
+        raise RetentionError(f"{RETAIN_MANIFEST_FILENAME} is unsafe: {exc}") from exc
+    if not private_file_is_secure(manifest_path):
         raise RetentionError(
-            f"{RETAIN_MANIFEST_FILENAME} must not be group/world accessible"
+            f"{RETAIN_MANIFEST_FILENAME} must be private to the current user"
+        )
+        raise RetentionError(
+            f"{RETAIN_MANIFEST_FILENAME} must be private to the current user"
         )
     if stat_result.st_size > MAX_RETAIN_MANIFEST_BYTES:
         raise RetentionError(
@@ -246,6 +255,53 @@ def _validate_portable_text(root: Path, relative_path: str, role: str) -> None:
             )
 
 
+def write_retain_manifest_v2(
+    artifact_dir: str | os.PathLike[str],
+    *,
+    entrypoint: str,
+    platform: str,
+    interpreter: str,
+    files: Iterable[tuple[str, str]],
+    argv: Iterable[str] = (),
+) -> RetainManifest:
+    """Build, validate, and atomically write a canonical private v2 manifest."""
+    root = Path(artifact_dir)
+    if not root.is_dir() or root.is_symlink():
+        raise RetentionError(f"artifact directory is missing or unsafe: {root}")
+    entries: list[dict[str, Any]] = []
+    seen_casefolded: set[str] = set()
+    for raw_path, role in files:
+        relative_path = _safe_relative_path(raw_path)
+        folded = relative_path.casefold()
+        if folded in seen_casefolded:
+            raise RetentionError(f"case-insensitive retained path collision: {relative_path}")
+        seen_casefolded.add(folded)
+        require_regular_file(root / relative_path)
+        content = (root / relative_path).read_bytes()
+        entries.append(
+            {
+                "path": relative_path,
+                "role": role,
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    data = {
+        "schema_version": 2,
+        "entrypoint": {
+            "path": entrypoint,
+            "platform": platform,
+            "interpreter": interpreter,
+            "argv": list(argv),
+        },
+        "files": entries,
+    }
+    manifest = validate_retain_manifest_data(root, data)
+    payload = (json.dumps(data, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    write_private_bytes_atomic(root / RETAIN_MANIFEST_FILENAME, payload)
+    return manifest
+
+
 def load_retain_manifest(
     artifact_dir: str | os.PathLike[str],
     *,
@@ -282,13 +338,41 @@ def validate_retain_manifest_data(
         raise RetentionError(f"artifact directory is missing or unsafe: {root}")
     if not isinstance(data, dict):
         raise RetentionError(f"{RETAIN_MANIFEST_FILENAME} must contain a JSON object")
-    if data.get("schema_version") != RETAIN_MANIFEST_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if schema_version not in SUPPORTED_RETAIN_MANIFEST_VERSIONS:
         raise RetentionError(
-            f"schema_version must be {RETAIN_MANIFEST_SCHEMA_VERSION}"
+            "schema_version must be one of: "
+            + ", ".join(str(v) for v in sorted(SUPPORTED_RETAIN_MANIFEST_VERSIONS))
         )
-    entrypoint = _safe_relative_path(data.get("entrypoint"))
-    if entrypoint != "reproduce.sh":
-        raise RetentionError("entrypoint must be reproduce.sh")
+    if schema_version == 1:
+        entrypoint = _safe_relative_path(data.get("entrypoint"))
+        platform = "linux"
+        interpreter = "sh"
+        argv: tuple[str, ...] = ()
+    else:
+        entrypoint_data = data.get("entrypoint")
+        if not isinstance(entrypoint_data, dict):
+            raise RetentionError("schema v2 entrypoint must be an object")
+        entrypoint = _safe_relative_path(entrypoint_data.get("path"))
+        platform = entrypoint_data.get("platform")
+        interpreter = entrypoint_data.get("interpreter")
+        raw_argv = entrypoint_data.get("argv", [])
+        allowed = {("linux", "sh"), ("windows", "powershell")}
+        if (platform, interpreter) not in allowed:
+            raise RetentionError("unsupported entrypoint platform/interpreter")
+        if (
+            not isinstance(raw_argv, list)
+            or len(raw_argv) > 32
+            or any(
+                not isinstance(arg, str) or "\x00" in arg or len(arg) > 1024
+                for arg in raw_argv
+            )
+        ):
+            raise RetentionError("entrypoint argv must be a bounded string array")
+        argv = tuple(raw_argv)
+    expected_entrypoint = "reproduce.ps1" if platform == "windows" else "reproduce.sh"
+    if entrypoint != expected_entrypoint:
+        raise RetentionError(f"entrypoint must be {expected_entrypoint}")
 
     entries = data.get("files")
     if not isinstance(entries, list) or not entries:
@@ -330,28 +414,48 @@ def validate_retain_manifest_data(
             raise RetentionError(
                 f"retained files exceed the {max_total_bytes}-byte total limit"
             )
+        digest = hashlib.sha256((root / relative_path).read_bytes()).hexdigest()
+        if schema_version == 2:
+            declared_size = entry.get("size")
+            declared_digest = entry.get("sha256")
+            if declared_size != file_stat.st_size:
+                raise RetentionError(
+                    f"retained file size mismatch: {relative_path}"
+                )
+            if (
+                not isinstance(declared_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", declared_digest)
+                or declared_digest != digest
+            ):
+                raise RetentionError(
+                    f"retained file SHA-256 mismatch: {relative_path}"
+                )
         retained.append(
             RetainedFile(
                 path=relative_path,
                 role=str(role),
                 size=file_stat.st_size,
+                sha256=digest,
             )
         )
         _validate_portable_text(root, relative_path, str(role))
 
     if entrypoint not in seen or entrypoint_role != "entrypoint":
-        raise RetentionError("reproduce.sh must be listed exactly once with role entrypoint")
+        raise RetentionError(
+            f"{entrypoint} must be listed exactly once with role entrypoint"
+        )
     entrypoint_path = root / entrypoint
-    try:
-        with entrypoint_path.open("rb") as entrypoint_stream:
-            first_line = entrypoint_stream.readline(256)
-    except OSError as exc:
-        raise RetentionError(f"cannot read reproduce.sh: {exc}") from exc
-    if not first_line.startswith(b"#!"):
-        raise RetentionError("reproduce.sh must start with a shebang")
-    entrypoint_stat = _regular_file_stat(root, entrypoint)
-    if not entrypoint_stat.st_mode & stat.S_IXUSR:
-        raise RetentionError("reproduce.sh must be executable by its owner")
+    if platform == "linux":
+        try:
+            with entrypoint_path.open("rb") as entrypoint_stream:
+                first_line = entrypoint_stream.readline(256)
+        except OSError as exc:
+            raise RetentionError(f"cannot read {entrypoint}: {exc}") from exc
+        if not first_line.startswith(b"#!"):
+            raise RetentionError(f"{entrypoint} must start with a shebang")
+        entrypoint_stat = _regular_file_stat(root, entrypoint)
+        if os.name != "nt" and not entrypoint_stat.st_mode & stat.S_IXUSR:
+            raise RetentionError(f"{entrypoint} must be executable by its owner")
 
     required = {_safe_relative_path(path) for path in required_paths}
     missing = sorted(required - seen)
@@ -363,6 +467,10 @@ def validate_retain_manifest_data(
         entrypoint=entrypoint,
         files=tuple(retained),
         total_bytes=total_bytes,
+        schema_version=int(schema_version),
+        platform=str(platform),
+        interpreter=str(interpreter),
+        argv=argv,
     )
 
 

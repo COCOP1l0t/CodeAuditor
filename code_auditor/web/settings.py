@@ -13,6 +13,7 @@ from ..config import (
     DEFAULT_BACKEND, DEFAULT_SANDBOX_MODE, DEFAULT_SANDBOX_RUNTIME,
     SANDBOX_MODES, SANDBOX_RUNTIMES, SandboxMode, SandboxRuntime,
 )
+from ..secure_fs import harden_private_file
 from ..utils import path_is_within
 
 DEFAULT_STATE_DIR = os.path.join("~", ".code_auditor")
@@ -420,11 +421,14 @@ def _write_settings_file(path: str, settings: dict[str, Any]) -> None:
         prefix=".settings-", suffix=".tmp", dir=directory, text=True
     )
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(settings, stream, indent=2, sort_keys=True)
             stream.write("\n")
+        harden_private_file(temporary)
         os.replace(temporary, path)
+        harden_private_file(path)
     except Exception:
         try:
             os.unlink(temporary)

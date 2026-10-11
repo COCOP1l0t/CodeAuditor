@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine, Protocol, TextIO
 from uuid import uuid4
 
 from .config import AuditConfig, ValidationIssue, resolve_agent_model
+from .secure_fs import SecureFSError, harden_private_file, require_regular_file
 from .logger import get_logger
+from .process_supervisor import ProcessJob
 from .process_tree import AUDIT_PROCESS_MARKER_ENV, CURRENT_AUDIT_PROCESS_MARKER
 from .utils import extract_json_object, format_validation_issues, record_agent_usage
 
@@ -96,6 +98,7 @@ _AGENT_PROCESS_REGISTRAR: ContextVar[Callable[[_KillableProcess | None], None] |
 @dataclass
 class _AgentRunControl:
     processes: list[_KillableProcess] = field(default_factory=list)
+    process_job: ProcessJob = field(default_factory=ProcessJob)
     killed_after_status_check: bool = False
     process_marker: str = field(default_factory=lambda: uuid4().hex)
 
@@ -103,6 +106,14 @@ class _AgentRunControl:
         if process is None or process in self.processes:
             return
         self.processes.append(process)
+        pid = getattr(process, "pid", None)
+        if os.name == "nt" and isinstance(pid, int):
+            try:
+                self.process_job.assign_pid(pid)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    process.kill()
+                raise
 
     def kill_processes(self, log_file: str, reason: str) -> None:
         self.killed_after_status_check = True
@@ -138,7 +149,14 @@ class _AgentRunControl:
         return env
 
     async def cleanup_processes(self) -> None:
-        """Stop agent descendants that detached from their original parent."""
+        """Stop all owned agent descendants, including detached children."""
+        if os.name == "nt":
+            try:
+                if self.process_job.pids():
+                    self.process_job.terminate()
+            finally:
+                self.process_job.close()
+            return
         pids = _marked_agent_process_ids(self.process_marker)
         if not pids:
             return
@@ -545,14 +563,24 @@ def _open_agent_log(log_file: str | None) -> TextIO | None:
     log_dir = os.path.dirname(log_file)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-    fd = os.open(
-        log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600,
-    )
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if os.name != "nt":
+        flags |= os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(log_file, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RuntimeError("agent log must be a regular file with a single link")
+    except Exception:
         os.close(fd)
-        raise RuntimeError("agent log must be a regular file with a single link")
-    log_fh = os.fdopen(fd, "a")
+        raise
+    try:
+        harden_private_file(log_file)
+        require_regular_file(log_file)
+    except (OSError, SecureFSError) as exc:
+        os.close(fd)
+        raise RuntimeError(f"agent log is unsafe: {exc}") from exc
+    log_fh = os.fdopen(fd, "a", encoding="utf-8")
     if log_fh.tell() > 0:
         log_fh.write("\n--- new agent invocation ---\n\n")
         log_fh.flush()

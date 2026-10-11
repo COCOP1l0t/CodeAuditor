@@ -363,9 +363,7 @@ function renderAgentSettingsForm() {
 function sandboxKindFromSettings(settings) {
   const mode = settings?.sandbox_mode || "docker-networked";
   if (mode === "local-worktree") return "local-worktree";
-  return (settings?.sandbox_runtime || "docker-default") === "runsc"
-    ? "gvisor"
-    : "docker";
+  return settings?.sandbox_runtime || "docker-default";
 }
 
 function selectedSandboxKind() {
@@ -374,7 +372,7 @@ function selectedSandboxKind() {
 }
 
 function sandboxRuntimeForKind(kind) {
-  return kind === "gvisor" ? "runsc" : "docker-default";
+  return kind;
 }
 
 // One sandbox choice maps onto the two persisted settings fields. The local
@@ -417,17 +415,12 @@ function setSandboxKindAvailable(kind, available) {
 async function loadSandboxCapability(backend) {
   const request = ++sandboxCapabilityRequest;
   const kind = selectedSandboxKind();
-  if (kind === "local-worktree") {
-    $("s-sandbox-status").dataset.state = "ready";
-    $("s-sandbox-status").textContent =
-      "Local worktree runs on the server host in a detached Git worktree, without Docker isolation.";
-    return;
-  }
   const runtime = sandboxRuntimeForKind(kind);
   setSandboxKindAvailable(kind, true);
   $("s-sandbox-status").dataset.state = "checking";
-  $("s-sandbox-status").textContent =
-    "Checking Docker, image, scratch disk, and Agent runtime on this server…";
+  $("s-sandbox-status").textContent = kind === "local-worktree"
+    ? "Checking host worktree support on this server…"
+    : "Checking Docker, image, scratch disk, and Agent runtime on this server…";
   try {
     const res = await fetch(
       `/api/sandbox/capability?backend=${encodeURIComponent(backend)}&runtime=${encodeURIComponent(runtime)}`,
@@ -436,12 +429,31 @@ async function loadSandboxCapability(backend) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
     if (request !== sandboxCapabilityRequest) return;
-    const docker = data.docker || {};
-    setSandboxKindAvailable(kind, docker.available === true);
-    $("s-sandbox-status").dataset.state = docker.available ? "ready" : "unavailable";
-    $("s-sandbox-status").textContent = docker.available
-      ? `${docker.reason} Free scratch space: ${formatBytes(docker.free_bytes || 0)}.`
-      : `Sandbox unavailable: ${docker.reason || "environment check failed"}`;
+    const runtimes = data.runtimes || {};
+    for (const runtimeName of ["docker-default", "runc", "runsc"]) {
+      setSandboxKindAvailable(
+        runtimeName,
+        runtimes[runtimeName]?.available === true
+      );
+    }
+    setSandboxKindAvailable(
+      "local-worktree",
+      data.local_worktree?.available === true
+    );
+    const capability = kind === "local-worktree"
+      ? (data.local_worktree || {})
+      : (runtimes[kind] || {});
+    if (!capability.available && data.local_worktree?.available === true) {
+      const localInput = document.querySelector(
+        'input[name="sandbox-kind"][value="local-worktree"]'
+      );
+      if (localInput) localInput.checked = true;
+      updateSandboxNetworkAvailability();
+    }
+    $("s-sandbox-status").dataset.state = capability.available ? "ready" : "unavailable";
+    $("s-sandbox-status").textContent = capability.available
+      ? `${capability.reason}${kind === "local-worktree" ? "" : ` Free scratch space: ${formatBytes(capability.free_bytes || 0)}.`}`
+      : `Sandbox unavailable: ${capability.reason || "environment check failed"}`;
   } catch (error) {
     if (request !== sandboxCapabilityRequest) return;
     setSandboxKindAvailable(kind, false);

@@ -7,6 +7,7 @@ from .checkpoint import CheckpointManager
 from .config import AuditConfig
 from .logger import get_logger
 from .repos import ensure_poc_worktree
+from .runtime_capabilities import require_stage56_execution
 from .stages.stage0 import run_setup
 from .stages.stage1 import run_stage1
 from .stages.stage2 import run_stage2
@@ -106,6 +107,15 @@ async def run_audit(
     # Stage 5: PoC reproduction per verified vulnerability
     if reporter:
         reporter.begin_stage(5, f"Reproducing {len(vuln_files)} vulnerabilities")
+    if vuln_files:
+        sandbox_mode = (
+            "docker-networked"
+            if config.sandbox_enabled and config.sandbox_network_enabled
+            else "docker-isolated"
+            if config.sandbox_enabled
+            else "local-worktree"
+        )
+        require_stage56_execution(sandbox_mode, config.sandbox_runtime)
     if vuln_files and not config.sandbox_enabled and config.poc_worktree is None:
         config.poc_worktree = await ensure_poc_worktree(config.target, config.output_dir)
     stage5_reports = await run_stage5(vuln_files, config, checkpoint)

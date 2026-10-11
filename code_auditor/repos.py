@@ -15,13 +15,13 @@ import ipaddress
 import os
 import re
 import shutil
-import signal
 import subprocess
 import threading
 import urllib.parse
 from datetime import datetime
 
 from .logger import get_logger
+from .process_supervisor import ProcessJob
 from .process_tree import current_audit_subprocess_env
 
 logger = get_logger("repos")
@@ -108,7 +108,10 @@ def list_cloned_repos(repos_dir: str = DEFAULT_REPOS_DIR) -> list[dict[str, str]
         return repos
     for root, dirs, _files in os.walk(base):
         if ".git" in dirs:
-            repos.append({"name": os.path.relpath(root, base), "path": root})
+            repos.append({
+                "name": os.path.relpath(root, base).replace(os.sep, "/"),
+                "path": root,
+            })
             dirs[:] = []  # do not descend into a checkout
     repos.sort(key=lambda r: r["name"])
     return repos
@@ -184,24 +187,24 @@ async def _ensure_repo_locked(url: str, dest: str) -> str:
 
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     logger.info("Cloning %s into %s ...", url, dest)
+    process_job = ProcessJob()
     proc = await asyncio.create_subprocess_exec(
         "git", "clone", "--", url, dest,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=_clone_env(),
-        start_new_session=True,
+        start_new_session=os.name != "nt",
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        ),
     )
+    process_job.assign_pid(proc.pid)
     try:
         out, _ = await asyncio.wait_for(
             proc.communicate(), timeout=CLONE_TIMEOUT_SECONDS
         )
     except (TimeoutError, asyncio.CancelledError) as exc:
-        # Kill the whole clone process group and remove the partial checkout:
-        # a half-written mirror would otherwise be reused as a valid checkout
-        # (or block every later clone with "Path exists but is not a git
-        # repository").
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(proc.pid, signal.SIGKILL)
+        process_job.terminate()
         with contextlib.suppress(Exception):
             await proc.wait()
         shutil.rmtree(dest, ignore_errors=True)
@@ -210,6 +213,8 @@ async def _ensure_repo_locked(url: str, dest: str) -> str:
         raise RepoError(
             f"git clone timed out for {url} after {CLONE_TIMEOUT_SECONDS} seconds"
         ) from exc
+    finally:
+        process_job.close()
     if proc.returncode != 0:
         tail = (out or b"").decode("utf-8", errors="replace")[-500:]
         shutil.rmtree(dest, ignore_errors=True)

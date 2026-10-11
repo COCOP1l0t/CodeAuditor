@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import fcntl
 import json
 import os
 import shutil
@@ -14,6 +13,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+if os.name == "posix":
+    import fcntl
 
 
 def unique_keys(pairs):
@@ -50,6 +52,8 @@ def read_config(path: Path) -> tuple[bytes, int]:
 
 
 def apply_config(config: Path, runsc: Path, replace: bool, dockerd: str) -> Path | None:
+    if os.name != "posix":
+        raise RuntimeError("gVisor configuration requires a Linux host")
     config.parent.mkdir(parents=True, exist_ok=True)
     lock = os.open(config.parent / ".code-auditor-daemon.lock",
                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)

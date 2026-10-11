@@ -11,9 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
 
 from cryptography.fernet import Fernet, InvalidToken
+
+from .secure_fs import (
+    SecureFSError,
+    read_private_bytes,
+    require_regular_file,
+    write_private_bytes_atomic,
+)
 
 ENCRYPTED_PREFIX = "enc:v1:"
 SECRET_KEY_ENV = "CODE_AUDITOR_SECRET_KEY"
@@ -47,10 +53,10 @@ class SecretCipher:
         if self.uses_env_key:
             return False
         try:
-            info = os.lstat(self._key_path)
-        except OSError:
+            require_regular_file(self._key_path)
+            return True
+        except (OSError, SecureFSError):
             return False
-        return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
     @property
     def fernet(self) -> Fernet:
@@ -70,17 +76,10 @@ class SecretCipher:
             return override.strip().encode("ascii", "ignore")
         path = self._key_path
         try:
-            info = os.lstat(path)
+            key = read_private_bytes(path).strip()
         except FileNotFoundError:
             return self._create_key(path)
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise SecretCipherError(
-                f"secret key path is not a regular file: {path}"
-            )
-        try:
-            with open(path, "rb") as stream:
-                key = stream.read().strip()
-        except OSError as exc:
+        except (OSError, SecureFSError) as exc:
             raise SecretCipherError(f"cannot read secret key {path}: {exc}") from exc
         if not key:
             raise SecretCipherError(f"secret key file is empty: {path}")
@@ -92,15 +91,16 @@ class SecretCipher:
             os.makedirs(directory, mode=0o700, exist_ok=True)
         key = Fernet.generate_key()
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            write_private_bytes_atomic(path, key, exclusive=True)
         except FileExistsError:
-            # Another process created it first; reuse that key.
-            with open(path, "rb") as stream:
-                return stream.read().strip()
+            try:
+                return read_private_bytes(path).strip()
+            except (OSError, SecureFSError) as exc:
+                raise SecretCipherError(
+                    f"cannot read concurrently created secret key {path}: {exc}"
+                ) from exc
         except OSError as exc:
             raise SecretCipherError(f"cannot create secret key {path}: {exc}") from exc
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(key)
         self.created = True
         return key
 
@@ -109,9 +109,8 @@ class SecretCipher:
         if not self.key_file_exists():
             return None
         try:
-            with open(self._key_path, encoding="ascii") as stream:
-                return stream.read().strip()
-        except (OSError, UnicodeError):
+            return read_private_bytes(self._key_path).decode("ascii").strip()
+        except (OSError, UnicodeError, SecureFSError):
             return None
 
     def key_fingerprint(self) -> str | None:
@@ -131,9 +130,8 @@ class SecretCipher:
             # Env-managed keys are backed up outside CodeAuditor.
             return True
         try:
-            with open(self._ack_path(), encoding="ascii") as stream:
-                return stream.read().strip() == fingerprint
-        except (OSError, UnicodeError):
+            return read_private_bytes(self._ack_path()).decode("ascii").strip() == fingerprint
+        except (OSError, UnicodeError, SecureFSError):
             return False
 
     def acknowledge_backup(self) -> bool:
@@ -146,13 +144,11 @@ class SecretCipher:
         if directory:
             os.makedirs(directory, mode=0o700, exist_ok=True)
         try:
-            fd = os.open(
-                ack_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            write_private_bytes_atomic(
+                ack_path, (fingerprint + "\n").encode("ascii")
             )
         except OSError as exc:
             raise SecretCipherError(f"cannot write {ack_path}: {exc}") from exc
-        with os.fdopen(fd, "w", encoding="ascii") as stream:
-            stream.write(fingerprint + "\n")
         return True
 
     def is_encrypted(self, value: str) -> bool:

@@ -1,4 +1,4 @@
-"""PTY-to-WebSocket bridge for server-owned PoC working directories."""
+"""PTY-to-WebSocket bridge for server-owned PoC working directories (POSIX)."""
 from __future__ import annotations
 
 import asyncio

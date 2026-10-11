@@ -74,27 +74,18 @@ def test_api_runtime_selection_and_launch_preflight(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server, "inspect_docker_sandbox_environment", capability)
     response = client.get("/api/sandbox/capability?backend=claude&runtime=runsc")
-    assert response.json()["docker"]["requested_runtime"] == "runsc"
+    body = response.json()
+    assert set(body["runtimes"]) == {"docker-default", "runc", "runsc"}
+    assert body["runtimes"]["runsc"]["available"] is False
+    assert body["local_worktree"]["available"] is True
+    assert checks == []
     request = {"backend": "claude", "mode": "local", "sandbox_mode": "docker-networked",
                "sandbox_runtime": "runsc"}
     assert client.put("/api/settings", json=request).status_code == 400
     assert client.get("/api/settings").json()["sandbox_runtime"] == "docker-default"
     ready = True
-    assert client.put("/api/settings", json=request).status_code == 200
-    captured = []
-
-    async def start(params):
-        captured.append(params)
-        return SimpleNamespace(status=lambda: {"state": "running"})
-
-    monkeypatch.setattr(app.state.manager, "start", start)
-    response = client.post("/api/audit", json={"git_url": "https://example.test/project.git"})
-    assert response.status_code == 202
-    assert captured[0].sandbox_runtime == "runsc"
-    assert checks[-1] == ("claude", "runsc")
-    ready = False
-    assert client.post("/api/audit", json={"git_url": "https://example.test/project.git"}).status_code == 400
-    assert len(captured) == 1
+    # Host policy remains authoritative even if Docker itself becomes ready.
+    assert client.put("/api/settings", json=request).status_code == 400
     assert client.put("/api/settings", json={**request, "sandbox_runtime": "arbitrary"}).status_code == 422
 
 

@@ -9,9 +9,10 @@ import json
 import os
 import re
 import stat
-import tempfile
 from pathlib import Path
 from typing import Any
+
+from .secure_fs import SecureFSError, require_regular_file, write_private_bytes_atomic
 
 EXECUTION_DIRECTORY = ".sandbox-executions"
 MAX_RECORD_BYTES = 32 * 1024
@@ -26,9 +27,12 @@ def create_execution_directory(output_dir: str, scratch_id: str) -> Path:
     root = Path(output_dir).expanduser().resolve() / EXECUTION_DIRECTORY
     root.mkdir(parents=True, mode=0o700, exist_ok=True)
     info = root.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        raise ValueError("execution record directory must be a host-owned real directory")
-    root.chmod(0o700)
+    if not stat.S_ISDIR(info.st_mode) or root.is_symlink():
+        raise ValueError("execution record directory must be a real directory")
+    if os.name != "nt" and info.st_uid != os.getuid():
+        raise ValueError("execution record directory must be host-owned")
+    if os.name != "nt":
+        root.chmod(0o700)
     directory = root / scratch_id
     directory.mkdir(mode=0o700)
     return directory
@@ -43,21 +47,40 @@ def write_execution_record(directory: Path, record: dict[str, Any]) -> None:
     payload = json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n"
     if len(payload.encode("utf-8")) > MAX_RECORD_BYTES:
         raise ValueError("execution record is too large")
-    fd, temporary = tempfile.mkstemp(prefix=".record-", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, directory / filename)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    write_private_bytes_atomic(directory / filename, payload.encode("utf-8"))
 
 
 def read_execution_records(
     directory: Path | str, *, parent_fd: int | None = None,
 ) -> list[dict[str, Any]]:
+    if os.name == "nt":
+        if parent_fd is not None:
+            return []
+        directory_path = Path(directory)
+        if not directory_path.is_dir() or directory_path.is_symlink():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in directory_path.iterdir():
+            if not _RECORD_NAME.fullmatch(path.name):
+                continue
+            try:
+                info = require_regular_file(path)
+                if info.st_size > MAX_RECORD_BYTES:
+                    continue
+                payload = path.read_bytes()
+                if len(payload) > MAX_RECORD_BYTES:
+                    continue
+                record = json.loads(payload)
+                if (
+                    isinstance(record, dict)
+                    and record.get("schema_version") in {1, 2}
+                    and f"{record.get('execution_id')}.json" == path.name
+                ):
+                    records.append(record)
+            except (OSError, SecureFSError, ValueError, UnicodeError):
+                continue
+        return records
+
     records = []
     # History passes a pinned parent descriptor to avoid directory replacement
     # races while opening a scratch's records.
@@ -84,7 +107,7 @@ def read_execution_records(
                 if len(payload) > MAX_RECORD_BYTES:
                     continue
                 record = json.loads(payload)
-                if (isinstance(record, dict) and record.get("schema_version") == 1
+                if (isinstance(record, dict) and record.get("schema_version") in {1, 2}
                         and f"{record.get('execution_id')}.json" == name):
                     records.append(record)
             except (OSError, ValueError, UnicodeError):
@@ -101,17 +124,25 @@ def list_sandbox_executions(
     output_dir: str, *, run_id: int | None = None, job_key: str | None = None,
 ) -> list[dict[str, Any]]:
     root = Path(output_dir) / EXECUTION_DIRECTORY
-    try:
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError:
-        return []
-    records = []
-    try:
-        for name in os.listdir(root_fd):
-            if re.fullmatch(r"[0-9a-f]{32}", name):
-                records.extend(read_execution_records(name, parent_fd=root_fd))
-    finally:
-        os.close(root_fd)
+    if os.name == "nt":
+        if not root.is_dir() or root.is_symlink():
+            return []
+        records: list[dict[str, Any]] = []
+        for child in root.iterdir():
+            if re.fullmatch(r"[0-9a-f]{32}", child.name):
+                records.extend(read_execution_records(child))
+    else:
+        try:
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            return []
+        records = []
+        try:
+            for name in os.listdir(root_fd):
+                if re.fullmatch(r"[0-9a-f]{32}", name):
+                    records.extend(read_execution_records(name, parent_fd=root_fd))
+        finally:
+            os.close(root_fd)
     if run_id is not None:
         records = [row for row in records if row.get("audit_run_id") == run_id]
     if job_key is not None:

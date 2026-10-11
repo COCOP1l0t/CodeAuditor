@@ -82,7 +82,7 @@ Create minimal copies of the PoC artifacts in `__DISCLOSURE_DIR__`. The minimal 
 - Remove debugging scaffolding, diagnostic prints, dead code paths, and verbose comments
 - Be concise enough for a maintainer to read, understand, and run quickly
 - Include a brief header comment in each script describing what the PoC demonstrates
-- Provide an executable `reproduce.sh` as the single portable entry point; it must
+- Provide `reproduce.ps1` on Windows or executable `reproduce.sh` on Linux as the single portable entry point; it must
   rebuild from the audited source commit and must not reference CodeAuditor scratch,
   worktree, build, toolchain, or home-directory paths
 
@@ -268,17 +268,19 @@ Create `__DISCLOSURE_DIR__/disclosure.zip` containing:
 
 ### Step 6: Declare Retained Files
 
-Create `__DISCLOSURE_DIR__/retain-manifest.json` after the zip has been produced:
+Create `__DISCLOSURE_DIR__/retain-manifest.json` after the zip has been produced,
+using schema version 2 with the OS-appropriate entrypoint. Include the exact final
+byte size and lowercase SHA-256 digest for every retained file:
 
 ```json
 {
-  "schema_version": 1,
-  "entrypoint": "reproduce.sh",
+  "schema_version": 2,
+  "entrypoint": {"path": "reproduce.sh", "platform": "linux", "interpreter": "sh", "argv": []},
   "files": [
-    {"path": "reproduce.sh", "role": "entrypoint"},
-    {"path": "report.md", "role": "report"},
-    {"path": "email.txt", "role": "disclosure"},
-    {"path": "disclosure.zip", "role": "disclosure"}
+    {"path": "reproduce.sh", "role": "entrypoint", "size": 123, "sha256": "<64 lowercase hex>"},
+    {"path": "report.md", "role": "report", "size": 456, "sha256": "<64 lowercase hex>"},
+    {"path": "email.txt", "role": "disclosure", "size": 234, "sha256": "<64 lowercase hex>"},
+    {"path": "disclosure.zip", "role": "disclosure", "size": 789, "sha256": "<64 lowercase hex>"}
   ]
 }
 ```

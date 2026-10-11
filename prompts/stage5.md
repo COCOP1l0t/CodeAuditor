@@ -200,9 +200,9 @@ The report must be accurate. Every claim must be supported by evidence. Do not e
 
 ### Step 5.2: Create the Retained Reproduction Entry Point
 
-Create `__POC_DIR__/reproduce.sh` as the single portable entry point. It must:
-
-- start with a shell shebang and be executable;
+Create the retained entry point for the target operating system: `reproduce.ps1`
+on Windows, otherwise `reproduce.sh`. The shell script must start with a shebang
+and be executable; the PowerShell script must be UTF-8 and non-interactive. It must:
 - check out or verify the audited source commit rather than referring to this scratch tree;
 - install or download dependencies into a temporary directory, pin versions, and
   verify cryptographic hashes for downloaded inputs when practical;
@@ -212,15 +212,23 @@ Create `__POC_DIR__/reproduce.sh` as the single portable entry point. It must:
 - avoid absolute CodeAuditor, `/tmp/code-auditor`, worktree, build, toolchain, and
   home-directory paths.
 
-Then create `__POC_DIR__/retain-manifest.json` with this exact top-level shape:
+Then create `__POC_DIR__/retain-manifest.json` using schema version 2. The
+entrypoint object must declare its normalized path, target platform (`linux` or
+`windows`), and allowlisted interpreter (`sh` or `powershell`). For every file,
+include its exact byte size and lowercase SHA-256 digest after the file is final:
 
 ```json
 {
-  "schema_version": 1,
-  "entrypoint": "reproduce.sh",
+  "schema_version": 2,
+  "entrypoint": {
+    "path": "reproduce.sh",
+    "platform": "linux",
+    "interpreter": "sh",
+    "argv": []
+  },
   "files": [
-    {"path": "reproduce.sh", "role": "entrypoint"},
-    {"path": "report.md", "role": "report"}
+    {"path": "reproduce.sh", "role": "entrypoint", "size": 123, "sha256": "<64 lowercase hex>"},
+    {"path": "report.md", "role": "report", "size": 456, "sha256": "<64 lowercase hex>"}
   ]
 }
 ```

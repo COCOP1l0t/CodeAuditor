@@ -30,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config import SandboxRuntime
+from ..runtime_capabilities import stage56_execution_capability
 from ..sandbox_records import list_sandbox_executions
 from ..db import (
     DEFAULT_DB_PATH,
@@ -885,6 +886,11 @@ def create_app(
     async def require_sandbox_environment(
         backend: str, sandbox_mode: str, runtime: SandboxRuntime
     ) -> None:
+        platform_capability = stage56_execution_capability(
+            sandbox_mode, runtime  # type: ignore[arg-type]
+        )
+        if not platform_capability.available:
+            raise HTTPException(status_code=400, detail=platform_capability.reason)
         if sandbox_mode == "local-worktree":
             return
         capability = await asyncio.to_thread(
@@ -1114,20 +1120,27 @@ def create_app(
         backend: Literal["claude", "codex"] = Query(...),
         runtime: SandboxRuntime = Query("docker-default"),
     ) -> dict:
-        capability = await asyncio.to_thread(
-            inspect_docker_sandbox_environment, backend, runtime
+        runtimes: dict[str, dict] = {}
+        for candidate_runtime in ("docker-default", "runc", "runsc"):
+            platform_capability = stage56_execution_capability(
+                "docker-networked", candidate_runtime
+            )
+            if platform_capability.available:
+                capability = await asyncio.to_thread(
+                    inspect_docker_sandbox_environment, backend, candidate_runtime
+                )
+                runtimes[candidate_runtime] = capability.public()
+            else:
+                runtimes[candidate_runtime] = platform_capability.public()
+        local_worktree = stage56_execution_capability(
+            "local-worktree", runtime
         )
         return {
             "backend": backend,
             "server_environment": True,
-            "docker": capability.public(),
-            "local_worktree": {
-                "available": True,
-                "reason": (
-                    "Runs Stage 5 and 6 in a detached worktree on the server host "
-                    "without Docker isolation."
-                ),
-            },
+            "runtimes": runtimes,
+            "docker": runtimes[runtime],
+            "local_worktree": local_worktree.public(),
         }
 
     @app.put("/api/settings")

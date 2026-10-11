@@ -1,6 +1,7 @@
 # 如何为 CodeAuditor 构造并测试审计语料
 
-被审计工程是 [`../demo`](../demo)；本目录（`demo-check/`）放答案键、PoC 与评测方法。
+被审计工程是 [`../demo`](../demo)（仓库内路径 `fixtures/demo/`）；本目录
+（`fixtures/demo-check/`）放答案键、PoC 与评测方法。
 
 ## 1. 从流水线反推靶场需求
 
@@ -9,7 +10,7 @@ CodeAuditor 是七段式流水线。靶场不是"写一堆有洞的代码"，而
 
 | 阶段 | 对靶场的硬性要求 | 本 demo 的做法 |
 |------|-----------------|----------------|
-| 0 | 本地文件夹可原地审计 | `demo/` 不需要是 git 仓库 |
+| 0 | 本地文件夹可原地审计 | `fixtures/demo/` 不需要是 git 仓库 |
 | 1 | 有 `README`/`SECURITY.md` 可读 | 两者齐全，显式声明 in/out of scope |
 | 2 | 有清晰的源码枚举与功能区边界，排除 test | `src/{main,server,handlers,util}.c` 四个文件 |
 | 3 | 只纳入“默认编译 + 默认运行时配置” | 3 个默认可达缺陷 + 3 个误报陷阱 |
@@ -17,7 +18,7 @@ CodeAuditor 是七段式流水线。靶场不是"写一堆有洞的代码"，而
 | 5 | 必须构建真实目标、真实执行、不伪造证据 | `Makefile`（默认 + `asan`），ASan 证据稳定 |
 | 6 | 产出报告/PoC/披露包 | `ground_truth.json` 供比对 |
 
-三条"不要"：**不要把答案放进被审计目录**（答案在 `demo-check/`）；**不要让缺陷只存在于
+三条"不要"：**不要把答案放进被审计目录**（答案在 `fixtures/demo-check/`）；**不要让缺陷只存在于
 死代码里**；**不要把缺陷藏在非默认编译/运行配置后面**。
 
 ## 2. 规模与运行时长
@@ -76,7 +77,7 @@ claude-code CLI 会以指数退避重试 **10 次**（约 0.5s→1s→2s→4s→
 1. 仓库根目录执行 `code-auditor`，打开 <http://127.0.0.1:8000>。
 2. 首次使用先在页面创建管理员。
 3. **Settings** 里选 Stage 5/6 执行环境（本机无 Docker → Local worktree）。
-4. **New Audit** → 选择本地代码文件夹 → 选中 `demo/`；把 *max parallel* 设为 **3–4**。
+4. **New Audit** → 选择本地代码文件夹 → 选中 `fixtures/demo/`；把 *max parallel* 设为 **3–4**。
 5. 在 **History → run 详情页** 看 Stages / Logs / Results。
 
 ## 7. 打分

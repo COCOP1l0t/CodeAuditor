@@ -324,3 +324,109 @@ def test_container_cleanup_retries_async_docker_removal_race(
 
     assert sum(command[1:3] == ["ps", "-aq"] for command in calls) == 3
     assert sum(command[1:3] == ["rm", "-f"] for command in calls) == 2
+
+@pytest.mark.asyncio
+async def test_docker_scratch_closes_on_cancellation(monkeypatch) -> None:
+    from code_auditor import sandbox as sandbox_module
+
+    events: list[str] = []
+
+    class FakeScratch:
+        def __init__(self, config, task_name) -> None:
+            del config, task_name
+
+        async def prepare(self, target, commit) -> None:
+            del target, commit
+            events.append("prepare")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    config = AuditConfig(target="target", output_dir="output")
+
+    with pytest.raises(asyncio.CancelledError):
+        async with sandbox_module.docker_scratch(
+            config, "task", logger=sandbox_module.logger, scratch_factory=FakeScratch
+        ):
+            raise asyncio.CancelledError
+
+    assert events == ["prepare", "close"]
+
+
+@pytest.mark.asyncio
+async def test_docker_scratch_preserves_body_error_when_close_fails(
+    monkeypatch, caplog
+) -> None:
+    from code_auditor import sandbox as sandbox_module
+
+    class FakeScratch:
+        def __init__(self, config, task_name) -> None:
+            del config, task_name
+
+        async def prepare(self, target, commit) -> None:
+            del target, commit
+
+        async def close(self) -> None:
+            raise RuntimeError("cleanup failed")
+
+    config = AuditConfig(target="target", output_dir="output")
+
+    with pytest.raises(ValueError, match="body failed"):
+        async with sandbox_module.docker_scratch(
+            config, "task", logger=sandbox_module.logger, scratch_factory=FakeScratch
+        ):
+            raise ValueError("body failed")
+
+    assert "cleanup failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_docker_scratch_raises_close_error_after_success(monkeypatch) -> None:
+    from code_auditor import sandbox as sandbox_module
+
+    class FakeScratch:
+        def __init__(self, config, task_name) -> None:
+            del config, task_name
+
+        async def prepare(self, target, commit) -> None:
+            del target, commit
+
+        async def close(self) -> None:
+            raise RuntimeError("cleanup failed")
+
+    config = AuditConfig(target="target", output_dir="output")
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        async with sandbox_module.docker_scratch(
+            config, "task", logger=sandbox_module.logger, scratch_factory=FakeScratch
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_docker_scratch_closes_when_prepare_fails(monkeypatch) -> None:
+    from code_auditor import sandbox as sandbox_module
+
+    events: list[str] = []
+
+    class FakeScratch:
+        def __init__(self, config, task_name) -> None:
+            del config, task_name
+
+        async def prepare(self, target, commit) -> None:
+            del target, commit
+            events.append("prepare")
+            raise ValueError("prepare failed")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    config = AuditConfig(target="target", output_dir="output")
+
+    with pytest.raises(ValueError, match="prepare failed"):
+        async with sandbox_module.docker_scratch(
+            config, "task", logger=sandbox_module.logger, scratch_factory=FakeScratch
+        ):
+            pytest.fail("context body must not run")
+
+    assert events == ["prepare", "close"]

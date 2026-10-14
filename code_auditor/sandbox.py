@@ -16,7 +16,7 @@ import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
 
 from .config import AuditConfig, AgentBackend, SandboxRuntime, SANDBOX_RUNTIMES
@@ -722,6 +722,38 @@ class DockerScratch:
         raise DockerSandboxError(
             f"sandbox container cleanup could not be verified for {', '.join(ids)}: {last_error}"
         ) from last_error
+
+
+@contextlib.asynccontextmanager
+async def docker_scratch(
+    config: AuditConfig,
+    task_name: str,
+    *,
+    source_commit: str = "",
+    logger: Any,
+    scratch_factory: Callable[[AuditConfig, str], DockerScratch] = DockerScratch,
+) -> AsyncIterator[DockerScratch]:
+    """Prepare and close a scratch workspace without masking task failures."""
+    scratch = scratch_factory(config, task_name)
+    try:
+        await scratch.prepare(config.target, source_commit)
+    except BaseException:
+        await scratch.close()
+        raise
+
+    try:
+        yield scratch
+    finally:
+        propagating = sys.exc_info()[0] is not None
+        try:
+            await scratch.close()
+        except Exception:
+            if not propagating:
+                raise
+            logger.exception(
+                "Failed to clean up scratch workspace %s; preserving the original task error.",
+                task_name,
+            )
 
 
 def inspect_docker_sandbox_environment(

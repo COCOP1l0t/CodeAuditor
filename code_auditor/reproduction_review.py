@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -9,14 +10,17 @@ from typing import Any
 
 from .agent import run_agent
 from .config import AuditConfig, ValidationIssue, select_poc_model
+from .logger import get_logger
 from .prompts import load_prompt
 from .retention import (
     export_retained_artifacts,
     load_retain_manifest,
     secure_generated_manifest_mode,
 )
-from .sandbox import DockerScratch
+from .sandbox import DockerScratch, docker_scratch
 from .validation.stage6 import validate_stage6_disclosure
+
+logger = get_logger("reproduction-review")
 
 _DISPOSITIONS = {
     "still-vulnerable",
@@ -162,18 +166,26 @@ async def run_reproduction_review(
 
     persistent_dir = Path(config.output_dir, "reproduction-review")
     persistent_dir.mkdir(parents=True, exist_ok=True)
-    sandbox: DockerScratch | None = None
-    work_config = config
-    work_result = Path(result_path)
-    work_retest = Path(retest_report_path)
-    work_finding = Path(finding_path)
     previous_dir = candidate.get("reference_dir") or ""
-    work_previous = Path(previous_dir) if previous_dir else None
 
     if config.sandbox_enabled:
-        sandbox = DockerScratch(config, f"reproduction-review-{candidate['vuln_id']}")
-        try:
-            await sandbox.prepare(config.target, config.poc_source_commit or "")
+        scratch_cm = docker_scratch(
+            config,
+            f"reproduction-review-{candidate['vuln_id']}",
+            source_commit=config.poc_source_commit or "",
+            logger=logger,
+            scratch_factory=DockerScratch,
+        )
+    else:
+        scratch_cm = contextlib.nullcontext(None)
+
+    async with scratch_cm as sandbox:
+        work_config = config
+        work_result = Path(result_path)
+        work_retest = Path(retest_report_path)
+        work_finding = Path(finding_path)
+        work_previous = Path(previous_dir) if previous_dir else None
+        if sandbox is not None:
             work_config = sandbox.audit_config(config)
             work_result = sandbox.copy_input(result_path, "reproduction-result.json")
             work_retest_dir = sandbox.copy_input_tree(
@@ -185,37 +197,30 @@ async def run_reproduction_review(
                 work_previous = sandbox.copy_input_tree(
                     previous_dir, "previous-disclosure"
                 )
-        except BaseException:
-            # CancelledError is a BaseException; a cancel during prepare() must
-            # still tear down the Docker scratch tree before propagating.
-            await sandbox.close()
-            raise
 
-    work_dir = Path(work_config.output_dir, "reproduction-review")
-    work_dir.mkdir(parents=True, exist_ok=True)
-    prompt = load_prompt(
-        "reproduction_review.md",
-        {
-            "finding_path": str(work_finding),
-            "result_path": str(work_result),
-            "retest_report_path": str(work_retest),
-            "previous_disclosure_path": str(work_previous)
-            if work_previous
-            else "not available",
-            "target_path": work_config.poc_worktree or work_config.target,
-            "output_dir": str(work_dir),
-            "project": str(candidate.get("project") or ""),
-            "title": str(candidate.get("title") or candidate.get("vuln_id") or ""),
-            "base_commit": str(
-                candidate.get("audited_commit") or candidate.get("commit") or "unknown"
-            ),
-            "tested_commit": str(config.poc_source_commit or ""),
-            "outcome": outcome,
-        },
-    )
+        work_dir = Path(work_config.output_dir, "reproduction-review")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        prompt = load_prompt(
+            "reproduction_review.md",
+            {
+                "finding_path": str(work_finding),
+                "result_path": str(work_result),
+                "retest_report_path": str(work_retest),
+                "previous_disclosure_path": str(work_previous)
+                if work_previous
+                else "not available",
+                "target_path": work_config.poc_worktree or work_config.target,
+                "output_dir": str(work_dir),
+                "project": str(candidate.get("project") or ""),
+                "title": str(candidate.get("title") or candidate.get("vuln_id") or ""),
+                "base_commit": str(
+                    candidate.get("audited_commit") or candidate.get("commit") or "unknown"
+                ),
+                "tested_commit": str(config.poc_source_commit or ""),
+                "outcome": outcome,
+            },
+        )
 
-    task_error: BaseException | None = None
-    try:
         await run_agent(
             prompt,
             work_config,
@@ -308,13 +313,3 @@ async def run_reproduction_review(
             "retest_report_path": str(persistent_dir / "retest-report.md"),
             "draft_path": str(persistent_draft) if outcome == "reproduced" else "",
         }
-    except BaseException as exc:
-        task_error = exc
-        raise
-    finally:
-        if sandbox is not None:
-            try:
-                await sandbox.close()
-            except Exception:
-                if task_error is None:
-                    raise

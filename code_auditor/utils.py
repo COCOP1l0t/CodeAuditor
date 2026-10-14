@@ -95,6 +95,33 @@ async def run_parallel_limited(
     return results
 
 
+def collect_parallel_results(
+    results: list[tuple[str, R | None, Exception | None]],
+    items: list[T],
+    *,
+    stage: str,
+    config: Any,
+    logger: Any,
+    item_id: Callable[[T], str],
+    item_log: Callable[[T], str] | None = None,
+) -> list[R]:
+    """Collect successful task values and record rejected parallel tasks."""
+    collected: list[R] = []
+    log_id = item_log or item_id
+    stage_label = f"Stage {stage.removeprefix('stage')}"
+    for index, (status, value, error) in enumerate(results):
+        if index >= len(items):
+            continue
+        item = items[index]
+        if status == "rejected":
+            logger.error("%s: %s failed: %s", stage_label, log_id(item), error)
+            record_task_error(config, stage, item_id(item), error)
+            continue
+        if value:
+            collected.append(value)
+    return collected
+
+
 def natural_sort_key(s: str) -> list[int | str]:
     """Sort key for natural ordering of strings containing numbers.
 

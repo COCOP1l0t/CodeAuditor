@@ -10,7 +10,12 @@ from ..checkpoint import CheckpointManager
 from ..config import AnalysisUnit, AuditConfig
 from ..logger import get_logger
 from ..prompts import load_prompt
-from ..utils import format_validation_issues, list_matching_files, record_task_error, run_parallel_limited
+from ..utils import (
+    collect_parallel_results,
+    format_validation_issues,
+    list_matching_files,
+    run_parallel_limited,
+)
 from ..validation.stage3 import validate_stage3_file
 from ..wiki import build_wiki_context
 
@@ -131,16 +136,15 @@ async def run_stage3(
         ),
     )
 
-    all_finding_files: list[str] = []
-    for i, (status, value, error) in enumerate(results):
-        if i >= len(units):
-            continue
-        if status == "rejected":
-            logger.error("Stage 3: %s failed: %s", units[i].id, error)
-            record_task_error(config, "stage3", units[i].id, error)
-            continue
-        if value:
-            all_finding_files.extend(value)
+    finding_groups = collect_parallel_results(
+        results,
+        units,
+        stage="stage3",
+        config=config,
+        logger=logger,
+        item_id=lambda unit: unit.id,
+    )
+    all_finding_files = [path for group in finding_groups for path in group]
 
     logger.info("Stage 3 complete. Total bug finding files: %s", len(all_finding_files))
     return all_finding_files

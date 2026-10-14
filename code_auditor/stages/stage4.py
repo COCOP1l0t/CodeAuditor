@@ -13,10 +13,10 @@ from ..logger import get_logger
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
 from ..utils import (
-    natural_sort_key,
+    collect_parallel_results,
     format_validation_issues,
     list_json_files,
-    record_task_error,
+    natural_sort_key,
     run_parallel_limited,
 )
 from ..validation.stage4 import validate_stage4_file
@@ -315,18 +315,14 @@ async def run_stage4(
         lambda ff, _: _run_finding(ff, config, checkpoint, vuln_criteria_path),
     )
 
-    confirmed_pending: list[str] = []
-    for i, (status, value, error) in enumerate(results):
-        if i >= len(finding_files):
-            continue
-        if status == "rejected":
-            logger.error("Stage 4: %s failed: %s", os.path.basename(finding_files[i]), error)
-            record_task_error(
-                config, "stage4", os.path.basename(finding_files[i]), error
-            )
-            continue
-        if value:
-            confirmed_pending.append(value)
+    confirmed_pending = collect_parallel_results(
+        results,
+        finding_files,
+        stage="stage4",
+        config=config,
+        logger=logger,
+        item_id=os.path.basename,
+    )
 
     logger.info("Stage 4: %s confirmed findings (from %s candidates).", len(confirmed_pending), len(finding_files))
 

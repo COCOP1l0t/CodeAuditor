@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,8 +22,8 @@ from ..reproduction_status import (
     read_reproduction_status,
 )
 from ..retention import export_retained_artifacts, secure_generated_manifest_mode
-from ..sandbox import DockerScratch
-from ..utils import extract_json_object, record_task_error, run_parallel_limited
+from ..sandbox import DockerScratch, docker_scratch
+from ..utils import collect_parallel_results, extract_json_object, run_parallel_limited
 from ..validation.stage6 import _report_sections, validate_stage6_disclosure
 from ..wiki import build_wiki_context
 
@@ -453,30 +453,32 @@ async def _run_disclosure(
         return persistent_disclosure_report
 
     logger.info("Stage 6: Starting disclosure preparation for %s.", vuln_id)
-    sandbox: DockerScratch | None = None
-    work_config = config
-    work_report_path = report_path
     poc_dir = str(Path(report_path).parent)
     finding_file = _find_finding_file(vuln_id, config.output_dir)
     if config.sandbox_enabled:
         identity = capture_repo_identity(config.target)
         source_commit = config.poc_source_commit or identity.get("commit") or ""
-        sandbox = DockerScratch(config, f"stage6-{vuln_id}")
-        try:
-            await sandbox.prepare(config.target, source_commit)
+        scratch_cm = docker_scratch(
+            config,
+            f"stage6-{vuln_id}",
+            source_commit=source_commit,
+            logger=logger,
+            scratch_factory=DockerScratch,
+        )
+    else:
+        scratch_cm = contextlib.nullcontext(None)
+
+    async with scratch_cm as sandbox:
+        work_config = config
+        work_report_path = report_path
+        if sandbox is not None:
             work_config = sandbox.audit_config(config)
             copied_poc_dir = sandbox.copy_input_tree(poc_dir, "stage5-poc")
             poc_dir = str(copied_poc_dir)
             work_report_path = str(copied_poc_dir / "report.md")
             if finding_file:
                 finding_file = str(sandbox.copy_input(finding_file, "finding.json"))
-        except BaseException:
-            # BaseException also covers CancelledError so a cancel during
-            # prepare() still tears down the scratch tree it created.
-            await sandbox.close()
-            raise
 
-    try:
         stage6_vuln_dir = os.path.join(
             work_config.output_dir, "stage6-disclosures", vuln_id
         )
@@ -556,20 +558,6 @@ async def _run_disclosure(
                     f"Stage 6: Invalid retained artifacts for {vuln_id}: "
                     + "; ".join(issue.description for issue in issues)
                 )
-    finally:
-        if sandbox is not None:
-            # Capture any in-flight validation/agent error before close() so a
-            # teardown failure cannot replace the real task result.
-            propagating = sys.exc_info()[0] is not None
-            try:
-                await sandbox.close()
-            except Exception:
-                if not propagating:
-                    raise
-                logger.exception(
-                    "Stage 6: failed to clean up scratch workspace for %s.", vuln_id
-                )
-
     checkpoint.mark_complete(key)
     has_report = os.path.exists(disclosure_report)
     logger.info("Stage 6: %s complete (report=%s)", vuln_id, has_report)
@@ -609,25 +597,17 @@ async def run_stage6(
         lambda candidate, _: _run_disclosure(candidate.report_path, config, checkpoint),
     )
 
-    disclosure_reports: list[str] = []
-    for i, (status, value, error) in enumerate(results):
-        if i >= len(candidates):
-            continue
-        if status == "rejected":
-            logger.error(
-                "Stage 6: %s failed: %s",
-                os.path.basename(candidates[i].report_path),
-                error,
-            )
-            record_task_error(
-                config,
-                "stage6",
-                os.path.basename(os.path.dirname(candidates[i].report_path)),
-                error,
-            )
-            continue
-        if value:
-            disclosure_reports.append(value)
+    disclosure_reports = collect_parallel_results(
+        results,
+        candidates,
+        stage="stage6",
+        config=config,
+        logger=logger,
+        item_id=lambda candidate: os.path.basename(
+            os.path.dirname(candidate.report_path)
+        ),
+        item_log=lambda candidate: os.path.basename(candidate.report_path),
+    )
 
     logger.info(
         "Stage 6 complete. %d disclosure packages prepared (from %d reproduced vulnerabilities).",

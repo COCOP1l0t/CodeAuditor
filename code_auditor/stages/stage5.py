@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -21,8 +22,8 @@ from ..retention import (
     export_retained_artifacts,
     secure_generated_manifest_mode,
 )
-from ..sandbox import DockerScratch
-from ..utils import format_validation_issues, record_task_error, run_parallel_limited
+from ..sandbox import DockerScratch, docker_scratch
+from ..utils import collect_parallel_results, format_validation_issues, run_parallel_limited
 from ..validation.stage5 import validate_stage5_trigger_graph
 from ..wiki import build_wiki_context
 
@@ -32,6 +33,26 @@ logger = get_logger("stage5")
 # building projects, writing exploit code, running/debugging, and iterating.
 _MAX_TURNS = 500
 _DEFAULT_EFFORT = "medium"
+
+
+def _poc_agent_kwargs(
+    config: AuditConfig,
+    poc_target: str,
+    log_file: str,
+    sandbox: DockerScratch | None,
+) -> dict[str, object]:
+    """Agent options shared by every Stage 5 invocation.
+
+    ``model`` is resolved fresh on each call: the local CLI configuration is
+    authoritative for the ``local`` provider mode.
+    """
+    return {
+        "cwd": poc_target,
+        "model": select_poc_model(config),
+        "effort": _DEFAULT_EFFORT,
+        "log_file": log_file,
+        "sandbox": sandbox,
+    }
 
 
 def _task_key(vuln_id: str) -> str:
@@ -130,9 +151,6 @@ async def _run_reproduce(
         checkpoint.clear(key)
 
     logger.info("Stage 5: Starting PoC reproduction for %s.", vuln_id)
-    sandbox: DockerScratch | None = None
-    work_config = config
-    work_vuln_file = vuln_file_path
     reproduction_context = (
         "This is a fresh audit reproduction. No earlier Disclosure package "
         "was supplied; develop and verify the PoC from the finding."
@@ -140,9 +158,20 @@ async def _run_reproduce(
     if config.sandbox_enabled:
         identity = capture_repo_identity(config.target)
         source_commit = config.poc_source_commit or identity.get("commit") or ""
-        sandbox = DockerScratch(config, f"stage5-{vuln_id}")
-        try:
-            await sandbox.prepare(config.target, source_commit)
+        scratch_cm = docker_scratch(
+            config,
+            f"stage5-{vuln_id}",
+            source_commit=source_commit,
+            logger=logger,
+            scratch_factory=DockerScratch,
+        )
+    else:
+        scratch_cm = contextlib.nullcontext(None)
+
+    async with scratch_cm as sandbox:
+        work_config = config
+        work_vuln_file = vuln_file_path
+        if sandbox is not None:
             work_config = sandbox.audit_config(config)
             work_vuln_file = str(sandbox.copy_input(vuln_file_path, "finding.json"))
             if config.reproduction_reference_dir:
@@ -158,52 +187,41 @@ async def _run_reproduce(
                     "cause on the pinned source revision. Do not treat an old "
                     "harness failure as proof that the vulnerability was fixed."
                 )
-        except BaseException:
-            # BaseException also covers CancelledError: a cancel during
-            # prepare() must still tear down the scratch tree it created.
-            await sandbox.close()
-            raise
 
-    poc_target = work_config.poc_worktree or work_config.target
-    poc_dir = os.path.join(work_config.output_dir, "stage5-pocs", vuln_id)
-    os.makedirs(poc_dir, exist_ok=True)
+        if config.reproduction_reference_dir and sandbox is None:
+            reproduction_context = (
+                "This is a latest-source retest. The prior retained Disclosure/PoC "
+                f"is available read-only at `{config.reproduction_reference_dir}`. "
+                "Run its portable reproducer first when present, then make only "
+                "compatibility changes needed to test the same root cause on the "
+                "pinned source revision. Do not treat an old harness failure as "
+                "proof that the vulnerability was fixed."
+            )
 
-    if config.reproduction_reference_dir and sandbox is None:
-        reproduction_context = (
-            "This is a latest-source retest. The prior retained Disclosure/PoC "
-            f"is available read-only at `{config.reproduction_reference_dir}`. "
-            "Run its portable reproducer first when present, then make only "
-            "compatibility changes needed to test the same root cause on the "
-            "pinned source revision. Do not treat an old harness failure as "
-            "proof that the vulnerability was fixed."
+        poc_target = work_config.poc_worktree or work_config.target
+        poc_dir = os.path.join(work_config.output_dir, "stage5-pocs", vuln_id)
+        os.makedirs(poc_dir, exist_ok=True)
+
+        prompt = load_prompt(
+            "stage5.md",
+            {
+                "finding_file_path": work_vuln_file,
+                "target_path": poc_target,
+                "poc_dir": poc_dir,
+                "finding_id": vuln_id,
+                "reproduction_context": reproduction_context,
+                "wiki_context": build_wiki_context(config, stage=5),
+            },
         )
 
-    prompt = load_prompt(
-        "stage5.md",
-        {
-            "finding_file_path": work_vuln_file,
-            "target_path": poc_target,
-            "poc_dir": poc_dir,
-            "finding_id": vuln_id,
-            "reproduction_context": reproduction_context,
-            "wiki_context": build_wiki_context(config, stage=5),
-        },
-    )
-
-    log_file = os.path.join(poc_dir, "agent.log")
-    resolved_report: str | None = None
-    reproduced = False
-    task_error: BaseException | None = None
-    try:
+        log_file = os.path.join(poc_dir, "agent.log")
+        resolved_report: str | None = None
+        reproduced = False
         await run_agent(
             prompt,
             work_config,
-            cwd=poc_target,
             max_turns=_MAX_TURNS,
-            model=select_poc_model(config),
-            effort=_DEFAULT_EFFORT,
-            log_file=log_file,
-            sandbox=sandbox,
+            **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
         )
 
         resolved_report = _resolve_reproduction_report(poc_dir)
@@ -231,12 +249,8 @@ async def _run_reproduce(
                 await run_agent(
                     repair_prompt,
                     work_config,
-                    cwd=poc_target,
                     max_turns=15,
-                    model=select_poc_model(config),
-                    effort=_DEFAULT_EFFORT,
-                    log_file=log_file,
-                    sandbox=sandbox,
+                    **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
                 )
                 issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
                 if issues:
@@ -284,12 +298,8 @@ async def _run_reproduce(
                 await run_agent(
                     repair_prompt,
                     work_config,
-                    cwd=poc_target,
                     max_turns=15,
-                    model=select_poc_model(config),
-                    effort=_DEFAULT_EFFORT,
-                    log_file=log_file,
-                    sandbox=sandbox,
+                    **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
                 )
                 secure_generated_manifest_mode(retained_source)
                 manifest = export_retained_artifacts(
@@ -307,25 +317,6 @@ async def _run_reproduce(
             )
             resolved_report = os.path.join(persistent_destination, "report.md")
 
-    except BaseException as exc:
-        # Keep the actual PoC/agent failure as the task result.  Cleanup is
-        # best-effort and must not replace it with a teardown error.
-        task_error = exc
-        raise
-
-    finally:
-        if sandbox is not None:
-            try:
-                await sandbox.close()
-            except Exception:
-                if task_error is None:
-                    raise
-                logger.exception(
-                    "Stage 5: failed to clean up scratch workspace for %s; "
-                    "preserving the original task error.",
-                    vuln_id,
-                )
-
     if resolved_report is None:
         # No retained report means the task did not finish; leave the
         # checkpoint unset so a resume retries it instead of treating an
@@ -341,7 +332,7 @@ async def _run_reproduce(
         logger.info("Stage 5: %s marked as false positive.", vuln_id)
         return None
 
-    has_report = resolved_report is not None
+    has_report = True
     has_graph = bool(
         reproduced
         and resolved_report
@@ -381,23 +372,15 @@ async def run_stage5(
         lambda vf, _: _run_reproduce(vf, config, checkpoint),
     )
 
-    reports: list[str] = []
-    for i, (status, value, error) in enumerate(results):
-        if i >= len(vuln_files):
-            continue
-        if status == "rejected":
-            logger.error(
-                "Stage 5: %s failed: %s", os.path.basename(vuln_files[i]), error
-            )
-            record_task_error(
-                config,
-                "stage5",
-                os.path.splitext(os.path.basename(vuln_files[i]))[0],
-                error,
-            )
-            continue
-        if value:
-            reports.append(value)
+    reports = collect_parallel_results(
+        results,
+        vuln_files,
+        stage="stage5",
+        config=config,
+        logger=logger,
+        item_id=lambda path: os.path.splitext(os.path.basename(path))[0],
+        item_log=os.path.basename,
+    )
 
     logger.info(
         "Stage 5 complete. %d reports generated (from %d vulnerabilities).",

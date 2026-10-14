@@ -307,6 +307,129 @@ def test_run_disclosure_exports_retained_files_and_cleans_up_scratch(
     assert checkpoint.is_complete("stage6:H-07")
 
 
+def test_run_disclosure_without_sandbox_still_writes_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local-worktree path must produce the same artifacts as the sandboxed one."""
+    config, checkpoint, _target, output_dir = _stage6_config(tmp_path)
+    config.sandbox_enabled = False
+    report = _write_stage5(output_dir, "H-13")
+
+    async def fake_run_agent(
+        _prompt: str,
+        work_config: AuditConfig,
+        **_kwargs: object,
+    ) -> str:
+        disclosure = (
+            Path(work_config.output_dir) / "stage6-disclosures" / "H-13" / "disclosure"
+        )
+        disclosure.mkdir(parents=True, exist_ok=True)
+        reproduce = disclosure / "reproduce.sh"
+        reproduce.write_text(
+            "#!/bin/sh\nexec echo reproduced\n", encoding="utf-8"
+        )
+        (disclosure / "report.md").write_text(
+            "# Disclosure\n\n### Summary\nExample.\n\n### Details\nExample.\n\n"
+            "### PoC\nExisting evidence.\n\n### Impact\nExample.\n",
+            encoding="utf-8",
+        )
+        (disclosure / "email.txt").write_text(
+            "Subject: Example\n\nBody.\n", encoding="utf-8"
+        )
+        with zipfile.ZipFile(disclosure / "disclosure.zip", "w") as archive:
+            archive.write(disclosure / "report.md", "report.md")
+            archive.write(reproduce, "reproduce.sh")
+        (disclosure / "retain-manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entrypoint": "reproduce.sh",
+                    "files": [
+                        {"path": "reproduce.sh", "role": "entrypoint"},
+                        {"path": "report.md", "role": "report"},
+                        {"path": "email.txt", "role": "disclosure"},
+                        {"path": "disclosure.zip", "role": "disclosure"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "done"
+
+    monkeypatch.setattr(stage6, "run_agent", fake_run_agent)
+
+    result = asyncio.run(stage6._run_disclosure(str(report), config, checkpoint))
+
+    persistent = output_dir / "stage6-disclosures" / "H-13" / "disclosure"
+    assert result == str(persistent / "report.md")
+    assert sorted(path.name for path in persistent.iterdir()) == [
+        "disclosure.zip",
+        "email.txt",
+        "report.md",
+        "reproduce.sh",
+        "retain-manifest.json",
+    ]
+    assert checkpoint.is_complete("stage6:H-13")
+
+
+def test_stage6_preserves_agent_error_when_scratch_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, checkpoint, _target, output_dir = _stage6_config(tmp_path)
+    config.sandbox_enabled = True
+    report = _write_stage5(output_dir, "H-12")
+    scratch_root = tmp_path / "fake-stage6-cleanup-scratch"
+
+    class FakeScratch:
+        def __init__(self, owner: AuditConfig, _task_name: str) -> None:
+            self.source_dir = scratch_root / "source"
+            self.artifact_dir = scratch_root / "artifacts"
+            self.input_dir = scratch_root / "inputs"
+
+        async def prepare(self, _target: str, _commit: str):  # type: ignore[no-untyped-def]
+            self.source_dir.mkdir(parents=True)
+            self.artifact_dir.mkdir(parents=True)
+            self.input_dir.mkdir(parents=True)
+            return self
+
+        def audit_config(self, owner: AuditConfig) -> AuditConfig:
+            return replace(
+                owner,
+                target=str(self.source_dir),
+                output_dir=str(self.artifact_dir),
+                poc_worktree=str(self.source_dir),
+            )
+
+        def copy_input_tree(self, source: str, name: str) -> Path:
+            destination = self.input_dir / name
+            shutil.copytree(source, destination)
+            return destination
+
+        def copy_input(self, source: str, name: str) -> Path:
+            destination = self.input_dir / name
+            shutil.copyfile(source, destination)
+            return destination
+
+        async def close(self) -> None:
+            raise RuntimeError("cleanup failed")
+
+    async def failing_agent(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("agent failed")
+
+    monkeypatch.setattr(stage6, "DockerScratch", FakeScratch)
+    monkeypatch.setattr(stage6, "capture_repo_identity", lambda _target: {"commit": ""})
+    monkeypatch.setattr(stage6, "run_agent", failing_agent)
+
+    reports = asyncio.run(stage6.run_stage6([str(report)], config, checkpoint))
+
+    assert reports == []
+    assert len(config.task_errors) == 1
+    assert "agent failed" in config.task_errors[0]
+    assert "cleanup failed" not in config.task_errors[0]
+
+
 @pytest.mark.parametrize("token_source", ["none", "candidate", "inventory"])
 def test_semantic_dedupe_uses_database_metadata(
     tmp_path: Path, monkeypatch, token_source: str

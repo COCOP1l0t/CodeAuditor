@@ -3888,3 +3888,104 @@ def test_api_target_merged(tmp_path, monkeypatch) -> None:
 
     assert client.get("/api/target/sha256:nope").status_code == 400
     assert client.get("/api/target/" + "sha256:" + "2" * 64).status_code == 404
+
+
+def test_api_history_trajectory_returns_root_children_and_blobs(tmp_path) -> None:
+    """The trajectory index exposes the ATIF root plus one entry per child."""
+    app = _make_app(tmp_path)
+    output_dir = tmp_path / "audit-output-trajectory"
+    trajectories = output_dir / "trajectories"
+    child_dir = trajectories / "stage5-pocs" / "H-12"
+    blob_dir = child_dir / "blobs"
+    child_dir.mkdir(parents=True)
+    blob_dir.mkdir(parents=True)
+    (blob_dir / "deadbeef.txt").write_text("spilled evidence", encoding="utf-8")
+
+    root = {
+        "schema_version": "ATIF-v1.7",
+        "session_id": "run-9",
+        "agent": {"name": "code-auditor", "version": "0.1.0"},
+        "steps": [{"step_id": 1, "source": "system", "message": "role"}],
+        "final_metrics": {"total_steps": 1},
+    }
+    (trajectories / "trajectory.json").write_text(json.dumps(root), encoding="utf-8")
+    child = {
+        "schema_version": "ATIF-v1.7",
+        "trajectory_id": "child-1",
+        "agent": {"name": "code-auditor", "version": "0.1.0", "model_name": "claude-sonnet-4-6"},
+        "steps": [
+            {"step_id": 1, "source": "user", "message": "audit"},
+            {"step_id": 2, "source": "agent", "message": "done"},
+        ],
+    }
+    (child_dir / "agent.json").write_text(json.dumps(child), encoding="utf-8")
+
+    run_id = app.state.store.create_run(
+        AuditConfig(target=str(tmp_path / "Target"), output_dir=str(output_dir)),
+        status=RUN_DONE,
+    )
+    client = TestClient(app)
+
+    response = client.get(f"/api/history/{run_id}/trajectory")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["root"]["schema_version"] == "ATIF-v1.7"
+    assert body["root"]["session_id"] == "run-9"
+    assert [entry["path"] for entry in body["children"]] == [
+        "stage5-pocs/H-12/agent.json"
+    ]
+    assert body["children"][0]["steps"] == 2
+    assert body["children"][0]["model_name"] == "claude-sonnet-4-6"
+    assert body["children"][0]["valid"] is True
+    # Blobs live next to the document that spilled them, not only at the root.
+    assert body["blobs"] == [
+        {"path": "stage5-pocs/H-12/blobs/deadbeef.txt", "bytes": 16}
+    ]
+
+    # The same documents are reachable through the generic file endpoint.
+    served = client.get(
+        f"/api/history/{run_id}/file",
+        params={"path": "trajectories/stage5-pocs/H-12/agent.json"},
+    )
+    assert served.status_code == 200
+    assert json.loads(served.text)["trajectory_id"] == "child-1"
+
+    # Results listing advertises the trajectory files.
+    results = client.get(f"/api/history/{run_id}/results").json()
+    assert "trajectories/stage5-pocs/H-12/agent.json" in results["trajectories"]
+
+
+def test_api_history_trajectory_is_empty_without_capture(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    output_dir = tmp_path / "audit-output-plain"
+    output_dir.mkdir()
+    run_id = app.state.store.create_run(
+        AuditConfig(target=str(tmp_path / "Target"), output_dir=str(output_dir)),
+        status=RUN_DONE,
+    )
+
+    body = TestClient(app).get(f"/api/history/{run_id}/trajectory").json()
+
+    assert body == {"root": None, "children": [], "blobs": []}
+
+
+def test_api_history_trajectory_marks_invalid_child_documents(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    output_dir = tmp_path / "audit-output-invalid-trajectory"
+    child_dir = output_dir / "trajectories" / "stage5-pocs" / "H-1"
+    child_dir.mkdir(parents=True)
+    (child_dir / "agent.invalid.json").write_text(
+        json.dumps({"schema_version": "ATIF-v1.7", "steps": []}), encoding="utf-8"
+    )
+    run_id = app.state.store.create_run(
+        AuditConfig(target=str(tmp_path / "Target"), output_dir=str(output_dir)),
+        status=RUN_DONE,
+    )
+
+    body = TestClient(app).get(f"/api/history/{run_id}/trajectory").json()
+
+    assert [entry["path"] for entry in body["children"]] == [
+        "stage5-pocs/H-1/agent.invalid.json"
+    ]
+    assert body["children"][0]["valid"] is False

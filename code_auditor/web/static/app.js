@@ -2092,6 +2092,7 @@ async function loadRunResults(run) {
     fillFileList("results-pocs", data.poc_reports, viewer);
     fillFileList("results-disclosures", data.disclosures, viewer);
     fillFileList("results-agent-logs", data.agent_logs, viewer);
+    fillFileList("results-trajectories", data.trajectories, viewer);
     resultsPanel.hidden = false;
   } catch {
     resultsPanel.hidden = true;

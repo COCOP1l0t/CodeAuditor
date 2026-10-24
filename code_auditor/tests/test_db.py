@@ -24,6 +24,7 @@ from code_auditor.db import (
     scan_output_dir,
 )
 from code_auditor.disclosures import build_dedupe_key
+from code_auditor.trajectory import TrajectoryRecorder, validate_trajectory
 
 
 def _make_output_dir(base: Path) -> Path:
@@ -2322,6 +2323,86 @@ def test_purge_all_trashed_disclosures(tmp_path) -> None:
             ).fetchone()[0]
             == 0
         )
+
+
+def test_permanent_purge_removes_trajectories_and_prunes_run_refs(tmp_path) -> None:
+    """Purging evidence must also erase the ATIF copies and dangling refs."""
+    out = _make_disclosure_output(tmp_path / "qemu")
+    db_path = tmp_path / "history.db"
+    store = AuditStore(str(db_path))
+    store.record_run(
+        AuditConfig(target=str(tmp_path / "qemu"), output_dir=str(out)),
+        status=RUN_DONE,
+    )
+    disclosure = store.list_disclosed()[0]
+    identity = ("qemu", disclosure["dedupe_key"])
+
+    trajectories = out / "trajectories"
+    stage5_child = trajectories / "stage5-pocs" / "H-01" / "agent.json"
+    stage6_child = trajectories / "stage6-disclosures" / "H-01" / "agent.json"
+    dedupe_child = trajectories / "stage6-disclosures" / ".dedupe-logs" / "H-01.json"
+    kept_child = trajectories / "stage5-pocs" / "H-02" / "agent.json"
+
+    def write_child(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "ATIF-v1.7",
+                    "session_id": "run-purge",
+                    "agent": {"name": "code-auditor", "version": "0.1.0"},
+                    "steps": [{"step_id": 1, "source": "user", "message": "go"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    for child in (stage5_child, stage6_child, dedupe_child, kept_child):
+        write_child(child)
+    blob = stage5_child.parent / "blobs" / "evidence.txt"
+    blob.parent.mkdir(parents=True)
+    blob.write_text("exploit evidence", encoding="utf-8")
+
+    root = TrajectoryRecorder(session_id="run-purge")
+    for relative in (
+        "stage5-pocs/H-01/agent.json",
+        "stage6-disclosures/H-01/agent.json",
+        "stage6-disclosures/.dedupe-logs/H-01.json",
+        "stage5-pocs/H-02/agent.json",
+    ):
+        root.add_subagent(relative, label=relative.split("/")[1])
+    root.finish()
+    root.write(trajectories / "trajectory.json")
+
+    assert store.trash_disclosure(*identity)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE disclosed_bugs SET deleted_at = ? WHERE dedupe_key = ?",
+            (time.time() - DISCLOSURE_TRASH_RETENTION_SECONDS - 1, identity[1]),
+        )
+    AuditStore(str(db_path))
+
+    assert not (trajectories / "stage5-pocs" / "H-01").exists()
+    assert not (trajectories / "stage6-disclosures" / "H-01").exists()
+    assert not dedupe_child.exists()
+    assert kept_child.is_file()
+
+    document = json.loads(
+        (trajectories / "trajectory.json").read_text(encoding="utf-8")
+    )
+    assert validate_trajectory(document) == []
+    referenced = [
+        ref["trajectory_path"]
+        for step in document["steps"]
+        for result in (step.get("observation") or {}).get("results", [])
+        for ref in result.get("subagent_trajectory_ref", [])
+    ]
+    assert "stage5-pocs/H-02/agent.json" in referenced
+    assert "stage5-pocs/H-01/agent.json" not in referenced
+    assert "stage6-disclosures/H-01/agent.json" not in referenced
+    assert "stage6-disclosures/.dedupe-logs/H-01.json" not in referenced
+    assert document["final_metrics"]["total_steps"] == len(document["steps"])
+
 
 
 def test_purge_selected_trashed_disclosures_only_removes_selected_artifacts(

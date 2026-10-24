@@ -255,6 +255,12 @@ def _sse_stream(bus, last_event_id: str | None = None) -> StreamingResponse:
     )
 
 
+# Bound what the trajectory index endpoint returns: a long audit can have
+# hundreds of child documents and some tool results spill to blob files.
+_TRAJECTORY_FILE_LIMIT = 8 * 1024 * 1024
+_TRAJECTORY_MAX_CHILDREN = 500
+
+
 def _scan_results(output_dir: str) -> dict:
     """List audit artifacts under the output directory (relative paths)."""
     base = Path(output_dir)
@@ -273,6 +279,7 @@ def _scan_results(output_dir: str) -> dict:
         "disclosures": rel("stage6-disclosures/*/disclosure/*"),
         "reproduction_review": rel("reproduction-review/**/*"),
         "reproduction_result": rel("reproduction-result.json"),
+        "trajectories": rel("trajectories/**/*.json"),
         "agent_logs": [
             str(path.relative_to(base)) for path in _agent_log_paths(output_dir)
         ],
@@ -1895,6 +1902,81 @@ def create_app(
     ):
         """Latest agent log of a run; works for both live and finished runs."""
         return _agent_log_response(_get_history_run(run_id)["output_dir"], download)
+
+    @app.get("/api/history/{run_id}/trajectory")
+    def history_run_trajectory(run_id: int) -> dict:
+        """ATIF v1.7 trajectories of one run: the root document and children.
+
+        The root document references each child by ``trajectory_path``; children
+        are returned as a light index (path, step count, agent) so a run with
+        hundreds of subagents does not return megabytes of JSON here. The full
+        child documents are served by ``/api/history/{run_id}/file``.
+        """
+        run = _get_history_run(run_id)
+        base = Path(run["output_dir"]) / "trajectories"
+        if not base.is_dir():
+            return {"root": None, "children": [], "blobs": []}
+
+        root: dict | None = None
+        root_path = base / "trajectory.json"
+        try:
+            root_size = root_path.stat().st_size if root_path.is_file() else None
+        except OSError:
+            root_size = None
+        if root_size is not None and root_size <= _TRAJECTORY_FILE_LIMIT:
+            try:
+                loaded = json.loads(root_path.read_text(encoding="utf-8"))
+                root = loaded if isinstance(loaded, dict) else None
+            except (OSError, ValueError):
+                root = None
+
+        children: list[dict] = []
+        for path in sorted(base.rglob("*.json")):
+            if path == root_path or not path.is_file():
+                continue
+            relative = str(path.relative_to(base))
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            entry: dict = {
+                "path": relative,
+                "bytes": size,
+                # ``write`` renames ATIF-invalid documents; keep them visible
+                # for diagnosis but never let a consumer mistake them for a
+                # valid trajectory.
+                "valid": not path.name.endswith(".invalid.json"),
+            }
+            if size <= _TRAJECTORY_FILE_LIMIT:
+                try:
+                    document = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    document = None
+                if isinstance(document, dict):
+                    steps = document.get("steps")
+                    entry["steps"] = len(steps) if isinstance(steps, list) else 0
+                    agent = document.get("agent")
+                    if isinstance(agent, dict):
+                        entry["agent"] = agent.get("name")
+                        entry["model_name"] = agent.get("model_name")
+                    entry["trajectory_id"] = document.get("trajectory_id")
+            children.append(entry)
+            if len(children) >= _TRAJECTORY_MAX_CHILDREN:
+                break
+
+        # Blobs are content-addressed next to the document that spilled them,
+        # so they can live under a child directory as well as at the root.
+        blobs: list[dict] = []
+        for path in sorted(base.rglob("blobs/*")):
+            if not path.is_file():
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            blobs.append({"path": path.relative_to(base).as_posix(), "bytes": size})
+
+        return {"root": root, "children": children, "blobs": blobs}
 
     @app.get("/api/history/{run_id}/file")
     def history_run_file(

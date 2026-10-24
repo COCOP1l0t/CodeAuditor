@@ -816,6 +816,101 @@ def scan_output_dir(
     return result
 
 
+def _trajectory_ref_removed(
+    path_value: object,
+    prefixes: set[str],
+    files: set[str],
+) -> bool:
+    """Return whether a ``subagent_trajectory_ref`` points at purged evidence."""
+    if not isinstance(path_value, str) or not path_value:
+        return False
+    relative = path_value.replace("\\", "/")
+    if relative in files:
+        return True
+    return any(relative == prefix or relative.startswith(prefix + "/") for prefix in prefixes)
+
+
+def _prune_trajectory_refs(
+    output_dir: str,
+    prefixes: set[str],
+    files: set[str],
+) -> int:
+    """Remove delegations to purged PoC/Disclosure artifacts from a run's ATIF.
+
+    The run-level document is the index of child trajectories. Deleting the
+    Stage 5/6 evidence without updating it would leave dangling references, so
+    the matching delegation steps are dropped and ``total_steps`` is refreshed.
+    """
+    from .trajectory import TrajectoryRecorder
+
+    root_path = Path(output_dir) / "trajectories" / "trajectory.json"
+    if not root_path.is_file():
+        return 0
+    try:
+        recorder = TrajectoryRecorder.load(root_path, redact=False)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Could not read run trajectory %s", root_path)
+        return 0
+    if recorder is None:
+        return 0
+    removed = 0
+    kept_steps: list[dict[str, Any]] = []
+    for step in recorder.steps:
+        observation = step.get("observation")
+        results = observation.get("results") if isinstance(observation, dict) else None
+        if isinstance(results, list) and results:
+            kept_results: list[dict[str, Any]] = []
+            for result in results:
+                if not isinstance(result, dict):
+                    kept_results.append(result)
+                    continue
+                refs = result.get("subagent_trajectory_ref")
+                if isinstance(refs, list) and refs:
+                    kept_refs = [
+                        ref
+                        for ref in refs
+                        if not _trajectory_ref_removed(
+                            ref.get("trajectory_path") if isinstance(ref, dict) else None,
+                            prefixes,
+                            files,
+                        )
+                    ]
+                    removed += len(refs) - len(kept_refs)
+                    if kept_refs:
+                        kept_results.append({**result, "subagent_trajectory_ref": kept_refs})
+                        continue
+                    if result.get("content") or result.get("extra"):
+                        kept_results.append(
+                            {key: value for key, value in result.items() if key != "subagent_trajectory_ref"}
+                        )
+                        continue
+                    continue
+                kept_results.append(result)
+            if kept_results:
+                step["observation"] = {"results": kept_results}
+                kept_steps.append(step)
+                continue
+            if step.get("message") or not step.get("extra", {}).get("label"):
+                step.pop("observation", None)
+                kept_steps.append(step)
+            continue
+        kept_steps.append(step)
+    if not removed:
+        return 0
+    recorder.steps = kept_steps
+    metrics = recorder.final_metrics if isinstance(recorder.final_metrics, dict) else {}
+    recorder.final_metrics = {**metrics, "total_steps": len(kept_steps)}
+    try:
+        recorder.write(root_path)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Could not update run trajectory %s", root_path)
+        return 0
+    logger.info(
+        "Removed %d purged trajectory reference(s) from %s.", removed, root_path
+    )
+    return removed
+
+
 class AuditStore:
     def __init__(
         self,
@@ -1461,12 +1556,49 @@ class AuditStore:
                 - protected_poc_dirs
             )
 
-        # Stage every managed artifact directory with same-filesystem renames
-        # before changing SQLite. A failure restores the entire batch, avoiding
-        # a record whose Stage 5 directory vanished while Stage 6 remained.
+        # Trajectories mirror the managed artifact layout (and contain the
+        # same prompts, exploit code and tool output). A permanent purge has to
+        # remove them too, otherwise the evidence survives in the run tree.
+        deleted_trajectory_paths: set[str] = set()
+        trajectory_cleanup: dict[str, tuple[set[str], set[str]]] = {}
+        for poc_dir in deleted_poc_dirs:
+            stage5_dir = os.path.dirname(poc_dir)
+            output_dir = os.path.dirname(stage5_dir)
+            vuln_id = os.path.basename(poc_dir)
+            deleted_trajectory_paths.add(
+                os.path.join(output_dir, "trajectories", "stage5-pocs", vuln_id)
+            )
+            prefixes, files = trajectory_cleanup.setdefault(output_dir, (set(), set()))
+            prefixes.add(f"stage5-pocs/{vuln_id}")
+        for disclosure_dir in deleted_disclosure_dirs:
+            vuln_dir = os.path.dirname(disclosure_dir)
+            output_dir = os.path.dirname(os.path.dirname(vuln_dir))
+            vuln_id = os.path.basename(vuln_dir)
+            deleted_trajectory_paths.add(
+                os.path.join(output_dir, "trajectories", "stage6-disclosures", vuln_id)
+            )
+            deleted_trajectory_paths.add(
+                os.path.join(
+                    output_dir,
+                    "trajectories",
+                    "stage6-disclosures",
+                    ".dedupe-logs",
+                    f"{vuln_id}.json",
+                )
+            )
+            prefixes, files = trajectory_cleanup.setdefault(output_dir, (set(), set()))
+            prefixes.add(f"stage6-disclosures/{vuln_id}")
+            files.add(f"stage6-disclosures/.dedupe-logs/{vuln_id}.json")
+
+        # Stage every managed artifact path (directories and the occasional
+        # single-file child trajectory) with same-filesystem renames before
+        # changing SQLite. A failure restores the entire batch, avoiding a
+        # record whose Stage 5 directory vanished while Stage 6 remained.
         quarantined: list[tuple[str, str]] = []
         try:
-            for artifact_dir in sorted(deleted_disclosure_dirs | deleted_poc_dirs):
+            for artifact_dir in sorted(
+                deleted_disclosure_dirs | deleted_poc_dirs | deleted_trajectory_paths
+            ):
                 if not os.path.lexists(artifact_dir):
                     continue
                 quarantine = os.path.join(
@@ -1564,9 +1696,22 @@ class AuditStore:
                     )
             raise
 
+        for output_dir, (prefixes, files) in trajectory_cleanup.items():
+            try:
+                _prune_trajectory_refs(output_dir, prefixes, files)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Disclosure artifacts were removed but trajectory references "
+                    "under %s could not be pruned.",
+                    output_dir,
+                )
+
         for _artifact_dir, quarantine in quarantined:
             try:
-                shutil.rmtree(quarantine)
+                if os.path.islink(quarantine) or not os.path.isdir(quarantine):
+                    os.unlink(quarantine)
+                else:
+                    shutil.rmtree(quarantine)
             except OSError:
                 logger.exception(
                     "Disclosure metadata was removed but quarantined artifacts could "

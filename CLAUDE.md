@@ -83,8 +83,8 @@ code_auditor/
 ├── agent.py             # claude-code-sdk wrapper + validation retry loop
 ├── trajectory.py        # ATIF v1.7 trajectory capture: event mapping, redaction,
 │                        #   blob spill, validator, run/child document layout
-├── bench/               # Benchmark adapters (base/registry + tsecbench);
-│                        #   not wired into the audit orchestrator yet
+├── bench/               # Benchmark adapters (base/registry, tsecbench,
+│                        #   ctftiny); not wired into the audit orchestrator yet
 ├── prompts.py           # load_prompt() with __KEY__ substitution
 ├── checkpoint.py        # File/marker-based checkpoint/resume
 ├── repos.py             # Git URL → ~/.code_auditor/repo/ mirror (clone + reuse)

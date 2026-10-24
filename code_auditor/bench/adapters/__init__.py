@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from ..registry import register
+from .ctftiny import CTFTinyAdapter
 from .tsecbench import TSecBenchAdapter
 
 register("tsecbench", TSecBenchAdapter)
+register("ctftiny", CTFTinyAdapter)
 
-__all__ = ["TSecBenchAdapter"]
+__all__ = ["CTFTinyAdapter", "TSecBenchAdapter"]

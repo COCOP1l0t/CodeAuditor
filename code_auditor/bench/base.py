@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Protocol, runtime_checkable
 
-Scenario = Literal["repo", "remote-target", "container"]
+Scenario = Literal["repo", "remote-target", "container", "workspace"]
 SubmissionKind = Literal["flag", "patch", "poc", "report"]
 
 

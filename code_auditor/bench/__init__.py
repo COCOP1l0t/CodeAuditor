@@ -8,7 +8,7 @@ validated against a real TSecBench deployment before it changes stage 0-6.
 
 from __future__ import annotations
 
-from .adapters import TSecBenchAdapter
+from .adapters import CTFTinyAdapter, TSecBenchAdapter
 from .base import (
     BenchAdapter,
     BenchTask,
@@ -28,6 +28,7 @@ __all__ = [
     "Scenario",
     "Submission",
     "SubmissionKind",
+    "CTFTinyAdapter",
     "TSecBenchAdapter",
     "create",
     "register",

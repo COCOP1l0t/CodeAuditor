@@ -19,9 +19,20 @@ from .base import (
     SubmissionKind,
 )
 from .registry import create, register, registered
+from .runner import (
+    BenchResult,
+    BenchRun,
+    BenchRunner,
+    BenchRunError,
+    extract_flag,
+)
 
 __all__ = [
     "BenchAdapter",
+    "BenchResult",
+    "BenchRun",
+    "BenchRunner",
+    "BenchRunError",
     "BenchTask",
     "InstanceSpec",
     "Outcome",
@@ -32,6 +43,7 @@ __all__ = [
     "CyBenchAdapter",
     "TSecBenchAdapter",
     "create",
+    "extract_flag",
     "register",
     "registered",
 ]

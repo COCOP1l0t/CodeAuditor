@@ -297,6 +297,10 @@ class CyBenchAdapter:
 
     # -- grading -----------------------------------------------------------
 
+    def expected_flag(self, instance: InstanceSpec | str) -> str:
+        """Host-side ground truth, used only to scrub leaked artifacts."""
+        return self._task(self._code(instance)).answer
+
     def grade(self, instance: InstanceSpec | str, submission: Submission) -> Outcome:
         code = self._code(instance)
         info = self._task(code)

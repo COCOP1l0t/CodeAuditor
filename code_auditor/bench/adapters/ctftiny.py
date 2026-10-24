@@ -294,6 +294,10 @@ class CTFTinyAdapter:
 
     # -- grading -----------------------------------------------------------
 
+    def expected_flag(self, instance: InstanceSpec | str) -> str:
+        """Host-side ground truth, used only to scrub leaked artifacts."""
+        return self._challenge(self._code(instance)).flag
+
     def grade(self, instance: InstanceSpec | str, submission: Submission) -> Outcome:
         code = self._code(instance)
         challenge = self._challenge(code)

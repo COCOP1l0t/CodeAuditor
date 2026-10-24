@@ -5,11 +5,12 @@
 
 ---
 
-> **基准接入现状（2026-10）**：`code_auditor/bench/` 已有框架 + `tsecbench` 与
-> `ctftiny` 两个 adapter，但**尚未接入 orchestrator/Web/DB**。TSECBench 联调见
-> [`docs/tsecbench-integration.md`](tsecbench-integration.md)，CTFTiny 见
-> [`docs/ctftiny-integration.md`](ctftiny-integration.md)。本文第 2、3 节是后续
-> CyberGym/CyBench 等接入的设计稿。
+> **基准接入现状（2026-10）**：`code_auditor/bench/` 已有框架 + `tsecbench`、
+> `ctftiny`、`cybench` 三个 adapter，但**尚未接入 orchestrator/Web/DB**。TSECBench
+> 联调见 [`docs/tsecbench-integration.md`](tsecbench-integration.md)，CTFTiny 见
+> [`docs/ctftiny-integration.md`](ctftiny-integration.md)，CyBench 见
+> [`docs/cybench-integration.md`](cybench-integration.md)。本文第 2、3 节是后续
+> CyberGym 等接入的设计稿。
 
 ## 0. 结论先行
 

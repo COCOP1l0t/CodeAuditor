@@ -91,5 +91,5 @@ adapter.close(task.instance)
 ## 下一步
 
 1. 接 bench runner（`run_agent` + `Submission`/`Outcome` + `run_kind=benchmark`）。
-2. 接 CyBench adapter（`init_script.sh` / `metadata.json` / 可选 `start_docker.sh`）。
+2. ~~接 CyBench adapter~~（已完成，见 `docs/cybench-integration.md`）。
 3. 把 flag 擦除、结果入库和 Web 视图补上。

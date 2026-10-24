@@ -137,6 +137,30 @@ class AuditConfig:
     # cache_creation_input_tokens, cache_read_input_tokens, cost_usd.
     usage_stats: dict[str, float] = field(default_factory=dict, repr=False)
 
+    # ATIF v1.7 trajectory capture. One trajectory document is written per
+    # agent invocation (next to its logical agent log), and a run-level
+    # document references them. Disabling this writes nothing. Operators can
+    # turn capture off without editing code via CODE_AUDITOR_TRAJECTORY=0.
+    trajectory_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "CODE_AUDITOR_TRAJECTORY", ""
+        ).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    trajectory_dirname: str = "trajectories"
+    # Inline budget for one tool result; larger payloads are truncated and the
+    # full text is spilled to the trajectory's ``blobs/`` directory.
+    trajectory_max_result_bytes: int = 64 * 1024
+    # Total inline observation budget for one invocation; beyond it, results are
+    # spilled to blobs and only a short snippet stays in memory/JSON.
+    trajectory_max_total_inline_bytes: int = 8 * 1024 * 1024
+    # Strip credential-shaped substrings before anything reaches a trajectory.
+    trajectory_redact: bool = True
+    # Runtime-only: absolute trajectory directory for this run, and the
+    # run-level recorder every invocation registers its child document with.
+    trajectory_root_dir: str | None = field(default=None, repr=False)
+    trajectory_root: Any = field(default=None, repr=False)
+
 
 def local_claude_model(
     settings_path: str | None = None,

@@ -13,6 +13,7 @@ import subprocess
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Protocol, TextIO
 from uuid import uuid4
 
@@ -21,6 +22,12 @@ from .secure_fs import SecureFSError, harden_private_file, require_regular_file
 from .logger import get_logger
 from .process_supervisor import ProcessJob
 from .process_tree import AUDIT_PROCESS_MARKER_ENV, CURRENT_AUDIT_PROCESS_MARKER
+from .trajectory import (
+    BLOBS_DIRNAME,
+    TrajectoryRecorder,
+    child_trajectory_path,
+    relative_trajectory_path,
+)
 from .utils import extract_json_object, format_validation_issues, record_agent_usage
 
 if TYPE_CHECKING:
@@ -338,6 +345,9 @@ async def _check_agent_log_semantically(
                 effort="low",
                 log_file=None,
                 sandbox=sandbox,
+                # The status checker is a watchdog, not part of the audited
+                # work: it must not appear in any trajectory.
+                trajectory=False,
             ),
             timeout=STATUS_CHECK_AGENT_TIMEOUT_SECONDS,
         )
@@ -554,6 +564,103 @@ def _additional_directories(config: AuditConfig, cwd: str) -> list[str]:
         if resolved != resolved_cwd and os.path.isdir(resolved) and resolved not in dirs:
             dirs.append(resolved)
     return dirs
+
+
+def _trajectory_session_id(config: AuditConfig) -> str:
+    """Session id shared by one run's root document and its children."""
+    root = getattr(config, "trajectory_root", None)
+    session_id = getattr(root, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        return session_id
+    if config.sandbox_run_id is not None:
+        return f"run-{config.sandbox_run_id}"
+    return f"ad-hoc-{uuid4().hex[:12]}"
+
+
+def _open_trajectory(
+    config: AuditConfig,
+    path: Path,
+    *,
+    model: str | None,
+    effort: str | None,
+) -> TrajectoryRecorder:
+    """Open the trajectory document for one invocation, resuming if present.
+
+    Resuming matters for repair invocations and for repeated validation
+    attempts that share one logical agent log: they are steps of the same
+    subagent task, not separate trajectories.
+    """
+    blob_dir = path.parent / BLOBS_DIRNAME
+    recorder = TrajectoryRecorder.load(
+        path,
+        max_inline_bytes=config.trajectory_max_result_bytes,
+        max_total_inline_bytes=config.trajectory_max_total_inline_bytes,
+        redact=config.trajectory_redact,
+        blob_dir=blob_dir,
+    )
+    if recorder is not None:
+        recorder.model_name = recorder.model_name or model
+        recorder.reasoning_effort = recorder.reasoning_effort or effort
+        return recorder
+    return TrajectoryRecorder(
+        session_id=_trajectory_session_id(config),
+        model_name=model,
+        reasoning_effort=effort,
+        max_inline_bytes=config.trajectory_max_result_bytes,
+        max_total_inline_bytes=config.trajectory_max_total_inline_bytes,
+        redact=config.trajectory_redact,
+        blob_dir=blob_dir,
+        extra={"label": os.path.basename(str(path.parent)) or "agent"},
+    )
+
+
+def _flush_trajectory(
+    recorder: TrajectoryRecorder | None,
+    path: Path | None,
+    config: AuditConfig,
+    *,
+    status: str,
+) -> None:
+    """Write this invocation's document and register it with the run.
+
+    Trajectory capture is observational: a failure here must never change the
+    outcome of the audit, matching how usage history reporting is handled.
+    """
+    if recorder is None or path is None:
+        return
+    try:
+        recorder.finish()
+        recorder.extend_extra({"status": status})
+        written = recorder.write(path)
+    except Exception as exc:
+        logger.warning("Could not write trajectory %s: %s", path, exc)
+        return
+    if Path(written) != Path(path):
+        # ``write`` moved an ATIF-invalid document to ``<name>.invalid.json``;
+        # the run-level document must keep pointing only at valid children.
+        logger.warning(
+            "Not referencing %s from the run trajectory because it failed validation.",
+            written,
+        )
+        return
+    root = getattr(config, "trajectory_root", None)
+    root_dir = getattr(config, "trajectory_root_dir", None)
+    if root is None or root_dir is None or root is recorder:
+        return
+    try:
+        relative = relative_trajectory_path(Path(written), Path(root_dir))
+    except ValueError:  # pragma: no cover - both paths are absolute in practice
+        relative = str(written)
+    label = recorder.extra.get("label")
+    try:
+        root.add_subagent(
+            relative,
+            label=str(label) if label else os.path.dirname(relative) or "agent",
+            summary=recorder.summary(),
+            trajectory_id=recorder.trajectory_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not register trajectory with the run: %s", exc)
 
 
 def _open_agent_log(log_file: str | None) -> TextIO | None:
@@ -832,11 +939,13 @@ async def _run_claude_agent(
     run_control: _AgentRunControl | None = None,
     sandbox: DockerScratch | None = None,
     on_invocation_started: Callable[[], Any] | None = None,
+    recorder: TrajectoryRecorder | None = None,
 ) -> str:
     ClaudeCodeOptions, query = _load_claude_sdk()
     tools = allowed_tools or DEFAULT_TOOLS
     add_dirs = _additional_directories(config, cwd)
     run_control = run_control or _AgentRunControl()
+    selected_model = resolve_agent_model(config, model)
 
     extra_args: dict[str, str | None] = {
         # Keep Claude Code settings sources enabled so provider/auth
@@ -850,7 +959,7 @@ async def _run_claude_agent(
         allowed_tools=tools,
         permission_mode="bypassPermissions",
         max_turns=max_turns,
-        model=resolve_agent_model(config, model),
+        model=selected_model,
         cwd=cwd,
         add_dirs=add_dirs,
         extra_args=extra_args,
@@ -889,6 +998,15 @@ async def _run_claude_agent(
                 async for message in query(prompt=prompt, options=options):
                     if message is None:
                         continue
+                    if recorder is not None:
+                        try:
+                            recorder.on_claude_message(message, model=selected_model)
+                        except Exception as exc:
+                            # Capture is observational: one unmappable message
+                            # must not abort the backend call.
+                            logger.warning(
+                                "Trajectory capture skipped one message: %s", exc
+                            )
                     if not announced and on_invocation_started is not None:
                         # First real feedback from the provider: only now has
                         # this backend/model actually been used. A request the
@@ -1075,6 +1193,7 @@ async def _run_codex_agent(
     run_control: _AgentRunControl | None = None,
     sandbox: DockerScratch | None = None,
     on_invocation_started: Callable[[], Any] | None = None,
+    recorder: TrajectoryRecorder | None = None,
 ) -> str:
     codex_sdk = _load_codex_sdk()
     if codex_sdk.flavor == "codex_app_server" and codex_sdk.app_server_client_cls is not None:
@@ -1182,6 +1301,13 @@ async def _run_codex_agent(
                 try:
                     async for event in stream:
                         payload = event.payload
+                        if recorder is not None:
+                            try:
+                                recorder.on_codex_event(event, model=selected_model)
+                            except Exception as exc:
+                                logger.warning(
+                                    "Trajectory capture skipped one event: %s", exc
+                                )
                         if not announced and on_invocation_started is not None:
                             # First event of the turn: the model is answering.
                             announced = True
@@ -1263,7 +1389,13 @@ async def run_agent(
     effort: str | None = None,
     log_file: str | None = None,
     sandbox: DockerScratch | None = None,
+    trajectory: bool = True,
+    trajectory_label: str | None = None,
 ) -> str:
+    # The Docker sandbox rewrites the log path to a host-only file; the
+    # trajectory is laid out from the *logical* path so it lands in the run's
+    # own output directory instead of the disposable scratch tree.
+    logical_log_file = log_file
     if sandbox is not None and log_file:
         log_file = sandbox.protected_log_path(log_file)
     # Backend/provider settings are hot-swappable on the owning Web job.
@@ -1287,6 +1419,22 @@ async def run_agent(
     started_at = time.monotonic()
     status = "failed"
     run_control = _AgentRunControl()
+
+    recorder: TrajectoryRecorder | None = None
+    recorder_path: Path | None = None
+    if trajectory and logical_log_file and invocation_config.trajectory_enabled:
+        recorder_path = child_trajectory_path(
+            invocation_config, logical_log_file, trajectory_label
+        )
+        try:
+            recorder = _open_trajectory(
+                invocation_config, recorder_path, model=selected_model, effort=effort
+            )
+            recorder.user(prompt)
+        except Exception as exc:
+            logger.warning("Could not open trajectory %s: %s", recorder_path, exc)
+            recorder = None
+            recorder_path = None
 
     logger.debug(
         "Creating %s subagent subagent_id=%s cwd=%s model=%s log_file=%s",
@@ -1336,6 +1484,7 @@ async def run_agent(
                 run_control=run_control,
                 sandbox=sandbox,
                 on_invocation_started=register_used_backend_and_model,
+                recorder=recorder,
             )
         else:
             agent_call = _run_claude_agent(
@@ -1350,6 +1499,7 @@ async def run_agent(
                 run_control=run_control,
                 sandbox=sandbox,
                 on_invocation_started=register_used_backend_and_model,
+                recorder=recorder,
             )
 
         result = await _await_agent_with_semantic_timeout(
@@ -1367,6 +1517,8 @@ async def run_agent(
         status = "cancelled"
         raise
     finally:
+        _flush_trajectory(recorder, recorder_path, invocation_config, status=status)
+
         async def cleanup_resources() -> None:
             try:
                 await run_control.cleanup_processes()

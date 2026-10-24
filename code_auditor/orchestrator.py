@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from .checkpoint import CheckpointManager
-from .config import AuditConfig
+from .config import AuditConfig, resolve_agent_model
 from .logger import get_logger
 from .repos import ensure_poc_worktree
 from .runtime_capabilities import require_stage56_execution
@@ -15,8 +17,214 @@ from .stages.stage3 import run_stage3
 from .stages.stage4 import run_stage4
 from .stages.stage5 import run_stage5
 from .stages.stage6 import run_stage6
+from .trajectory import (
+    BLOBS_DIRNAME,
+    ROOT_FILENAME,
+    TrajectoryRecorder,
+    atif_totals_from_usage_stats,
+    merge_final_metrics,
+    relative_trajectory_path,
+)
 
 logger = get_logger("orchestrator")
+
+# Backfilling references reads every child document once at the end of a run.
+# Bound both the file count and the per-file size so an unrelated/oversized
+# JSON file under ``trajectories/`` cannot stall the audit shutdown.
+_BACKFILL_MAX_FILES = 2000
+_BACKFILL_MAX_FILE_BYTES = 16 * 1024 * 1024
+
+
+def _run_model(config: AuditConfig) -> str | None:
+    """Model id to advertise on the run-level trajectory document."""
+    try:
+        return resolve_agent_model(config)
+    except Exception:  # pragma: no cover - resolution reads local config files
+        return None
+
+
+def _run_extra(config: AuditConfig) -> dict[str, object]:
+    return {
+        "run_kind": "audit",
+        "target": config.target,
+        "backend": config.backend,
+        "sandbox_enabled": config.sandbox_enabled,
+    }
+
+
+def _start_run_trajectory(config: AuditConfig) -> TrajectoryRecorder | None:
+    """Create (or resume) the run-level ATIF document.
+
+    The run-level document records orchestration only: the system/user framing
+    and one deterministic delegation step per agent invocation. Token and cost
+    totals come from the run's usage accumulator, because those calls belong to
+    the child documents.
+
+    On resume the existing document is loaded instead of replaced. Checkpointed
+    sub-tasks do not run again, so a fresh document would silently drop the
+    references to their child trajectories and start a new session id.
+    """
+    if not config.trajectory_enabled:
+        return None
+    root_dir = Path(config.output_dir) / config.trajectory_dirname
+    config.trajectory_root_dir = str(root_dir)
+    blob_dir = root_dir / BLOBS_DIRNAME
+    root_path = root_dir / ROOT_FILENAME
+
+    if config.resume and root_path.is_file():
+        try:
+            existing = TrajectoryRecorder.load(
+                root_path,
+                max_inline_bytes=config.trajectory_max_result_bytes,
+                max_total_inline_bytes=config.trajectory_max_total_inline_bytes,
+                redact=config.trajectory_redact,
+                blob_dir=blob_dir,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not load the run-level trajectory: %s", exc)
+            existing = None
+        if existing is not None and existing.steps:
+            existing.max_inline_bytes = config.trajectory_max_result_bytes
+            existing.max_total_inline_bytes = config.trajectory_max_total_inline_bytes
+            existing.redact = config.trajectory_redact
+            existing.blob_dir = blob_dir
+            existing.model_name = existing.model_name or _run_model(config)
+            existing.extend_extra(_run_extra(config))
+            config.trajectory_root = existing
+            logger.info(
+                "Resuming run-level trajectory %s (%d steps).",
+                root_path,
+                existing.step_count,
+            )
+            return existing
+
+    session_id = (
+        f"run-{config.sandbox_run_id}"
+        if config.sandbox_run_id is not None
+        else f"run-{uuid4().hex[:12]}"
+    )
+    root = TrajectoryRecorder(
+        session_id=session_id,
+        model_name=_run_model(config),
+        max_inline_bytes=config.trajectory_max_result_bytes,
+        max_total_inline_bytes=config.trajectory_max_total_inline_bytes,
+        redact=config.trajectory_redact,
+        blob_dir=blob_dir,
+        extra=_run_extra(config),
+    )
+    root.system(
+        "CodeAuditor multi-stage audit: security-context research, analysis-unit "
+        "decomposition, bug discovery, finding evaluation, PoC reproduction, and "
+        "disclosure preparation.",
+        extra={"stages": 7},
+    )
+    root.user(
+        f"Audit the repository at {config.target} for security vulnerabilities.",
+        extra={
+            "scope": config.scope or "",
+            "threat_model": config.threat_model,
+            "target_au_count": config.target_au_count,
+        },
+    )
+    config.trajectory_root = root
+    return root
+
+
+def _backfill_subagent_refs(root: TrajectoryRecorder, base: Path) -> int:
+    """Reference child documents this process did not register itself.
+
+    Resume and process termination both leave valid child trajectories that the
+    just-finished run never saw (a checkpointed task, or a task completed by an
+    earlier crashed process). They belong to the same ``session_id``, so they
+    can be re-attached without guessing.
+    """
+    if not root.session_id or not base.is_dir():
+        return 0
+    added = 0
+    for path in sorted(base.rglob("*.json")):
+        if added >= _BACKFILL_MAX_FILES:
+            logger.warning(
+                "Trajectory reference backfill stopped after %d files.", added
+            )
+            break
+        if path == base / ROOT_FILENAME or path.name.endswith(".invalid.json"):
+            continue
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > _BACKFILL_MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        try:
+            child = TrajectoryRecorder.load(path)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not inspect child trajectory %s: %s", path, exc)
+            continue
+        if child is None or child.step_count == 0:
+            continue
+        if child.session_id != root.session_id:
+            continue
+        relative = relative_trajectory_path(path, base)
+        if root.has_subagent(relative):
+            continue
+        parent = path.parent.name if path.parent != base else "agent"
+        try:
+            root.add_subagent(
+                relative,
+                label=parent,
+                summary=child.summary(),
+                trajectory_id=child.trajectory_id,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not reference child trajectory %s: %s", path, exc)
+            continue
+        added += 1
+    return added
+
+
+def _finish_run_trajectory(
+    config: AuditConfig, root: TrajectoryRecorder | None
+) -> None:
+    """Publish the run-level document; never fail the audit over it."""
+    if root is None:
+        return
+    root_dir = config.trajectory_root_dir
+    if not root_dir:
+        logger.warning("Run-level trajectory has no output directory; skipping write.")
+        config.trajectory_root = None
+        return
+    previous_metrics = dict(root.final_metrics or {})
+    try:
+        _backfill_subagent_refs(root, Path(root_dir))
+        root.finish(usage_totals=atif_totals_from_usage_stats(config.usage_stats))
+        if previous_metrics:
+            root.final_metrics = merge_final_metrics(
+                previous_metrics, root.final_metrics
+            )
+        root.extend_extra(
+            {
+                "models_used": list(config.models_used),
+                "backends_used": list(config.backends_used),
+                "task_errors": len(config.task_errors),
+            }
+        )
+        root.write(Path(root_dir) / ROOT_FILENAME)
+    except Exception as exc:
+        logger.warning("Could not write the run-level trajectory: %s", exc)
+    finally:
+        config.trajectory_root = None
+
+
+def _record_stage(config: AuditConfig, stage: int, description: str) -> None:
+    """Add a system step for one stage boundary to the run trajectory."""
+    root = config.trajectory_root
+    if root is None:
+        return
+    try:
+        root.system(f"Stage {stage}: {description}", extra={"stage": stage})
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not record stage %d in the trajectory: %s", stage, exc)
 
 
 class ProgressReporter(Protocol):
@@ -39,12 +247,25 @@ async def run_audit(
     config: AuditConfig,
     reporter: ProgressReporter | None = None,
 ) -> None:
+    """Run the audit pipeline, publishing the run-level ATIF trajectory."""
+    root = _start_run_trajectory(config)
+    try:
+        await _run_audit_stages(config, reporter)
+    finally:
+        _finish_run_trajectory(config, root)
+
+
+async def _run_audit_stages(
+    config: AuditConfig,
+    reporter: ProgressReporter | None = None,
+) -> None:
     checkpoint = CheckpointManager(config.output_dir, config.resume)
 
     if config.resume:
         logger.info("Resume mode enabled. Existing output files and markers will be reused.")
 
     # Stage 0: setup
+    _record_stage(config, 0, "Setting up output directory")
     if reporter:
         reporter.begin_stage(0, "Setting up output directory")
     await run_setup(config)
@@ -52,6 +273,7 @@ async def run_audit(
         reporter.end_stage(0)
 
     # Stage 1: security context research
+    _record_stage(config, 1, "Researching security context")
     if reporter:
         reporter.begin_stage(1, "Researching security context")
     stage1_out = await run_stage1(config, checkpoint)
@@ -70,6 +292,7 @@ async def run_audit(
     )
 
     # Stage 2: decompose project into analysis units
+    _record_stage(config, 2, "Decomposing codebase")
     if reporter:
         reporter.begin_stage(2, "Decomposing codebase")
     analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
@@ -83,6 +306,7 @@ async def run_audit(
 
     # Stage 3: bug discovery per AU
     total_aus = len(analysis_units)
+    _record_stage(config, 3, f"Discovering bugs across {total_aus} AUs")
     if reporter:
         reporter.begin_stage(3, f"Discovering bugs across {total_aus} AUs")
 
@@ -96,6 +320,7 @@ async def run_audit(
         reporter.end_stage(3)
 
     # Stage 4: evaluate findings
+    _record_stage(config, 4, f"Evaluating {len(bug_files)} findings")
     if reporter:
         reporter.begin_stage(4, f"Evaluating {len(bug_files)} findings")
     vuln_files = await run_stage4(bug_files, config, checkpoint, vuln_criteria_path)
@@ -105,6 +330,7 @@ async def run_audit(
         reporter.end_stage(4)
 
     # Stage 5: PoC reproduction per verified vulnerability
+    _record_stage(config, 5, f"Reproducing {len(vuln_files)} vulnerabilities")
     if reporter:
         reporter.begin_stage(5, f"Reproducing {len(vuln_files)} vulnerabilities")
     if vuln_files:
@@ -125,6 +351,7 @@ async def run_audit(
         reporter.end_stage(5)
 
     # Stage 6: disclosure preparation per reproduced vulnerability
+    _record_stage(config, 6, f"Preparing {len(stage5_reports)} disclosures")
     if reporter:
         reporter.begin_stage(6, f"Preparing {len(stage5_reports)} disclosures")
     await run_stage6(stage5_reports, config, checkpoint)

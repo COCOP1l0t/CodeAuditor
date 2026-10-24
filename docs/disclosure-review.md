@@ -67,5 +67,9 @@ CVE 关联保持不变。此操作只更新本地材料，不发送邮件、不�
 当前可勾选的行。永久清理及 30 天自动过期使用相同边界：删除该条目登记且不再被其他
 Disclosure 引用的 `stage5-pocs/<vuln>/` 和
 `stage6-disclosures/<vuln>/disclosure/`，同步移除对应 PoC/Disclosure 数据库索引。
+同一批证据在轨迹树里的副本也会删除：`trajectories/stage5-pocs/<vuln>/`、
+`trajectories/stage6-disclosures/<vuln>/` 与
+`trajectories/stage6-disclosures/.dedupe-logs/<vuln>.json`，并从 run 级
+`trajectories/trajectory.json` 裁剪指向它们的引用、重算 `total_steps`。
 Stage 4 finding、审计 Run 和 Stage 6 漏洞目录下的非 Disclosure 日志不在清理范围内。
 不属于受管 results 目录且未由数据库 Run 登记的路径不会递归删除。

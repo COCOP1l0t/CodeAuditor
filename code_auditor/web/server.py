@@ -29,16 +29,19 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..config import SandboxRuntime
+from ..config import AuditConfig, SandboxRuntime
 from ..runtime_capabilities import stage56_execution_capability
 from ..sandbox_records import list_sandbox_executions
 from ..db import (
     DEFAULT_DB_PATH,
     DISCLOSURE_TRASH_RETENTION_DAYS,
+    RUN_CANCELLED,
+    RUN_FAILED,
     RUN_KIND_MAINTENANCE,
     RUN_RUNNING,
     AuditStore,
 )
+from ..bench import BenchRunner, create as create_benchmark_adapter, registered as registered_benchmarks
 from ..logger import configure_logging, get_logger
 from ..repos import RepoError, list_cloned_repos, validate_remote_repo_url
 from ..retention import RetentionError, export_retained_artifacts
@@ -488,6 +491,52 @@ def _safe_revision_component(value: object) -> str:
     return component.strip("-")[:40] or "previous"
 
 
+def _benchmark_dataset_roots(state_dir: str, repos_dir: str) -> list[Path]:
+    """Directories a Web-started benchmark may execute dataset scripts from."""
+    roots = [Path(state_dir) / "benchmarks", Path(repos_dir)]
+    extra = os.environ.get("CODE_AUDITOR_BENCH_ROOTS", "")
+    for part in extra.split(os.pathsep):
+        if part.strip():
+            roots.append(Path(os.path.expanduser(part.strip())).resolve())
+    return roots
+
+
+def _resolve_benchmark_dataset(
+    repo_dir: str, *, state_dir: str, repos_dir: str
+) -> str:
+    if "\x00" in repo_dir:
+        raise HTTPException(status_code=400, detail="Invalid dataset path.")
+    path = Path(os.path.expanduser(repo_dir)).resolve()
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Dataset directory not found: {path}")
+    roots = _benchmark_dataset_roots(state_dir, repos_dir)
+    if not any(path == root or path_is_within(path, root) for root in roots):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Benchmark datasets execute repository scripts. Keep them under "
+                f"{state_dir}/benchmarks or {repos_dir}, or list an allowed root "
+                "in CODE_AUDITOR_BENCH_ROOTS."
+            ),
+        )
+    return str(path)
+
+
+def _benchmark_output_dir(results_dir: str, benchmark: str) -> Path:
+    """Create a fresh managed output directory for one benchmark run."""
+    root = Path(results_dir) / "benchmarks"
+    root.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^a-z0-9_-]+", "-", benchmark.lower()).strip("-") or "benchmark"
+    for _attempt in range(5):
+        candidate = root / f"{safe}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise HTTPException(status_code=500, detail="Could not allocate a benchmark output directory.")
+
+
 def _tokens_match(provided: str, expected: str) -> bool:
     """Constant-time token comparison that tolerates non-ASCII input.
 
@@ -524,6 +573,13 @@ def _validate_http_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("URL must use http or https")
     return value
+
+
+class BenchStartRequest(StrictRequest):
+    benchmark: str = Field(min_length=1, max_length=64)
+    repo_dir: str | None = Field(default=None, max_length=4096)
+    max_turns: int = Field(default=100, ge=1, le=500)
+    capture_trajectory: bool = False
 
 
 class ImportRequest(StrictRequest):
@@ -746,6 +802,11 @@ def create_app(
         try:
             yield
         finally:
+            bench_tasks = list(app.state.bench_tasks.values())
+            for task in bench_tasks:
+                task.cancel()
+            if bench_tasks:
+                await asyncio.gather(*bench_tasks, return_exceptions=True)
             await manager.shutdown()
             purge_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -761,6 +822,8 @@ def create_app(
     app.state.terminal_token = secrets.token_urlsafe(32)
     app.state.local_directory_selections = {}
     app.state.active_terminals = 0
+    app.state.bench_tasks = {}
+    app.state.bench_task_meta = {}
     # One process-wide log handler routes records to the owning job's bus.
     install_web_log_handler(manager.bus_for_job)
 
@@ -1993,9 +2056,133 @@ def create_app(
 
     @app.get("/api/bench/adapters")
     def list_benchmark_adapters() -> dict:
-        from ..bench import registered
+        return {"adapters": registered_benchmarks()}
 
-        return {"adapters": registered()}
+    @app.post("/api/bench/runs", status_code=202)
+    async def start_benchmark_run(request: BenchStartRequest) -> dict:
+        benchmark = request.benchmark.strip().lower()
+        if benchmark not in registered_benchmarks():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown benchmark adapter: {request.benchmark}",
+            )
+        if benchmark in app.state.bench_task_meta.values():
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {benchmark} benchmark run is already active.",
+            )
+        repo_dir = ""
+        if benchmark != "tsecbench":
+            if not request.repo_dir or not request.repo_dir.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="This benchmark needs a local dataset directory.",
+                )
+            repo_dir = _resolve_benchmark_dataset(
+                request.repo_dir,
+                state_dir=settings.state_dir,
+                repos_dir=settings.repos_dir,
+            )
+
+        output_dir = _benchmark_output_dir(settings.results_dir, benchmark)
+        options: dict[str, object] = {}
+        if benchmark != "tsecbench":
+            options["repo_dir"] = repo_dir
+            options["work_root"] = output_dir / "work"
+        try:
+            adapter = create_benchmark_adapter(benchmark, **options)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not initialize the benchmark adapter: {exc}",
+            ) from exc
+
+        provider = settings.provider()
+        config = AuditConfig(
+            target=repo_dir or benchmark,
+            output_dir=str(output_dir),
+            backend=settings.backend,
+            model=provider.model if provider.mode == "custom" else None,
+            provider_mode=provider.mode,
+            provider_base_url=provider.base_url or None,
+            provider_api_key=provider.api_key or None,
+            max_parallel=1,
+            log_level=settings.log_level,
+            sandbox_enabled=False,
+            trajectory_enabled=request.capture_trajectory,
+        )
+        try:
+            run_id = await asyncio.to_thread(
+                store.create_bench_run,
+                benchmark=benchmark,
+                adapter=type(adapter).__name__,
+                repo_dir=repo_dir,
+                output_dir=str(output_dir),
+                backend=config.backend,
+                model=config.model,
+                started_at=time.time(),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Could not record the benchmark run: {exc}"
+            ) from exc
+
+        try:
+            runner = BenchRunner(
+                adapter,
+                config,
+                output_dir=output_dir,
+                max_turns=request.max_turns,
+                capture_trajectory=request.capture_trajectory,
+                store=store,
+                db_run_id=run_id,
+            )
+        except Exception as exc:
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    store.finish_bench_run,
+                    run_id,
+                    status=RUN_FAILED,
+                    error=f"{type(exc).__name__}: {exc}"[:2000],
+                )
+            raise HTTPException(
+                status_code=500, detail=f"Could not initialize the benchmark runner: {exc}"
+            ) from exc
+
+        async def run_benchmark() -> None:
+            try:
+                await runner.run()
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        store.finish_bench_run,
+                        run_id,
+                        status=RUN_CANCELLED,
+                        error="cancelled",
+                    )
+                raise
+            except Exception as exc:
+                logger.exception("Benchmark run %s failed", run_id)
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        store.finish_bench_run,
+                        run_id,
+                        status=RUN_FAILED,
+                        error=f"{type(exc).__name__}: {exc}"[:2000],
+                    )
+            finally:
+                app.state.bench_tasks.pop(run_id, None)
+                app.state.bench_task_meta.pop(run_id, None)
+
+        task = asyncio.create_task(run_benchmark())
+        app.state.bench_tasks[run_id] = task
+        app.state.bench_task_meta[run_id] = benchmark
+        return {
+            "run_id": run_id,
+            "benchmark": benchmark,
+            "status": RUN_RUNNING,
+            "output_dir": str(output_dir),
+        }
 
     @app.get("/api/bench/runs")
     def list_benchmark_runs(

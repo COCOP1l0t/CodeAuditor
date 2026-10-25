@@ -55,17 +55,31 @@ run = asyncio.run(
 
 ## Web
 
-只读页面与 API 已接入：
+页面与 API：
 
-- `#/benchmarks`：运行列表（搜索/状态过滤、刷新）。
+- `#/benchmarks`：发起表单 + 运行列表（搜索/状态过滤、刷新）。
 - `#/benchmark/{id}`：汇总、逐实例结果、Agent log 查看。
+- `POST /api/bench/runs`：`{benchmark, repo_dir?, max_turns?, capture_trajectory?}`，
+  返回 `{run_id, status, output_dir}`；后台 task 立即开始，页面跳转详情。
 - `GET /api/bench/adapters`：注册的适配器名。
 - `GET /api/bench/runs`：`limit/offset/status/benchmark/q`。
 - `GET /api/bench/runs/{id}`：汇总 + results。
 - `GET /api/bench/runs/{id}/file?path=...`：仅允许 `output_dir` 内的文件（Agent log）。
 
-**当前 Web 不能发起新 benchmark run**；run 仍由 Python `BenchRunner` 创建（写入 DB 后即可
-在页面看到）。发起表单/后台 job 是后续工作。
+服务端行为：
+
+- 一次只允许同一 benchmark 有一个 active run（409）；不同 benchmark 可并行（注意 Docker
+  端口/容器名冲突）。
+- 输出目录自动创建在 `<results_dir>/benchmarks/<benchmark>-<timestamp>-<rand>/`，Web
+  请求不能指定任意输出路径。
+- CTFTiny/CyBench 的 dataset 目录**必须**位于 `<state_dir>/benchmarks/`、管理的 repos
+  目录，或 `CODE_AUDITOR_BENCH_ROOTS`（`os.pathsep` 分隔）列出的根目录下；这些数据集
+  会执行 `init_script.sh` 等仓库脚本，不能允许任意路径。
+- TSECBench 忽略 dataset 路径，使用服务端 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN`
+  和 VPN；adapter 构造失败会在启动前返回 400。
+- agent 使用当前 Web backend/provider 设置；`sandbox_enabled=False`，benchmark 服务/脚本
+  由 adapter 在宿主管理。
+- 服务关闭时取消 active benchmark task，runner 会把 DB 状态写为 `cancelled`。
 
 ## 输出
 

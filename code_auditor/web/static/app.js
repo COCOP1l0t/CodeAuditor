@@ -5045,6 +5045,8 @@ setupTerminalSplitter();
 
 // ── Benchmarks ─────────────────────────────────────────────────────────────
 
+let benchmarkDetailTimer = null;
+
 function benchStatusBadge(status) {
   const safe = String(status || "unknown").replace(/[^a-z_-]/g, "");
   const span = document.createElement("span");
@@ -5060,7 +5062,87 @@ function benchCell(row, text) {
   return cell;
 }
 
+function updateBenchmarkRepoField() {
+  const select = $("benchmark-start-adapter");
+  const repo = $("benchmark-start-repo");
+  if (!select || !repo) return;
+  const tsec = select.value === "tsecbench";
+  repo.disabled = tsec;
+  repo.required = !tsec;
+  repo.placeholder = tsec
+    ? "Not used for TSECBench (platform API + VPN)"
+    : "~/.code_auditor/benchmarks/CTFTiny or an allowed root";
+}
+
+async function loadBenchmarkAdapters() {
+  const select = $("benchmark-start-adapter");
+  if (!select) return;
+  try {
+    const res = await fetch("/api/bench/adapters", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const current = select.value;
+    select.innerHTML = "";
+    for (const name of data.adapters || []) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      select.appendChild(option);
+    }
+    if ([...select.options].some((option) => option.value === current)) {
+      select.value = current;
+    }
+    updateBenchmarkRepoField();
+  } catch (error) {
+    $("benchmark-start-message").textContent = `Could not load adapters: ${error}`;
+  }
+}
+
+$("benchmark-start-adapter")?.addEventListener("change", updateBenchmarkRepoField);
+$("benchmark-start-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const benchmark = $("benchmark-start-adapter").value;
+  const repo = $("benchmark-start-repo").value.trim();
+  const maxTurns = Number($("benchmark-start-turns").value || 100);
+  const capture = $("benchmark-start-trajectory").checked;
+  const message = $("benchmark-start-message");
+  const button = $("btn-benchmark-start");
+  if (!benchmark) {
+    message.textContent = "Select a benchmark adapter.";
+    return;
+  }
+  if (benchmark !== "tsecbench" && !repo) {
+    message.textContent = "This adapter needs a dataset directory.";
+    return;
+  }
+  const payload = {
+    benchmark,
+    max_turns: maxTurns,
+    capture_trajectory: capture,
+  };
+  if (benchmark !== "tsecbench") payload.repo_dir = repo;
+  button.disabled = true;
+  message.textContent = `Starting ${benchmark}…`;
+  try {
+    const res = await fetch("/api/bench/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    message.textContent = `Run #${data.run_id} started.`;
+    location.hash = `#/benchmark/${encodeURIComponent(data.run_id)}`;
+  } catch (error) {
+    message.textContent = `Could not start: ${error}`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 async function loadBenchmarks() {
+  loadBenchmarkAdapters();
+  updateBenchmarkRepoField();
   const message = $("benchmarks-message");
   const tbody = document.querySelector("#benchmarks-table tbody");
   if (!tbody) return;
@@ -5169,6 +5251,11 @@ async function loadBenchmarkDetail(runId) {
       tbody.appendChild(row);
     }
     message.textContent = (run.results || []).length ? "" : "No instance results recorded yet.";
+    if (run.status === "running") {
+      benchmarkDetailTimer = setTimeout(() => {
+        if (location.hash === `#/benchmark/${run.id}`) loadBenchmarkDetail(run.id);
+      }, 2500);
+    }
   } catch (error) {
     message.textContent = `Could not load benchmark run: ${error}`;
   }
@@ -5202,6 +5289,8 @@ $("benchmarks-search")?.addEventListener("input", () => {
 
 // ── Hash routing ────────────────────────────────────────────────────────────
 function route() {
+  clearTimeout(benchmarkDetailTimer);
+  benchmarkDetailTimer = null;
   const hash = location.hash || "#/";
   const runMatch = hash.match(/^#\/run\/(\d+)$/);
   const benchmarkMatch = hash.match(/^#\/benchmark\/(\d+)$/);

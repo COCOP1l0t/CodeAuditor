@@ -178,9 +178,11 @@ class BenchRunner:
         agent_runner: AgentRunner | None = None,
         final_instruction: str = FINAL_INSTRUCTION,
         store: "AuditStore | None" = None,
+        db_run_id: int | None = None,
     ) -> None:
         self.adapter = adapter
         self.store = store
+        self.db_run_id = db_run_id
         self.config = config
         self.run_dir = Path(output_dir) if output_dir is not None else Path(config.output_dir) / "bench"
         self.max_turns = max(1, int(max_turns))
@@ -206,14 +208,16 @@ class BenchRunner:
         preflight = getattr(self.adapter, "preflight", None)
         if callable(preflight):
             try:
-                preflight()
+                await asyncio.to_thread(preflight)
             except Exception as exc:
                 raise BenchRunError(f"Benchmark preflight failed: {exc}") from exc
         try:
             selected = (
                 list(instances)
                 if instances is not None
-                else self._list_instances(include_completed=include_completed)
+                else await asyncio.to_thread(
+                    self._list_instances, include_completed=include_completed
+                )
             )
         except TypeError:
             selected = list(instances) if instances is not None else list(self.adapter.list_instances())
@@ -227,18 +231,21 @@ class BenchRunner:
         )
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if self.store is not None:
-            try:
-                run.db_run_id = self.store.create_bench_run(
-                    benchmark=run.benchmark,
-                    adapter=type(self.adapter).__name__,
-                    repo_dir=str(getattr(self.adapter, "repo_dir", "") or ""),
-                    output_dir=str(self.run_dir),
-                    backend=self.config.backend,
-                    model=self.config.model,
-                    started_at=run.started_at,
-                )
-            except Exception as exc:
-                raise BenchRunError(f"Could not record the benchmark run: {exc}") from exc
+            if self.db_run_id is not None:
+                run.db_run_id = self.db_run_id
+            else:
+                try:
+                    run.db_run_id = self.store.create_bench_run(
+                        benchmark=run.benchmark,
+                        adapter=type(self.adapter).__name__,
+                        repo_dir=str(getattr(self.adapter, "repo_dir", "") or ""),
+                        output_dir=str(self.run_dir),
+                        backend=self.config.backend,
+                        model=self.config.model,
+                        started_at=run.started_at,
+                    )
+                except Exception as exc:
+                    raise BenchRunError(f"Could not record the benchmark run: {exc}") from exc
 
         status = "failed"
         error = "benchmark run did not finish"
@@ -312,7 +319,7 @@ class BenchRunner:
             agent_log=str(log_path.relative_to(self.run_dir)),
         )
         try:
-            task = self.adapter.open_task(instance)
+            task = await asyncio.to_thread(self.adapter.open_task, instance)
             phase = "agent"
             cwd = self._workspace(instance_id, task)
             output = await self.agent_runner(
@@ -331,7 +338,8 @@ class BenchRunner:
                 result.error = "the agent reply did not contain an extractable flag"
                 return result
             phase = "grade"
-            outcome: Outcome = self.adapter.grade(
+            outcome: Outcome = await asyncio.to_thread(
+                self.adapter.grade,
                 instance,
                 Submission(instance_id=instance_id, kind="flag", value=submitted),
             )
@@ -350,7 +358,7 @@ class BenchRunner:
             self._scrub_artifacts(secrets)
             if task is not None:
                 try:
-                    self.adapter.close(instance)
+                    await asyncio.to_thread(self.adapter.close, instance)
                 except Exception as exc:
                     result.cleanup_error = f"{type(exc).__name__}: {exc}"[:1000]
                     logger.warning("Benchmark cleanup failed for %s: %s", instance_id, exc)

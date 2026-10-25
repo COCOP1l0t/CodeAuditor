@@ -25,6 +25,7 @@ from code_auditor.db import (
     RUN_DONE,
     RUN_FAILED,
     RUN_KIND_MAINTENANCE,
+    RUN_RUNNING,
     RUN_SUPERSEDED,
     AuditStore,
     compute_target_key,
@@ -4063,3 +4064,99 @@ def test_api_benchmark_runs_results_and_agent_log(tmp_path) -> None:
     assert 'data-route="benchmarks"' in html
     assert 'id="view-benchmarks"' in html
     assert 'id="view-benchmark-detail"' in html
+
+
+def test_api_start_benchmark_run_creates_output_and_records_db(
+    tmp_path, monkeypatch
+) -> None:
+    app = _make_app(tmp_path)
+    dataset = tmp_path / "benchmarks" / "dataset"
+    dataset.mkdir(parents=True)
+    started: dict = {}
+
+    class FakeAdapter:
+        repo_dir = str(dataset)
+
+    class FakeRunner:
+        def __init__(self, adapter, config, **options):
+            started["adapter"] = adapter
+            started["config"] = config
+            started["options"] = options
+            self.store = options["store"]
+            self.run_id = options["db_run_id"]
+
+        async def run(self):
+            self.store.finish_bench_run(
+                self.run_id,
+                status="done",
+                summary={"total": 0, "succeeded": 0, "failed": 0, "errors": 0, "score": 0},
+            )
+
+    monkeypatch.setattr(server_module, "registered_benchmarks", lambda: ["ctftiny"])
+    monkeypatch.setattr(
+        server_module, "create_benchmark_adapter", lambda name, **opts: FakeAdapter()
+    )
+    monkeypatch.setattr(server_module, "BenchRunner", FakeRunner)
+
+    import time as _time
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/bench/runs",
+            json={
+                "benchmark": "ctftiny",
+                "repo_dir": str(dataset),
+                "max_turns": 7,
+                "capture_trajectory": True,
+            },
+        )
+        assert response.status_code == 202
+        body = response.json()
+        run_id = body["run_id"]
+        assert body["benchmark"] == "ctftiny"
+        assert body["status"] == RUN_RUNNING
+        assert Path(body["output_dir"]).is_dir()
+        assert str(app.state.web_settings.results_dir) in body["output_dir"]
+
+        deadline = _time.time() + 5
+        detail = None
+        while _time.time() < deadline:
+            detail = client.get(f"/api/bench/runs/{run_id}").json()
+            if detail["status"] == RUN_DONE:
+                break
+            _time.sleep(0.02)
+        assert detail is not None
+        assert detail["status"] == RUN_DONE
+        assert detail["repo_dir"] == str(dataset.resolve())
+        assert detail["adapter"] == "FakeAdapter"
+
+        assert started["options"]["max_turns"] == 7
+        assert started["options"]["capture_trajectory"] is True
+        assert started["config"].trajectory_enabled is True
+        assert started["config"].sandbox_enabled is False
+        assert started["adapter"].repo_dir == str(dataset)
+
+    # Missing dataset and unknown adapter are rejected before any task starts.
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/api/bench/runs", json={"benchmark": "ctftiny"}
+            ).status_code
+            == 400
+        )
+        assert (
+            client.post(
+                "/api/bench/runs",
+                json={"benchmark": "nope", "repo_dir": str(dataset)},
+            ).status_code
+            == 400
+        )
+        outside = tmp_path / "outside-dataset"
+        outside.mkdir()
+        assert (
+            client.post(
+                "/api/bench/runs",
+                json={"benchmark": "ctftiny", "repo_dir": str(outside)},
+            ).status_code
+            == 400
+        )

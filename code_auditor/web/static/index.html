@@ -659,6 +659,37 @@
 
     <div id="view-benchmarks" hidden>
       <section class="panel">
+        <h2>Start Benchmark Run</h2>
+        <form id="benchmark-start-form" class="form-grid">
+          <label>
+            Benchmark
+            <select id="benchmark-start-adapter" required></select>
+          </label>
+          <label class="settings-wide-field">
+            Dataset directory
+            <input id="benchmark-start-repo" type="text" maxlength="4096"
+                   autocomplete="off" placeholder="/data/CTFTiny" />
+            <span class="hint">CTFTiny/CyBench need a checkout under state-dir <code>benchmarks/</code>, the managed repos directory, or <code>CODE_AUDITOR_BENCH_ROOTS</code>; TSECBench ignores this field.</span>
+          </label>
+          <label>
+            Max turns
+            <input id="benchmark-start-turns" type="number" min="1" max="500" value="100" required />
+          </label>
+          <label class="settings-checkbox">
+            <input id="benchmark-start-trajectory" type="checkbox" />
+            Capture ATIF trajectory
+          </label>
+          <div class="button-row">
+            <button type="submit" id="btn-benchmark-start" class="btn btn-start">Start run</button>
+            <span id="benchmark-start-message" class="dim" role="status"></span>
+          </div>
+        </form>
+        <p class="hint">
+          TSECBench reads <code>BENCHMARK_BASE_URL</code> / <code>BENCHMARK_TOKEN</code> from the
+          server environment and requires the VPN to be up.
+        </p>
+      </section>
+      <section class="panel">
         <h2>Benchmark Runs</h2>
         <p id="benchmarks-message" class="registry-message dim" role="status"></p>
         <div class="registry-toolbar">

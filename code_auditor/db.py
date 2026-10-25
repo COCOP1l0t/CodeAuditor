@@ -22,7 +22,7 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 from .config import AuditConfig
@@ -236,6 +236,48 @@ CREATE INDEX IF NOT EXISTS idx_reproduction_disclosure
     ON reproduction_runs(project, dedupe_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reproduction_state
     ON reproduction_runs(state, started_at DESC);
+CREATE TABLE IF NOT EXISTS bench_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    benchmark TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    repo_dir TEXT NOT NULL DEFAULT '',
+    output_dir TEXT NOT NULL,
+    backend TEXT,
+    model TEXT,
+    status TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    started_at REAL,
+    ended_at REAL,
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    total_instances INTEGER NOT NULL DEFAULT 0,
+    succeeded INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0,
+    score REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_runs_started
+    ON bench_runs(started_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS bench_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES bench_runs(id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL,
+    benchmark TEXT NOT NULL,
+    status TEXT NOT NULL,
+    success INTEGER,
+    score REAL NOT NULL DEFAULT 0,
+    extracted INTEGER NOT NULL DEFAULT 0,
+    submitted_length INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    cleanup_error TEXT NOT NULL DEFAULT '',
+    agent_log TEXT NOT NULL DEFAULT '',
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    UNIQUE(run_id, instance_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bench_results_run
+    ON bench_results(run_id, id);
 CREATE TABLE IF NOT EXISTS cves (
     cve_id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
@@ -3146,6 +3188,270 @@ class AuditStore:
             )
 
     # ── Reads ────────────────────────────────────────────────────────────
+
+    # ── Benchmark runs ────────────────────────────────────────────────────
+
+    def create_bench_run(
+        self,
+        *,
+        benchmark: str,
+        adapter: str,
+        output_dir: str,
+        repo_dir: str = "",
+        backend: str | None = None,
+        model: str | None = None,
+        started_at: float | None = None,
+        status: str = RUN_RUNNING,
+    ) -> int:
+        """Create a benchmark run row; results are appended per instance."""
+        if not benchmark.strip() or not adapter.strip():
+            raise ValueError("benchmark and adapter are required")
+        if not output_dir:
+            raise ValueError("output_dir is required")
+        if status not in RUN_STATUSES:
+            raise ValueError(f"Unsupported bench status: {status}")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO bench_runs (
+                    benchmark, adapter, repo_dir, output_dir, backend, model,
+                    status, started_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    benchmark.strip(),
+                    adapter.strip(),
+                    repo_dir,
+                    output_dir,
+                    backend,
+                    model,
+                    status,
+                    time.time() if started_at is None else float(started_at),
+                    time.time(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def record_bench_result(self, run_id: int, result: Mapping[str, Any]) -> None:
+        """Insert or replace one instance result (idempotent per instance)."""
+        instance_id = str(result.get("instance_id") or "").strip()
+        status = str(result.get("status") or "").strip()
+        if not instance_id or not status:
+            raise ValueError("instance_id and status are required")
+        detail = result.get("detail") or {}
+        if not isinstance(detail, Mapping):
+            detail = {}
+        success = result.get("success")
+        success_value = None if success is None else int(bool(success))
+        with self._connect() as conn:
+            run = conn.execute(
+                "SELECT benchmark FROM bench_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown benchmark run: {run_id}")
+            benchmark = str(result.get("benchmark") or run["benchmark"])
+            conn.execute(
+                """
+                INSERT INTO bench_results (
+                    run_id, instance_id, benchmark, status, success, score,
+                    extracted, submitted_length, detail, error, cleanup_error,
+                    agent_log, duration_seconds, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, instance_id) DO UPDATE SET
+                    benchmark = excluded.benchmark,
+                    status = excluded.status,
+                    success = excluded.success,
+                    score = excluded.score,
+                    extracted = excluded.extracted,
+                    submitted_length = excluded.submitted_length,
+                    detail = excluded.detail,
+                    error = excluded.error,
+                    cleanup_error = excluded.cleanup_error,
+                    agent_log = excluded.agent_log,
+                    duration_seconds = excluded.duration_seconds
+                """,
+                (
+                    run_id,
+                    instance_id,
+                    benchmark,
+                    status,
+                    success_value,
+                    float(result.get("score") or 0.0),
+                    int(bool(result.get("extracted", False))),
+                    int(result.get("submitted_length") or 0),
+                    json.dumps(dict(detail), ensure_ascii=False),
+                    str(result.get("error") or "")[:4096],
+                    str(result.get("cleanup_error") or "")[:4096],
+                    str(result.get("agent_log") or "")[:4096],
+                    float(result.get("duration_seconds") or 0.0),
+                    time.time(),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE bench_runs SET
+                    total_instances = (SELECT COUNT(*) FROM bench_results WHERE run_id = ?),
+                    succeeded = (SELECT COUNT(*) FROM bench_results WHERE run_id = ? AND status = 'succeeded'),
+                    failed = (SELECT COUNT(*) FROM bench_results WHERE run_id = ? AND status = 'failed'),
+                    errors = (SELECT COUNT(*) FROM bench_results WHERE run_id = ? AND status NOT IN ('succeeded', 'failed')),
+                    score = (SELECT COALESCE(SUM(score), 0) FROM bench_results WHERE run_id = ?)
+                WHERE id = ?
+                """,
+                (run_id, run_id, run_id, run_id, run_id, run_id),
+            )
+
+    def finish_bench_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        error: str = "",
+        ended_at: float | None = None,
+        summary: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Finalize a benchmark run and persist aggregate counts."""
+        if status not in RUN_STATUSES:
+            raise ValueError(f"Unsupported bench status: {status}")
+        finished_at = time.time() if ended_at is None else float(ended_at)
+        with self._connect() as conn:
+            run = conn.execute(
+                "SELECT started_at FROM bench_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown benchmark run: {run_id}")
+            if summary is None:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total,
+                           COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded,
+                           COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+                           COALESCE(SUM(CASE WHEN status NOT IN ('succeeded', 'failed') THEN 1 ELSE 0 END), 0) AS errors,
+                           COALESCE(SUM(score), 0) AS score
+                    FROM bench_results WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                counts = {
+                    "total": int(row["total"]),
+                    "succeeded": int(row["succeeded"]),
+                    "failed": int(row["failed"]),
+                    "errors": int(row["errors"]),
+                    "score": float(row["score"]),
+                }
+            else:
+                counts = {
+                    "total": int(summary.get("total") or 0),
+                    "succeeded": int(summary.get("succeeded") or 0),
+                    "failed": int(summary.get("failed") or 0),
+                    "errors": int(summary.get("errors") or 0),
+                    "score": float(summary.get("score") or 0.0),
+                }
+            duration = max(
+                0.0,
+                finished_at - float(run["started_at"] or finished_at),
+            )
+            conn.execute(
+                """
+                UPDATE bench_runs
+                SET status = ?, error = ?, ended_at = ?, duration_seconds = ?,
+                    total_instances = ?, succeeded = ?, failed = ?,
+                    errors = ?, score = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    str(error or "")[:4096],
+                    finished_at,
+                    duration,
+                    counts["total"],
+                    counts["succeeded"],
+                    counts["failed"],
+                    counts["errors"],
+                    counts["score"],
+                    run_id,
+                ),
+            )
+
+    def list_bench_runs(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        benchmark: str | None = None,
+        status: str | None = None,
+        query: str | None = None,
+    ) -> tuple[list[dict], int]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if benchmark:
+            clauses.append("benchmark = ?")
+            args.append(benchmark)
+        if status:
+            if status not in RUN_STATUSES:
+                raise ValueError(f"Unsupported bench status: {status}")
+            clauses.append("status = ?")
+            args.append(status)
+        if query and (needle := query.strip().lower()):
+            fields = ("CAST(id AS TEXT)", "benchmark", "adapter", "repo_dir", "output_dir", "model")
+            clauses.append(
+                "(" + " OR ".join(f"instr(lower(COALESCE({field}, '')), ?) > 0" for field in fields) + ")"
+            )
+            args.extend([needle] * len(fields))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        with self._connect() as conn:
+            total = int(
+                conn.execute(f"SELECT COUNT(*) FROM bench_runs {where}", args).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT * FROM bench_runs {where}
+                ORDER BY COALESCE(started_at, created_at) DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*args, limit, offset),
+            ).fetchall()
+        return [self._public_bench_run(dict(row)) for row in rows], total
+
+    def get_bench_run(self, run_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM bench_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            run = self._public_bench_run(dict(row))
+            results = conn.execute(
+                "SELECT * FROM bench_results WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
+        normalized = []
+        for item in results:
+            result = dict(item)
+            result["success"] = (
+                None if result.get("success") is None else bool(result["success"])
+            )
+            result["extracted"] = bool(result.get("extracted"))
+            try:
+                result["detail"] = json.loads(result.get("detail") or "{}")
+            except (TypeError, ValueError):
+                result["detail"] = {}
+            normalized.append(result)
+        run["results"] = normalized
+        return run
+
+    @staticmethod
+    def _public_bench_run(run: dict[str, Any]) -> dict[str, Any]:
+        for key in ("total_instances", "succeeded", "failed", "errors"):
+            run[key] = int(run.get(key) or 0)
+        run["score"] = float(run.get("score") or 0.0)
+        run["duration_seconds"] = float(run.get("duration_seconds") or 0.0)
+        run["success_rate"] = (
+            round(run["succeeded"] / run["total_instances"], 4)
+            if run["total_instances"]
+            else 0.0
+        )
+        return run
 
     def list_runs(
         self,

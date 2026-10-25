@@ -5043,14 +5043,174 @@ $("btn-terminal-dock-close").addEventListener("click", () => {
 });
 setupTerminalSplitter();
 
+// ── Benchmarks ─────────────────────────────────────────────────────────────
+
+function benchStatusBadge(status) {
+  const safe = String(status || "unknown").replace(/[^a-z_-]/g, "");
+  const span = document.createElement("span");
+  span.className = `badge badge-${safe}`;
+  span.textContent = status || "unknown";
+  return span;
+}
+
+function benchCell(row, text) {
+  const cell = document.createElement("td");
+  cell.textContent = text === null || text === undefined || text === "" ? "—" : String(text);
+  row.appendChild(cell);
+  return cell;
+}
+
+async function loadBenchmarks() {
+  const message = $("benchmarks-message");
+  const tbody = document.querySelector("#benchmarks-table tbody");
+  if (!tbody) return;
+  message.textContent = "Loading benchmark runs…";
+  tbody.innerHTML = "";
+  const params = new URLSearchParams();
+  const query = $("benchmarks-search").value.trim();
+  const status = $("benchmarks-status").value;
+  if (query) params.set("q", query);
+  if (status) params.set("status", status);
+  try {
+    const res = await fetch(`/api/bench/runs?${params.toString()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    for (const run of data.runs || []) {
+      const row = document.createElement("tr");
+      benchCell(row, run.id);
+      benchCell(row, run.benchmark);
+      const statusCell = document.createElement("td");
+      statusCell.appendChild(benchStatusBadge(run.status));
+      row.appendChild(statusCell);
+      benchCell(row, run.total_instances);
+      benchCell(row, run.succeeded);
+      benchCell(row, run.failed);
+      benchCell(row, run.errors);
+      benchCell(row, Number(run.score || 0));
+      benchCell(row, run.model);
+      benchCell(row, fmtTime(run.started_at));
+      const action = document.createElement("td");
+      const link = document.createElement("a");
+      link.href = `#/benchmark/${encodeURIComponent(run.id)}`;
+      link.textContent = "Open";
+      action.appendChild(link);
+      row.appendChild(action);
+      tbody.appendChild(row);
+    }
+    $("benchmarks-count").textContent = `${data.total || 0} run(s)`;
+    message.textContent = (data.runs || []).length ? "" : "No benchmark runs recorded yet.";
+  } catch (error) {
+    message.textContent = `Could not load benchmark runs: ${error}`;
+  }
+}
+
+async function loadBenchmarkDetail(runId) {
+  const message = $("benchmark-detail-message");
+  const meta = $("benchmark-detail-meta");
+  const tbody = document.querySelector("#benchmark-results-table tbody");
+  message.textContent = "Loading benchmark run…";
+  meta.innerHTML = "";
+  tbody.innerHTML = "";
+  $("benchmark-log-panel").hidden = true;
+  try {
+    const res = await fetch(`/api/bench/runs/${encodeURIComponent(runId)}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const run = await res.json();
+    $("benchmark-detail-title").textContent = `Benchmark Run #${run.id} · ${run.benchmark}`;
+    const values = [
+      ["Benchmark", run.benchmark],
+      ["Adapter", run.adapter],
+      ["Status", run.status],
+      ["Backend", run.backend],
+      ["Model", run.model],
+      ["Started", fmtTime(run.started_at)],
+      ["Duration", fmtDurationSeconds(run.duration_seconds)],
+      ["Instances", run.total_instances],
+      ["Succeeded", run.succeeded],
+      ["Failed", run.failed],
+      ["Errors", run.errors],
+      ["Score", Number(run.score || 0)],
+      ["Success rate", `${Math.round(Number(run.success_rate || 0) * 100)}%`],
+      ["Repository", run.repo_dir],
+      ["Output", run.output_dir],
+      ["Error", run.error],
+    ];
+    meta.innerHTML = values
+      .map(([label, value]) =>
+        `<div class="meta-key">${escapeHtml(label)}</div>` +
+        `<div>${escapeHtml(value === null || value === undefined || value === "" ? "—" : String(value))}</div>`
+      )
+      .join("");
+    for (const item of run.results || []) {
+      const row = document.createElement("tr");
+      benchCell(row, item.instance_id);
+      const statusCell = document.createElement("td");
+      statusCell.appendChild(benchStatusBadge(item.status));
+      row.appendChild(statusCell);
+      benchCell(row, item.success === true ? "yes" : item.success === false ? "no" : "—");
+      benchCell(row, Number(item.score || 0));
+      benchCell(row, item.extracted ? "yes" : "no");
+      benchCell(row, fmtDurationSeconds(item.duration_seconds));
+      benchCell(row, item.error || item.cleanup_error);
+      const action = document.createElement("td");
+      if (item.agent_log) {
+        const link = document.createElement("a");
+        link.href = "#";
+        link.textContent = "View log";
+        link.addEventListener("click", (event) => {
+          event.preventDefault();
+          viewBenchmarkLog(run.id, item.agent_log);
+        });
+        action.appendChild(link);
+      } else {
+        action.textContent = "—";
+      }
+      row.appendChild(action);
+      tbody.appendChild(row);
+    }
+    message.textContent = (run.results || []).length ? "" : "No instance results recorded yet.";
+  } catch (error) {
+    message.textContent = `Could not load benchmark run: ${error}`;
+  }
+}
+
+async function viewBenchmarkLog(runId, path) {
+  const panel = $("benchmark-log-panel");
+  const content = $("benchmark-log-content");
+  $("benchmark-log-title").textContent = `Agent log · ${path}`;
+  content.textContent = "Loading…";
+  panel.hidden = false;
+  try {
+    const res = await fetch(
+      `/api/bench/runs/${encodeURIComponent(runId)}/file?path=${encodeURIComponent(path)}`,
+      { cache: "no-store" }
+    );
+    content.textContent = res.ok ? await res.text() : `Error: HTTP ${res.status}`;
+  } catch (error) {
+    content.textContent = `Error: ${error}`;
+  }
+  panel.scrollIntoView({ behavior: "smooth" });
+}
+
+$("btn-benchmarks-refresh")?.addEventListener("click", loadBenchmarks);
+$("benchmarks-status")?.addEventListener("change", loadBenchmarks);
+let benchmarkSearchTimer = null;
+$("benchmarks-search")?.addEventListener("input", () => {
+  clearTimeout(benchmarkSearchTimer);
+  benchmarkSearchTimer = setTimeout(loadBenchmarks, 250);
+});
+
 // ── Hash routing ────────────────────────────────────────────────────────────
 function route() {
   const hash = location.hash || "#/";
   const runMatch = hash.match(/^#\/run\/(\d+)$/);
+  const benchmarkMatch = hash.match(/^#\/benchmark\/(\d+)$/);
   const targetMatch = hash.match(/^#\/target\/(.+)$/);
   const views = {
     dashboard: $("view-dashboard"),
     history: $("view-history"),
+    benchmarks: $("view-benchmarks"),
+    benchmarkDetail: $("view-benchmark-detail"),
     reproduction: $("view-reproduction"),
     detail: $("view-run-detail"),
     disclosures: $("view-disclosures"),
@@ -5069,6 +5229,15 @@ function route() {
     stopAuditProcessTree();
     liveDetailRunId = null;
     detailRunId = null;
+  }
+
+  if (benchmarkMatch) {
+    views.benchmarkDetail.hidden = false;
+    tabs.forEach((t) => {
+      if (t.dataset.route === "benchmarks") t.classList.add("tab-active");
+    });
+    loadBenchmarkDetail(benchmarkMatch[1]);
+    return;
   }
 
   if (runMatch) {
@@ -5117,6 +5286,12 @@ function route() {
       if (t.dataset.route === "cves") t.classList.add("tab-active");
     });
     loadCves();
+  } else if (hash.startsWith("#/benchmarks")) {
+    views.benchmarks.hidden = false;
+    tabs.forEach((t) => {
+      if (t.dataset.route === "benchmarks") t.classList.add("tab-active");
+    });
+    loadBenchmarks();
   } else if (hash.startsWith("#/history")) {
     views.history.hidden = false;
     tabs.forEach((t) => {

@@ -17,6 +17,7 @@ from code_auditor.bench import (
 )
 from code_auditor.bench.base import BenchTask
 from code_auditor.config import AuditConfig
+from code_auditor.db import AuditStore
 
 EXPECTED = "flag{runner_expected}"
 
@@ -303,3 +304,33 @@ def asyncio_run(coroutine):
     import asyncio
 
     return asyncio.run(coroutine)
+
+
+def test_runner_persists_to_the_store(tmp_path: Path) -> None:
+    store = AuditStore(str(tmp_path / "history.db"))
+    adapter = FakeAdapter(tmp_path)
+    agent = FakeAgent(["ANSWER: flag{runner_expected}", "ANSWER: flag{runner_wrong}"])
+    runner = BenchRunner(
+        adapter,
+        _config(tmp_path),
+        output_dir=tmp_path / "run",
+        agent_runner=agent,
+        store=store,
+    )
+
+    run = asyncio_run(runner.run())
+
+    assert run.db_run_id is not None
+    runs, total = store.list_bench_runs()
+    assert total == 1
+    assert runs[0]["id"] == run.db_run_id
+    assert runs[0]["status"] == "done"
+    assert runs[0]["total_instances"] == 2
+    assert runs[0]["succeeded"] == 1
+    assert runs[0]["failed"] == 1
+    detail = store.get_bench_run(run.db_run_id)
+    assert detail is not None
+    assert [item["instance_id"] for item in detail["results"]] == ["one", "two"]
+    persisted = json.dumps(detail)
+    assert "flag{runner_expected}" not in persisted
+    assert "flag{runner_wrong}" not in persisted

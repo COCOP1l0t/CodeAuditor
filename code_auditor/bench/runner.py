@@ -19,18 +19,22 @@ support and is intentionally left to the caller.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from .base import BenchAdapter, BenchTask, InstanceSpec, Outcome, Submission
 from .ctf import safe_component
 from ..agent import run_agent
 from ..config import AuditConfig
 from ..logger import get_logger
+
+if TYPE_CHECKING:
+    from ..db import AuditStore
 
 logger = get_logger("bench.runner")
 
@@ -125,6 +129,7 @@ class BenchRun:
     output_dir: str
     started_at: float
     finished_at: float | None = None
+    db_run_id: int | None = None
     results: list[BenchResult] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
@@ -133,6 +138,7 @@ class BenchRun:
         errors = len(self.results) - succeeded - failed
         return {
             "benchmark": self.benchmark,
+            "db_run_id": self.db_run_id,
             "total": len(self.results),
             "succeeded": succeeded,
             "failed": failed,
@@ -171,8 +177,10 @@ class BenchRunner:
         capture_trajectory: bool = False,
         agent_runner: AgentRunner | None = None,
         final_instruction: str = FINAL_INSTRUCTION,
+        store: "AuditStore | None" = None,
     ) -> None:
         self.adapter = adapter
+        self.store = store
         self.config = config
         self.run_dir = Path(output_dir) if output_dir is not None else Path(config.output_dir) / "bench"
         self.max_turns = max(1, int(max_turns))
@@ -218,13 +226,65 @@ class BenchRunner:
             started_at=time.time(),
         )
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        for instance in selected:
-            result = await self._run_instance(instance)
-            run.results.append(result)
+        if self.store is not None:
+            try:
+                run.db_run_id = self.store.create_bench_run(
+                    benchmark=run.benchmark,
+                    adapter=type(self.adapter).__name__,
+                    repo_dir=str(getattr(self.adapter, "repo_dir", "") or ""),
+                    output_dir=str(self.run_dir),
+                    backend=self.config.backend,
+                    model=self.config.model,
+                    started_at=run.started_at,
+                )
+            except Exception as exc:
+                raise BenchRunError(f"Could not record the benchmark run: {exc}") from exc
+
+        status = "failed"
+        error = "benchmark run did not finish"
+        try:
+            for instance in selected:
+                result = await self._run_instance(instance)
+                run.results.append(result)
+                self._persist_result(run, result)
+                run.write()
+            status = "done"
+            error = ""
+        except asyncio.CancelledError:
+            status = "cancelled"
+            error = "cancelled"
+            raise
+        except Exception as exc:
+            status = "failed"
+            error = f"{type(exc).__name__}: {exc}"[:2000]
+            raise
+        finally:
+            run.finished_at = time.time()
+            self._persist_finish(run, status, error)
             run.write()
-        run.finished_at = time.time()
-        run.write()
         return run
+
+    def _persist_result(self, run: BenchRun, result: BenchResult) -> None:
+        if self.store is None or run.db_run_id is None:
+            return
+        try:
+            self.store.record_bench_result(run.db_run_id, result.public())
+        except Exception as exc:
+            logger.warning("Could not persist benchmark result %s: %s", result.instance_id, exc)
+
+    def _persist_finish(self, run: BenchRun, status: str, error: str) -> None:
+        if self.store is None or run.db_run_id is None:
+            return
+        try:
+            self.store.finish_bench_run(
+                run.db_run_id,
+                status=status,
+                error=error,
+                ended_at=run.finished_at,
+                summary=run.summary(),
+            )
+        except Exception as exc:
+            logger.warning("Could not finalize benchmark run %s: %s", run.db_run_id, exc)
 
     def _list_instances(self, *, include_completed: bool) -> list[InstanceSpec]:
         try:

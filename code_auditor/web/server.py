@@ -934,6 +934,7 @@ def create_app(
                 request.url.path.startswith("/api/")
                 and request.url.path.endswith("/sandbox-executions")
             )
+            or request.url.path.startswith("/api/bench/")
         ):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -1987,6 +1988,52 @@ def create_app(
         return _output_file_response(
             _get_history_run(run_id)["output_dir"], path, download
         )
+
+    # ── Benchmark runs ───────────────────────────────────────────────────
+
+    @app.get("/api/bench/adapters")
+    def list_benchmark_adapters() -> dict:
+        from ..bench import registered
+
+        return {"adapters": registered()}
+
+    @app.get("/api/bench/runs")
+    def list_benchmark_runs(
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        status: str | None = Query(default=None, max_length=32),
+        benchmark: str | None = Query(default=None, max_length=64),
+        q: str | None = Query(default=None, max_length=256),
+    ) -> dict:
+        try:
+            runs, total = store.list_bench_runs(
+                limit=limit,
+                offset=offset,
+                status=status or None,
+                benchmark=benchmark or None,
+                query=q or None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"runs": runs, "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/api/bench/runs/{run_id}")
+    def get_benchmark_run(run_id: int) -> dict:
+        run = store.get_bench_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Benchmark run not found.")
+        return run
+
+    @app.get("/api/bench/runs/{run_id}/file")
+    def benchmark_run_file(
+        run_id: int,
+        path: str = Query(min_length=1, max_length=4096),
+        download: bool = Query(default=False),
+    ):
+        run = store.get_bench_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Benchmark run not found.")
+        return _output_file_response(run["output_dir"], path, download)
 
     @app.post("/api/history/import", status_code=201)
     def import_history(request: ImportRequest) -> dict:

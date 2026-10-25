@@ -3989,3 +3989,77 @@ def test_api_history_trajectory_marks_invalid_child_documents(tmp_path) -> None:
         "stage5-pocs/H-1/agent.invalid.json"
     ]
     assert body["children"][0]["valid"] is False
+
+
+def test_api_benchmark_runs_results_and_agent_log(tmp_path) -> None:
+    app = _make_app(tmp_path)
+    store = app.state.store
+    output_dir = tmp_path / "bench-run"
+    (output_dir / "pwn-baby").mkdir(parents=True)
+    (output_dir / "pwn-baby" / "agent.log").write_text(
+        "solving\n[REDACTED]\n", encoding="utf-8"
+    )
+    run_id = store.create_bench_run(
+        benchmark="ctftiny",
+        adapter="CTFTinyAdapter",
+        repo_dir="/data/CTFTiny",
+        output_dir=str(output_dir),
+        backend="claude",
+        model="claude-test",
+        started_at=100.0,
+    )
+    store.record_bench_result(
+        run_id,
+        {
+            "instance_id": "pwn-baby",
+            "benchmark": "ctftiny",
+            "status": "succeeded",
+            "success": True,
+            "score": 50.0,
+            "extracted": True,
+            "submitted_length": 12,
+            "detail": {"category": "pwn"},
+            "agent_log": "pwn-baby/agent.log",
+            "duration_seconds": 3.0,
+        },
+    )
+    store.finish_bench_run(run_id, status=RUN_DONE, ended_at=110.0)
+    client = TestClient(app)
+
+    listing = client.get("/api/bench/runs")
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["total"] == 1
+    assert body["runs"][0]["id"] == run_id
+    assert body["runs"][0]["succeeded"] == 1
+    assert body["runs"][0]["status"] == RUN_DONE
+
+    detail = client.get(f"/api/bench/runs/{run_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["benchmark"] == "ctftiny"
+    assert payload["results"][0]["instance_id"] == "pwn-baby"
+    assert payload["results"][0]["success"] is True
+    assert payload["results"][0]["detail"] == {"category": "pwn"}
+
+    log = client.get(
+        f"/api/bench/runs/{run_id}/file", params={"path": "pwn-baby/agent.log"}
+    )
+    assert log.status_code == 200
+    assert "[REDACTED]" in log.text
+    assert (
+        client.get(
+            f"/api/bench/runs/{run_id}/file", params={"path": "../escape"}
+        ).status_code
+        == 400
+    )
+    assert client.get("/api/bench/runs/9999").status_code == 404
+    assert client.get("/api/bench/runs?status=nope").status_code == 400
+
+    adapters = client.get("/api/bench/adapters").json()["adapters"]
+    assert {"tsecbench", "ctftiny", "cybench"} <= set(adapters)
+
+    html = client.get("/").text
+    assert 'data-route="benchmarks"' in html
+    assert 'id="view-benchmarks"' in html
+    assert 'id="view-benchmark-detail"' in html

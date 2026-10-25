@@ -31,6 +31,42 @@ print(run.summary())
 TSECBench 同理；远程任务没有本地 workdir，runner 会在
 `<output>/workspaces/<instance>/` 创建 agent 工作目录。
 
+## DB 持久化
+
+传 `store=AuditStore(...)` 时，runner 会自动写两张表：
+
+- `bench_runs`：id、benchmark/adapter、repo_dir、output_dir、backend/model、status、
+  started/ended/duration、total/succeeded/failed/errors/score。
+- `bench_results`：`(run_id, instance_id)` 唯一，status/success/score/extracted/
+  submitted_length/detail/error/cleanup_error/agent_log/duration。
+
+每个实例完成后 upsert 一条结果并刷新计数；整轮结束（done/failed/cancelled）写最终
+`bench_runs` 状态与汇总。结果同样**不包含提交值或 ground truth**。
+
+```python
+from code_auditor.db import AuditStore
+
+store = AuditStore("~/.code_auditor/audits.db")
+run = asyncio.run(
+    BenchRunner(adapter, config, output_dir=..., store=store).run()
+)
+# run.db_run_id 即 bench_runs.id
+```
+
+## Web
+
+只读页面与 API 已接入：
+
+- `#/benchmarks`：运行列表（搜索/状态过滤、刷新）。
+- `#/benchmark/{id}`：汇总、逐实例结果、Agent log 查看。
+- `GET /api/bench/adapters`：注册的适配器名。
+- `GET /api/bench/runs`：`limit/offset/status/benchmark/q`。
+- `GET /api/bench/runs/{id}`：汇总 + results。
+- `GET /api/bench/runs/{id}/file?path=...`：仅允许 `output_dir` 内的文件（Agent log）。
+
+**当前 Web 不能发起新 benchmark run**；run 仍由 Python `BenchRunner` 创建（写入 DB 后即可
+在页面看到）。发起表单/后台 job 是后续工作。
+
 ## 输出
 
 ```
@@ -82,8 +118,8 @@ When finished, end your reply with exactly: ANSWER: <the exact flag>
 - 若 agent 没给出可提取 flag，日志里可能仍有目标真实 flag，无法精确擦除；基准场景
   应在运行后检查/删除日志，或关闭日志持久化。
 - 服务生命周期、VPN、Docker 网络由 adapter 负责；runner 只调用 `preflight()`。
-- **未接**：SQLite 结果表、Web UI、并发调度、失败重试。`on_result` 钩子留给后续 DB。
-- 结果只落文件；调用方可用 `run.results` 自行入库。
+- **未接**：Web 发起 run、并发调度、失败重试、断点续跑。
+- 结果同时落文件和（可选）SQLite；调用方可用 `run.results` 自行处理。
 
 ## 测试
 

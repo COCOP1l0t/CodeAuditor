@@ -101,6 +101,10 @@
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         <span>History</span>
       </a>
+      <a href="#/benchmarks" class="tab" data-route="benchmarks" aria-label="Benchmarks" title="Benchmarks">
+        <svg viewBox="0 0 24 24"><path d="M5 21V4"/><path d="M5 4h11l-2 4 2 4H5"/><path d="M9 21h4"/></svg>
+        <span>Benchmarks</span>
+      </a>
       <a href="#/disclosures" class="tab" data-route="disclosures" aria-label="Disclosures" title="Disclosures">
         <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         <span>Disclosures</span>
@@ -652,6 +656,75 @@
         </div>
       </section>
     </div><!-- /view-reproduction -->
+
+    <div id="view-benchmarks" hidden>
+      <section class="panel">
+        <h2>Benchmark Runs</h2>
+        <p id="benchmarks-message" class="registry-message dim" role="status"></p>
+        <div class="registry-toolbar">
+          <label class="toolbar-search">
+            <span>Search</span>
+            <input id="benchmarks-search" type="search" maxlength="256"
+                   autocomplete="off" placeholder="Run, benchmark, adapter, path…">
+          </label>
+          <label class="toolbar-filter">
+            <span>Status</span>
+            <select id="benchmarks-status">
+              <option value="">All statuses</option>
+              <option value="running">Running</option>
+              <option value="done">Complete</option>
+              <option value="failed">Failed</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </label>
+          <button type="button" id="btn-benchmarks-refresh" class="btn">Refresh</button>
+          <span id="benchmarks-count" class="record-count" aria-live="polite"></span>
+        </div>
+        <div class="table-shell" tabindex="0" aria-label="Benchmark runs">
+          <table id="benchmarks-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>Benchmark</th><th>Status</th><th>Instances</th>
+                <th>Succeeded</th><th>Failed</th><th>Errors</th><th>Score</th>
+                <th>Model</th><th>Started</th><th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div><!-- /view-benchmarks -->
+
+    <div id="view-benchmark-detail" hidden>
+      <section class="panel">
+        <div class="history-run-header">
+          <div>
+            <a href="#/benchmarks" class="back-link">← Back to benchmarks</a>
+            <h2 id="benchmark-detail-title">Benchmark Run</h2>
+          </div>
+        </div>
+        <p id="benchmark-detail-message" class="registry-message dim" role="status"></p>
+        <div id="benchmark-detail-meta" class="meta-grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Results</h2>
+        <div class="table-shell" tabindex="0" aria-label="Benchmark results">
+          <table id="benchmark-results-table">
+            <thead>
+              <tr>
+                <th>Instance</th><th>Status</th><th>Success</th><th>Score</th>
+                <th>Extracted</th><th>Duration</th><th>Error</th><th>Log</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel" id="benchmark-log-panel" hidden>
+        <h2 id="benchmark-log-title">Agent log</h2>
+        <pre id="benchmark-log-content"></pre>
+      </section>
+    </div><!-- /view-benchmark-detail -->
 
     <div id="view-history" hidden>
       <section class="panel">

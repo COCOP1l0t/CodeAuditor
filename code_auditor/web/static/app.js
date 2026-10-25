@@ -5140,6 +5140,16 @@ $("benchmark-start-form")?.addEventListener("submit", async (event) => {
   }
 });
 
+async function cancelBenchmarkRun(runId) {
+  const res = await fetch(
+    `/api/bench/runs/${encodeURIComponent(runId)}/cancel`,
+    { method: "POST" }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
 async function loadBenchmarks() {
   loadBenchmarkAdapters();
   updateBenchmarkRepoField();
@@ -5176,6 +5186,25 @@ async function loadBenchmarks() {
       link.href = `#/benchmark/${encodeURIComponent(run.id)}`;
       link.textContent = "Open";
       action.appendChild(link);
+      if (run.status === "running") {
+        const stop = document.createElement("button");
+        stop.type = "button";
+        stop.className = "btn btn-compact btn-stop";
+        stop.textContent = "Stop";
+        stop.addEventListener("click", async (event) => {
+          event.preventDefault();
+          stop.disabled = true;
+          try {
+            await cancelBenchmarkRun(run.id);
+            $("benchmarks-message").textContent = `Stopping run #${run.id}…`;
+            setTimeout(loadBenchmarks, 1200);
+          } catch (error) {
+            $("benchmarks-message").textContent = `Could not stop run #${run.id}: ${error}`;
+            stop.disabled = false;
+          }
+        });
+        action.appendChild(stop);
+      }
       row.appendChild(action);
       tbody.appendChild(row);
     }
@@ -5251,6 +5280,20 @@ async function loadBenchmarkDetail(runId) {
       tbody.appendChild(row);
     }
     message.textContent = (run.results || []).length ? "" : "No instance results recorded yet.";
+    const stop = $("btn-benchmark-stop");
+    stop.hidden = run.status !== "running";
+    stop.disabled = false;
+    stop.onclick = async () => {
+      stop.disabled = true;
+      try {
+        await cancelBenchmarkRun(run.id);
+        message.textContent = "Stopping benchmark run…";
+        setTimeout(() => loadBenchmarkDetail(run.id), 500);
+      } catch (error) {
+        message.textContent = `Could not stop: ${error}`;
+        stop.disabled = false;
+      }
+    };
     if (run.status === "running") {
       benchmarkDetailTimer = setTimeout(() => {
         if (location.hash === `#/benchmark/${run.id}`) loadBenchmarkDetail(run.id);

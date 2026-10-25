@@ -2177,6 +2177,12 @@ def create_app(
         task = asyncio.create_task(run_benchmark())
         app.state.bench_tasks[run_id] = task
         app.state.bench_task_meta[run_id] = benchmark
+
+        def forget_benchmark_task(_task: asyncio.Task) -> None:
+            app.state.bench_tasks.pop(run_id, None)
+            app.state.bench_task_meta.pop(run_id, None)
+
+        task.add_done_callback(forget_benchmark_task)
         return {
             "run_id": run_id,
             "benchmark": benchmark,
@@ -2203,6 +2209,37 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"runs": runs, "total": total, "limit": limit, "offset": offset}
+
+    @app.post("/api/bench/runs/{run_id}/cancel", status_code=202)
+    async def cancel_benchmark_run(run_id: int) -> dict:
+        task = app.state.bench_tasks.get(run_id)
+        if task is None:
+            run = await asyncio.to_thread(store.get_bench_run, run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Benchmark run not found.")
+            if run.get("status") != RUN_RUNNING:
+                raise HTTPException(
+                    status_code=409, detail="Benchmark run is not running."
+                )
+            # The process restarted and lost the task; finalize the stale row.
+            await asyncio.to_thread(
+                store.finish_bench_run,
+                run_id,
+                status=RUN_CANCELLED,
+                error="cancelled by operator (no active task)",
+            )
+            return {"run_id": run_id, "status": RUN_CANCELLED}
+        if task.done() or not task.cancel():
+            raise HTTPException(
+                status_code=409, detail="Benchmark run is already finishing."
+            )
+        await asyncio.to_thread(
+            store.finish_bench_run,
+            run_id,
+            status=RUN_CANCELLED,
+            error="cancelled by operator",
+        )
+        return {"run_id": run_id, "status": "cancelling"}
 
     @app.get("/api/bench/runs/{run_id}")
     def get_benchmark_run(run_id: int) -> dict:

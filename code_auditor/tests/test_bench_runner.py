@@ -334,3 +334,35 @@ def test_runner_persists_to_the_store(tmp_path: Path) -> None:
     persisted = json.dumps(detail)
     assert "flag{runner_expected}" not in persisted
     assert "flag{runner_wrong}" not in persisted
+
+
+def test_runner_cancellation_closes_and_marks_the_run_cancelled(tmp_path: Path) -> None:
+    import asyncio
+
+    store = AuditStore(str(tmp_path / "history.db"))
+    adapter = FakeAdapter(tmp_path)
+
+    async def blocking_agent(*args, **kwargs):
+        await asyncio.sleep(60)
+
+    runner = BenchRunner(
+        adapter,
+        _config(tmp_path),
+        output_dir=tmp_path / "run",
+        agent_runner=blocking_agent,
+        store=store,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(runner.run(instances=[adapter.instances[0]]))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert adapter.closed == ["one"]
+    runs, total = store.list_bench_runs()
+    assert total == 1
+    assert runs[0]["status"] == "cancelled"

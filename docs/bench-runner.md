@@ -61,6 +61,8 @@ run = asyncio.run(
 - `#/benchmark/{id}`：汇总、逐实例结果、Agent log 查看。
 - `POST /api/bench/runs`：`{benchmark, repo_dir?, max_turns?, capture_trajectory?}`，
   返回 `{run_id, status, output_dir}`；后台 task 立即开始，页面跳转详情。
+- `POST /api/bench/runs/{id}/cancel`：取消 active task；DB 立即写 `cancelled`，返回
+  `202 {status: "cancelling"}`；未知 run 404，已完成 409。
 - `GET /api/bench/adapters`：注册的适配器名。
 - `GET /api/bench/runs`：`limit/offset/status/benchmark/q`。
 - `GET /api/bench/runs/{id}`：汇总 + results。
@@ -80,6 +82,9 @@ run = asyncio.run(
 - agent 使用当前 Web backend/provider 设置；`sandbox_enabled=False`，benchmark 服务/脚本
   由 adapter 在宿主管理。
 - 服务关闭时取消 active benchmark task，runner 会把 DB 状态写为 `cancelled`。
+- 详情页和运行列表在 `running` 状态显示 **Stop** 按钮；详情页自动轮询直到结束。
+- 取消发生在 `open_task` 的阻塞线程中时，runner 会等该线程返回、关闭已创建的服务/workspace，
+  再传播取消；因此“已取消”可能比点击晚一小段时间。
 
 ## 输出
 
@@ -132,7 +137,8 @@ When finished, end your reply with exactly: ANSWER: <the exact flag>
 - 若 agent 没给出可提取 flag，日志里可能仍有目标真实 flag，无法精确擦除；基准场景
   应在运行后检查/删除日志，或关闭日志持久化。
 - 服务生命周期、VPN、Docker 网络由 adapter 负责；runner 只调用 `preflight()`。
-- **未接**：Web 发起 run、并发调度、失败重试、断点续跑。
+- **未接**：并发调度（不同 benchmark 仍可同时跑，可能争 Docker 端口）、失败重试、断点续跑、
+  SSE 日志流。
 - 结果同时落文件和（可选）SQLite；调用方可用 `run.results` 自行处理。
 
 ## 测试

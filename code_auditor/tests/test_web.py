@@ -4160,3 +4160,62 @@ def test_api_start_benchmark_run_creates_output_and_records_db(
             ).status_code
             == 400
         )
+
+
+def test_api_cancel_benchmark_run(tmp_path, monkeypatch) -> None:
+    app = _make_app(tmp_path)
+    dataset = tmp_path / "benchmarks" / "dataset"
+    dataset.mkdir(parents=True)
+
+    class FakeAdapter:
+        repo_dir = str(dataset)
+
+    class SlowRunner:
+        def __init__(self, adapter, config, **options):
+            self.store = options["store"]
+            self.run_id = options["db_run_id"]
+
+        async def run(self):
+            import asyncio as _asyncio
+
+            await _asyncio.sleep(60)
+
+    monkeypatch.setattr(server_module, "registered_benchmarks", lambda: ["ctftiny"])
+    monkeypatch.setattr(
+        server_module, "create_benchmark_adapter", lambda name, **opts: FakeAdapter()
+    )
+    monkeypatch.setattr(server_module, "BenchRunner", SlowRunner)
+
+    import time as _time
+
+    with TestClient(app) as client:
+        started = client.post(
+            "/api/bench/runs",
+            json={"benchmark": "ctftiny", "repo_dir": str(dataset), "max_turns": 5},
+        )
+        assert started.status_code == 202
+        run_id = started.json()["run_id"]
+        assert run_id in app.state.bench_tasks
+
+        cancelled = client.post(f"/api/bench/runs/{run_id}/cancel")
+        assert cancelled.status_code == 202
+        assert cancelled.json()["status"] == "cancelling"
+
+        deadline = _time.time() + 5
+        detail = None
+        while _time.time() < deadline:
+            detail = client.get(f"/api/bench/runs/{run_id}").json()
+            if detail["status"] == RUN_CANCELLED:
+                break
+            _time.sleep(0.02)
+        assert detail is not None
+        assert detail["status"] == RUN_CANCELLED
+        assert run_id not in app.state.bench_tasks
+        assert run_id not in app.state.bench_task_meta
+
+        assert client.post("/api/bench/runs/9999/cancel").status_code == 404
+        done_id = app.state.store.create_bench_run(
+            benchmark="ctftiny", adapter="x", output_dir=str(tmp_path / "done")
+        )
+        app.state.store.finish_bench_run(done_id, status=RUN_DONE)
+        assert client.post(f"/api/bench/runs/{done_id}/cancel").status_code == 409

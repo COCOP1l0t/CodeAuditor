@@ -23,6 +23,7 @@ import asyncio
 import json
 import re
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -319,7 +320,21 @@ class BenchRunner:
             agent_log=str(log_path.relative_to(self.run_dir)),
         )
         try:
-            task = await asyncio.to_thread(self.adapter.open_task, instance)
+            open_task = asyncio.create_task(
+                asyncio.to_thread(self.adapter.open_task, instance)
+            )
+            try:
+                task = await asyncio.shield(open_task)
+            except asyncio.CancelledError:
+                # to_thread cannot be cancelled; wait for it so a container or
+                # workspace it created can be closed instead of leaking.
+                opened: BenchTask | None = None
+                with suppress(BaseException):
+                    opened = await open_task
+                if opened is not None:
+                    with suppress(Exception):
+                        await asyncio.to_thread(self.adapter.close, instance)
+                raise
             phase = "agent"
             cwd = self._workspace(instance_id, task)
             output = await self.agent_runner(

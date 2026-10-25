@@ -189,9 +189,6 @@ def _read_manifest_data(artifact_dir: Path) -> dict[str, Any]:
         raise RetentionError(
             f"{RETAIN_MANIFEST_FILENAME} must be private to the current user"
         )
-        raise RetentionError(
-            f"{RETAIN_MANIFEST_FILENAME} must be private to the current user"
-        )
     if stat_result.st_size > MAX_RETAIN_MANIFEST_BYTES:
         raise RetentionError(
             f"{RETAIN_MANIFEST_FILENAME} exceeds {MAX_RETAIN_MANIFEST_BYTES} bytes"

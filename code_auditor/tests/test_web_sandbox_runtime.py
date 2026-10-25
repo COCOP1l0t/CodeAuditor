@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from code_auditor.config import AuditConfig
 from code_auditor.sandbox_records import create_execution_directory, write_execution_record
+from code_auditor.runtime_capabilities import stage56_execution_capability
 from code_auditor.web import server
 from code_auditor.web import job as job_module
 from code_auditor.web.job import AuditJob, AuditJobManager, AuditStartParams
@@ -78,14 +79,27 @@ def test_api_runtime_selection_and_launch_preflight(tmp_path, monkeypatch):
     assert set(body["runtimes"]) == {"docker-default", "runc", "runsc"}
     assert body["runtimes"]["runsc"]["available"] is False
     assert body["local_worktree"]["available"] is True
-    assert checks == []
+    # GET may probe whichever runtimes the host platform reports as available;
+    # it must only ever probe this backend, and never the same runtime twice.
+    assert all(backend == "claude" for backend, _runtime in checks)
+    assert {runtime for _backend, runtime in checks} <= {
+        "docker-default",
+        "runc",
+        "runsc",
+    }
+    assert len(checks) == len(set(checks))
     request = {"backend": "claude", "mode": "local", "sandbox_mode": "docker-networked",
                "sandbox_runtime": "runsc"}
     assert client.put("/api/settings", json=request).status_code == 400
     assert client.get("/api/settings").json()["sandbox_runtime"] == "docker-default"
     ready = True
     # Host policy remains authoritative even if Docker itself becomes ready.
-    assert client.put("/api/settings", json=request).status_code == 400
+    platform_allows_runsc = stage56_execution_capability(
+        "docker-networked", "runsc"
+    ).available
+    assert client.put("/api/settings", json=request).status_code == (
+        200 if platform_allows_runsc else 400
+    )
     assert client.put("/api/settings", json={**request, "sandbox_runtime": "arbitrary"}).status_code == 422
 
 

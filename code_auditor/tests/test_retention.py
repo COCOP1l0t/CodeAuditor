@@ -122,7 +122,7 @@ def test_manifest_rejects_group_or_world_access(tmp_path: Path) -> None:
     _write_retained_tree(source)
     (source / RETAIN_MANIFEST_FILENAME).chmod(0o644)
 
-    with pytest.raises(RetentionError, match="group/world accessible"):
+    with pytest.raises(RetentionError, match="private to the current user"):
         load_retain_manifest(source)
 
 

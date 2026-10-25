@@ -1404,6 +1404,7 @@ async def test_reproduction_git_disables_prompts_and_remote_helpers(
     captured = {}
 
     class FakeProcess:
+        pid = 12345
         returncode = 0
 
         async def communicate(self):
@@ -1969,9 +1970,9 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="f-local-directory-path"' in res.text
     assert 'id="btn-choose-local-directory"' in res.text
     assert 'id="f-wiki-select"' in res.text
-    assert res.text.count('name="sandbox-kind"') == 3
-    assert 'value="docker"' in res.text
-    assert 'value="gvisor"' in res.text
+    assert res.text.count('name="sandbox-kind"') == 4
+    for sandbox_kind in ("docker-default", "runc", "runsc", "local-worktree"):
+        assert f'value="{sandbox_kind}"' in res.text
     assert 'id="s-sandbox-network"' in res.text
     assert 'id="s-sandbox-runtime"' not in res.text
     assert 'data-route="cves"' in res.text
@@ -2014,7 +2015,7 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="s-backend"' in res.text
     assert 'id="s-mode"' in res.text
     assert "Active jobs switch on their next agent call" in res.text
-    assert res.text.count('class="table-shell') == 5
+    assert res.text.count('class="table-shell') == 7
     assert 'class="table-shell history-table-shell"' in res.text
     assert 'id="history-search"' in res.text
     assert 'id="history-status"' in res.text

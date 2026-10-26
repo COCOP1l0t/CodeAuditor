@@ -5,21 +5,21 @@ Multi-stage code auditing agent using `claude-code-sdk` (Python). Given a target
 ## Quick Reference
 
 - **Language**: Python >=3.12
-- **Package manager**: pip (uses `pyproject.toml`, hatchling backend)
+- **Package manager**: uv with `uv.lock` and the `uv_build` backend
 - **Entry point**: `code-auditor` → Web UI via `code_auditor/__main__.py:main`
 - **Agent backends**: Claude via `claude-code-sdk`; Codex via local Codex app server SDK
 
 ## Running
 
 ```bash
-# Install (editable)
-pip install -e .
+# Sync the locked environment (editable project install)
+uv sync --locked
 
 # Start the Web UI (default mode)
-code-auditor
+uv run code-auditor
 
 # Common server options
-code-auditor --host 0.0.0.0 --port 8000
+uv run code-auditor --host 0.0.0.0 --port 8000
 
 # Audit settings live in ~/.code_auditor/settings.json and the Web UI.
 # Historical retention/cleanup commands remain available via --help.
@@ -28,10 +28,12 @@ code-auditor --host 0.0.0.0 --port 8000
 ## Testing
 
 ```bash
-pytest -q
+uv run pytest -q
 ```
 
 Tests are under `code_auditor/tests/`; they do not make real agent calls.
+
+Build source and wheel distributions with `uv build`.
 
 ## Architecture (7 stages)
 
@@ -47,7 +49,7 @@ Tests are under `code_auditor/tests/`; they do not make real agent calls.
 
 ## Key patterns
 
-- **Prompt templates**: `prompts/stageN.md` with `__KEY__` placeholders, loaded via `prompts.py:load_prompt()`
+- **Prompt templates**: `code_auditor/prompts/stageN.md` with `__KEY__` placeholders, loaded via `prompts.py:load_prompt()`
 - **Directive injection**: Stage 1 produces auditing focus and vulnerability criteria directives; injected into Stage 2 (scope/hot-spots), Stage 3 (both), and Stage 4 (vuln criteria only)
 - **Validation + retry**: Each agent output is validated; on failure, a repair prompt is sent (up to `max_retries`)
 - **Task failure surfacing**: Failed parallel sub-tasks are collected in `config.task_errors`; any failure marks the run `failed` with a summary in the `error` field. Agent error results (e.g. API 429 quota exhaustion) raise instead of passing silently, and non-retryable errors fail fast without retries. Web History offers Resume for cancelled, failed, and done-with-errors runs.
@@ -101,5 +103,5 @@ code_auditor/
 │                        #   progress.py EventBus/SSE + ContextVar log routing + progress
 │                        #   reporter, static/ vanilla-JS page
 └── tests/
-prompts/                 # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
+code_auditor/prompts/    # stage1.md–stage6.md — prompt templates with __KEY__ placeholders
 ```

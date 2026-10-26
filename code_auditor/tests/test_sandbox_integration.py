@@ -1,6 +1,6 @@
 """Opt-in, benign container checks; no model requests or target PoCs.
 
-CODE_AUDITOR_RUN_SANDBOX_TESTS=1 pytest -q -rs code_auditor/tests/test_sandbox_integration.py
+CODE_AUDITOR_RUN_SANDBOX_TESTS=1 uv run pytest -q -rs code_auditor/tests/test_sandbox_integration.py
 The existing image is used as-is. These tests never install a runtime, pull an
 image, change daemon configuration, or restart Docker.
 """

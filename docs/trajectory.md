@@ -65,7 +65,7 @@ run 级轨迹通过 `observation.results[].subagent_trajectory_ref[].trajectory_
 
 一次调用里记录：
 
-1. **user** 步：实际发给 agent 的 prompt（`prompts/stageN.md` 渲染后的全文，含注入的 directive/wiki 上下文）。
+1. **user** 步：实际发给 agent 的 prompt（`code_auditor/prompts/stageN.md` 渲染后的全文，含注入的 directive/wiki 上下文）。
 2. **system** 步：SDK 的系统事件（`SystemMessage` 子类型）；遇到 compact 类子类型会带
    `step.extra.context_management.boundary = "replace"`。
 3. **agent** 步：一轮助手输出 —— 文本进 `message`，思考块进 `reasoning_content`，

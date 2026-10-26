@@ -5,6 +5,12 @@ import pytest
 from code_auditor import prompts
 
 
+def test_prompt_templates_are_bundled_with_the_package() -> None:
+    assert prompts.PROMPTS_DIR == Path(prompts.__file__).resolve().parent / "prompts"
+    assert (prompts.PROMPTS_DIR / "stage1.md").is_file()
+    assert (prompts.PROMPTS_DIR / "stage6.md").is_file()
+
+
 @pytest.mark.parametrize(
     "value",
     ["window.__TAURI_INTERNALS__.invoke", "__NEXT__", r"C:\source\1\file", ""],

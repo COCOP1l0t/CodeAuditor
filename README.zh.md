@@ -29,6 +29,7 @@ CodeAuditor 已帮助多个常用开源项目发现 CVE，详见[已发现漏洞
 ## 环境要求
 
 - Python **3.12+**
+- [uv](https://docs.astral.sh/uv/)（用于依赖管理和构建）
 - Git；仅 Docker 沙箱模式需要可用的 Docker Engine
 - [Claude Code](https://docs.claude.com/en/docs/claude-code)，或支持 `codex app-server` 的 Codex CLI；后端在 Web 设置中选择
 
@@ -37,7 +38,7 @@ CodeAuditor 已帮助多个常用开源项目发现 CVE，详见[已发现漏洞
 ```bash
 git clone https://github.com/COCOP1l0t/CodeAuditor.git
 cd CodeAuditor
-pip install -e .
+uv sync --locked
 ```
 
 ## 快速开始
@@ -45,7 +46,7 @@ pip install -e .
 启动 Web 界面，然后打开 `http://127.0.0.1:8000`：
 
 ```bash
-code-auditor
+uv run code-auditor
 ```
 
 Web 服务选项：
@@ -98,11 +99,12 @@ Web 界面会发现 `~/.code_auditor/wiki/` 下的知识库。CodeAuditor 将所
 ## 开发
 
 ```bash
-pip install -e '.[test]'
-pytest -q
+uv sync --locked
+uv run pytest -q
+uv build
 ```
 
-测试不会发起真实的智能体调用。
+`uv sync` 会安装默认的 `dev` 依赖组。测试不会发起真实的智能体调用。
 
 ## 已发现漏洞
 

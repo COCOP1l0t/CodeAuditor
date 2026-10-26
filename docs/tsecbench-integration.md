@@ -69,7 +69,7 @@ VPN preflight：`GET http://10.0.100.58` 必须返回 `{"status":"ok"}`，否则
 
 **本地模式（推荐先接）：**
 
-- 主机 + VPN（SSLVPN / 平台下发 `.ovpn`），Python ≥ 3.9，`pip install tsec-benchmark`
+- 主机 + VPN（SSLVPN / 平台下发 `.ovpn`），Python ≥ 3.9，`uv pip install tsec-benchmark`
   （只依赖 httpx）；**不需要 Docker/KVM**，靶场容器在平台侧启动。
 - 每题官方口径 ≤1 小时（多阶段 ≤2 小时），超时判失败。
 - 同一账号最多 3 个 active challenge；start/close 要成对，异常路径也必须 close。

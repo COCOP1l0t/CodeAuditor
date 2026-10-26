@@ -29,6 +29,7 @@ Outputs are validated and checkpointed between stages. Stage 1's project-specifi
 ## Requirements
 
 - Python **3.12+**
+- [uv](https://docs.astral.sh/uv/) for dependency management and builds
 - Git; Docker Engine is required only for Docker sandbox modes
 - [Claude Code](https://docs.claude.com/en/docs/claude-code), or a Codex CLI with `codex app-server` support; select the backend in Web settings
 
@@ -37,7 +38,7 @@ Outputs are validated and checkpointed between stages. Stage 1's project-specifi
 ```bash
 git clone https://github.com/COCOP1l0t/CodeAuditor.git
 cd CodeAuditor
-pip install -e .
+uv sync --locked
 ```
 
 ## Quick start
@@ -45,7 +46,7 @@ pip install -e .
 Start the Web UI and open `http://127.0.0.1:8000`:
 
 ```bash
-code-auditor
+uv run code-auditor
 ```
 
 Web server options:
@@ -98,11 +99,12 @@ The same repository commit reuses its output directory and resumes from checkpoi
 ## Development
 
 ```bash
-pip install -e '.[test]'
-pytest -q
+uv sync --locked
+uv run pytest -q
+uv build
 ```
 
-Tests do not make real agent calls.
+`uv sync` installs the default `dev` dependency group. Tests do not make real agent calls.
 
 ## Vulnerabilities found
 

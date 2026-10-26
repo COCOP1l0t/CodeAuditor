@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 _PLACEHOLDER = re.compile(r"__[A-Z][A-Z0-9_]*?__")
 

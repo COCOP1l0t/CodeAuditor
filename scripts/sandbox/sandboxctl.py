@@ -26,7 +26,7 @@ def verify(runtime: str) -> int:
     scratch = DockerScratch(config, "verification-preflight")
     scratch._verify_runtime()
     if importlib.util.find_spec("pytest") is None:
-        raise ValueError("install test dependencies first: python -m pip install -e '.[test]'")
+        raise ValueError("install development dependencies first: uv sync --locked")
     test_file = REPOSITORY / "code_auditor/tests/test_sandbox_integration.py"
     tests = [
         f"{test_file}::test_runtime_write_boundary_and_durable_record[{runtime}]",
@@ -63,7 +63,7 @@ def main() -> int:
         from code_auditor.config import AuditConfig
         from code_auditor.sandbox import DockerSandboxError, inspect_docker_sandbox_environment
     except ImportError:
-        parser.exit(1, "Use the CodeAuditor Python environment: python -m pip install -e '.[test]'\n")
+        parser.exit(1, "Use the uv project environment: uv sync --locked && uv run python scripts/sandbox/sandboxctl.py\n")
     try:
         if args.command == "check":
             capability = inspect_docker_sandbox_environment(args.backend, args.runtime)

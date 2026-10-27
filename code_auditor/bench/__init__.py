@@ -1,14 +1,13 @@
 """Benchmark integration surface.
 
-``code_auditor.bench`` intentionally is not wired into the audit orchestrator
-yet: adapters are exercised by tests and by the analysis in
-``docs/tsecbench-integration.md`` first, so the remote-target flow can be
-validated against a real TSecBench deployment before it changes stage 0-6.
+``code_auditor.bench`` provides the built-in TSECBench adapter and the shared
+sequential runner. The runner is independent of the audit stages and persists
+results through the Web/DB benchmark surface.
 """
 
 from __future__ import annotations
 
-from .adapters import CTFTinyAdapter, CyBenchAdapter, TSecBenchAdapter
+from .adapters import TSecBenchAdapter
 from .base import (
     BenchAdapter,
     BenchmarkPlatformCapability,
@@ -49,8 +48,6 @@ __all__ = [
     "SubmissionKind",
     "benchmark_platform_capability",
     "benchmark_platform_prerequisites",
-    "CTFTinyAdapter",
-    "CyBenchAdapter",
     "TSecBenchAdapter",
     "create",
     "extract_flag",

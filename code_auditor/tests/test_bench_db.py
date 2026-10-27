@@ -17,9 +17,9 @@ def _store(tmp_path: Path) -> AuditStore:
 def test_benchmark_run_lifecycle_and_upsert(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = store.create_bench_run(
-        benchmark="ctftiny",
-        adapter="CTFTinyAdapter",
-        repo_dir="/data/CTFTiny",
+        benchmark="tsecbench",
+        adapter="TSecBenchAdapter",
+        repo_dir="",
         output_dir=str(tmp_path / "run"),
         backend="claude",
         model="claude-test",
@@ -33,15 +33,15 @@ def test_benchmark_run_lifecycle_and_upsert(tmp_path: Path) -> None:
     store.record_bench_result(
         run_id,
         {
-            "instance_id": "pwn-baby",
-            "benchmark": "ctftiny",
+            "instance_id": "C-1",
+            "benchmark": "tsecbench",
             "status": "succeeded",
             "success": True,
             "score": 50.0,
             "extracted": True,
             "submitted_length": 12,
             "detail": {"category": "pwn", "matched": True},
-            "agent_log": "pwn-baby/agent.log",
+            "agent_log": "C-1/agent.log",
             "duration_seconds": 3.5,
         },
     )
@@ -49,7 +49,7 @@ def test_benchmark_run_lifecycle_and_upsert(tmp_path: Path) -> None:
         run_id,
         {
             "instance_id": "web-x",
-            "benchmark": "ctftiny",
+            "benchmark": "tsecbench",
             "status": "failed",
             "success": False,
             "score": 0.0,
@@ -64,8 +64,8 @@ def test_benchmark_run_lifecycle_and_upsert(tmp_path: Path) -> None:
     store.record_bench_result(
         run_id,
         {
-            "instance_id": "pwn-baby",
-            "benchmark": "ctftiny",
+            "instance_id": "C-1",
+            "benchmark": "tsecbench",
             "status": "succeeded",
             "success": True,
             "score": 50.0,
@@ -91,32 +91,32 @@ def test_benchmark_run_lifecycle_and_upsert(tmp_path: Path) -> None:
     assert run["score"] == 50.0
     assert run["duration_seconds"] == pytest.approx(12.0)
     assert run["success_rate"] == 0.5
-    assert run["repo_dir"] == "/data/CTFTiny"
+    assert run["repo_dir"] == ""
 
     detail = store.get_bench_run(run_id)
     assert detail is not None
     assert len(detail["results"]) == 2
     by_id = {item["instance_id"]: item for item in detail["results"]}
-    assert by_id["pwn-baby"]["detail"]["revision"] == 2
-    assert by_id["pwn-baby"]["success"] is True
+    assert by_id["C-1"]["detail"]["revision"] == 2
+    assert by_id["C-1"]["success"] is True
     assert by_id["web-x"]["success"] is False
 
 
 def test_list_bench_runs_filters_and_search(tmp_path: Path) -> None:
     store = _store(tmp_path)
     first = store.create_bench_run(
-        benchmark="ctftiny", adapter="ctftiny", output_dir=str(tmp_path / "alpha"), started_at=1
+        benchmark="alpha", adapter="alpha", output_dir=str(tmp_path / "alpha"), started_at=1
     )
     second = store.create_bench_run(
-        benchmark="cybench", adapter="cybench", output_dir=str(tmp_path / "bravo"), started_at=2
+        benchmark="bravo", adapter="bravo", output_dir=str(tmp_path / "bravo"), started_at=2
     )
     store.finish_bench_run(first, status=RUN_DONE, ended_at=3)
 
-    runs, total = store.list_bench_runs(benchmark="cybench")
+    runs, total = store.list_bench_runs(benchmark="bravo")
     assert total == 1 and runs[0]["id"] == second
     runs, total = store.list_bench_runs(status=RUN_DONE)
     assert total == 1 and runs[0]["id"] == first
-    runs, total = store.list_bench_runs(query="cybench")
+    runs, total = store.list_bench_runs(query="bravo")
     assert total == 1 and runs[0]["id"] == second
     runs, total = store.list_bench_runs(query="bravo")
     assert total == 1 and runs[0]["id"] == second

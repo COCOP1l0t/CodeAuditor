@@ -11,12 +11,9 @@ open_task -> run_agent -> extract_flag -> adapter.grade -> adapter.close
 | Benchmark | Linux | macOS | 原生 Windows | 额外依赖 |
 |---|---|---|---|---|
 | TSECBench | 支持 | 支持 | 支持 | 可访问平台 API 的网络/VPN，以及 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN`；不要求本地 Docker/bash |
-| CTFTiny | 支持 | 支持 | 支持 | 纯文件题无额外依赖；`compose: true` 的题需要 Docker Compose，Windows 应使用 Docker Desktop 的 Linux container backend |
-| CyBench | 支持 | 支持 | 不支持，需使用 WSL2/Linux | 必须能执行 `bash`；启动 Docker 服务的任务还需要 Docker |
 
 Web 的 `GET /api/bench/adapters` 同时返回 `capabilities`，其中包含当前平台、
-`available`、支持平台列表、必需/可选命令和说明。原生 Windows 上的 CyBench 会在
-启动前返回 400，而不是等到执行数据集脚本时才失败。
+`available`、支持平台列表、必需/可选命令和说明。
 
 ## 用法
 
@@ -25,14 +22,14 @@ import asyncio
 from code_auditor.bench import BenchRunner, create
 from code_auditor.config import AuditConfig
 
-adapter = create("cybench", repo_dir="/data/cybench")
-config = AuditConfig(target="bench", output_dir="/results/bench-cybench")
+adapter = create("tsecbench")
+config = AuditConfig(target="bench", output_dir="/results/bench-tsecbench")
 
 run = asyncio.run(
     BenchRunner(
         adapter,
         config,
-        output_dir="/results/bench-cybench",
+        output_dir="/results/bench-tsecbench",
         max_turns=100,
         capture_trajectory=False,   # 默认关闭，避免 flag 进入轨迹
     ).run()
@@ -40,7 +37,7 @@ run = asyncio.run(
 print(run.summary())
 ```
 
-TSECBench 同理；远程任务没有本地 workdir，runner 会在
+TSECBench 的远程任务没有本地 workdir，runner 会在
 `<output>/workspaces/<instance>/` 创建 agent 工作目录。
 
 ## DB 持久化
@@ -71,7 +68,7 @@ run = asyncio.run(
 
 - `#/benchmarks`：发起表单 + 运行列表（搜索/状态过滤、刷新）。
 - `#/benchmark/{id}`：汇总、逐实例结果、Agent log 查看。
-- `POST /api/bench/runs`：`{benchmark, repo_dir?, max_turns?, capture_trajectory?}`，
+- `POST /api/bench/runs`：`{benchmark, max_turns?, capture_trajectory?}`，
   返回 `{run_id, status, output_dir}`；后台 task 立即开始，页面跳转详情。
 - `POST /api/bench/runs/{id}/cancel`：取消 active task；DB 立即写 `cancelled`，返回
   `202 {status: "cancelling"}`；未知 run 404，已完成 409。
@@ -82,15 +79,11 @@ run = asyncio.run(
 
 服务端行为：
 
-- 一次只允许同一 benchmark 有一个 active run（409）；不同 benchmark 可并行（注意 Docker
-  端口/容器名冲突）。
+- 一次只允许同一 benchmark 有一个 active run（409）。
 - 输出目录自动创建在 `<results_dir>/benchmarks/<benchmark>-<timestamp>-<rand>/`，Web
   请求不能指定任意输出路径。
-- CTFTiny/CyBench 的 dataset 目录**必须**位于 `<state_dir>/benchmarks/`、管理的 repos
-  目录，或 `CODE_AUDITOR_BENCH_ROOTS`（`os.pathsep` 分隔）列出的根目录下；这些数据集
-  会执行 `init_script.sh` 等仓库脚本，不能允许任意路径。
-- TSECBench 忽略 dataset 路径，使用服务端 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN`
-  和 VPN；adapter 构造失败会在启动前返回 400。
+- TSECBench 使用服务端 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` 和 VPN；
+  adapter 构造失败会在启动前返回 400。
 - agent 使用当前 Web backend/provider 设置；`sandbox_enabled=False`，benchmark 服务/脚本
   由 adapter 在宿主管理。
 - 服务关闭时取消 active benchmark task，runner 会把 DB 状态写为 `cancelled`。

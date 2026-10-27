@@ -288,7 +288,7 @@ def test_adapter_rejects_empty_flags_and_surfaces_duplicates() -> None:
 
 
 def test_registry_exposes_tsecbench_and_rejects_unknown_names() -> None:
-    assert "tsecbench" in registered()
+    assert registered() == ["tsecbench"]
     client = FakeClient()
     adapter = create("tsecbench", client=client)
     assert isinstance(adapter, TSecBenchAdapter)
@@ -305,30 +305,6 @@ def test_benchmark_platform_prerequisites_are_explicit() -> None:
     )
     assert tsec.available is True
     assert "VPN" in tsec.reason
-
-    ctftiny = benchmark_platform_capability(
-        "ctftiny", platform_name="windows", command_exists=available
-    )
-    assert ctftiny.available is True
-    assert "Docker Desktop" in ctftiny.reason
-
-    cybench_windows = benchmark_platform_capability(
-        "cybench", platform_name="windows", command_exists=available
-    )
-    assert cybench_windows.available is False
-    assert "WSL2/Linux" in cybench_windows.reason
-
-    cybench_macos = benchmark_platform_capability(
-        "cybench", platform_name="macos", command_exists=available
-    )
-    assert cybench_macos.available is True
-    assert cybench_macos.prerequisites.required_commands == ("bash",)
-
-    missing_bash = benchmark_platform_capability(
-        "cybench", platform_name="linux", command_exists=lambda _command: None
-    )
-    assert missing_bash.available is False
-    assert "bash" in missing_bash.reason
 
 
 def test_adapter_builds_an_instance_getter_for_task_metadata() -> None:

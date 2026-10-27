@@ -64,24 +64,6 @@ _BENCHMARK_PLATFORM_PREREQUISITES = {
             "No local Docker or bash installation is required."
         ),
     ),
-    "ctftiny": BenchmarkPlatformPrerequisites(
-        supported_platforms=("linux", "macos", "windows"),
-        optional_commands=("docker",),
-        notes=(
-            "File-only challenges need no container runtime. Challenges marked "
-            "compose require Docker Compose; native Windows should use Docker "
-            "Desktop with Linux containers."
-        ),
-    ),
-    "cybench": BenchmarkPlatformPrerequisites(
-        supported_platforms=("linux", "macos"),
-        required_commands=("bash",),
-        optional_commands=("docker",),
-        notes=(
-            "CyBench executes dataset bash scripts. Docker-network tasks also "
-            "require Docker. Native Windows must run CodeAuditor in WSL2/Linux."
-        ),
-    ),
 }
 
 

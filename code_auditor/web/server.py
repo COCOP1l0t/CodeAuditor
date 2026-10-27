@@ -499,37 +499,6 @@ def _safe_revision_component(value: object) -> str:
     return component.strip("-")[:40] or "previous"
 
 
-def _benchmark_dataset_roots(state_dir: str, repos_dir: str) -> list[Path]:
-    """Directories a Web-started benchmark may execute dataset scripts from."""
-    roots = [Path(state_dir) / "benchmarks", Path(repos_dir)]
-    extra = os.environ.get("CODE_AUDITOR_BENCH_ROOTS", "")
-    for part in extra.split(os.pathsep):
-        if part.strip():
-            roots.append(Path(os.path.expanduser(part.strip())).resolve())
-    return roots
-
-
-def _resolve_benchmark_dataset(
-    repo_dir: str, *, state_dir: str, repos_dir: str
-) -> str:
-    if "\x00" in repo_dir:
-        raise HTTPException(status_code=400, detail="Invalid dataset path.")
-    path = Path(os.path.expanduser(repo_dir)).resolve()
-    if not path.is_dir():
-        raise HTTPException(status_code=400, detail=f"Dataset directory not found: {path}")
-    roots = _benchmark_dataset_roots(state_dir, repos_dir)
-    if not any(path == root or path_is_within(path, root) for root in roots):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Benchmark datasets execute repository scripts. Keep them under "
-                f"{state_dir}/benchmarks or {repos_dir}, or list an allowed root "
-                "in CODE_AUDITOR_BENCH_ROOTS."
-            ),
-        )
-    return str(path)
-
-
 def _benchmark_output_dir(results_dir: str, benchmark: str) -> Path:
     """Create a fresh managed output directory for one benchmark run."""
     root = Path(results_dir) / "benchmarks"
@@ -585,7 +554,6 @@ def _validate_http_url(value: str) -> str:
 
 class BenchStartRequest(StrictRequest):
     benchmark: str = Field(min_length=1, max_length=64)
-    repo_dir: str | None = Field(default=None, max_length=4096)
     max_turns: int = Field(default=100, ge=1, le=500)
     capture_trajectory: bool = False
 
@@ -2089,26 +2057,9 @@ def create_app(
                 status_code=409,
                 detail=f"A {benchmark} benchmark run is already active.",
             )
-        repo_dir = ""
-        if benchmark != "tsecbench":
-            if not request.repo_dir or not request.repo_dir.strip():
-                raise HTTPException(
-                    status_code=400,
-                    detail="This benchmark needs a local dataset directory.",
-                )
-            repo_dir = _resolve_benchmark_dataset(
-                request.repo_dir,
-                state_dir=settings.state_dir,
-                repos_dir=settings.repos_dir,
-            )
-
         output_dir = _benchmark_output_dir(settings.results_dir, benchmark)
-        options: dict[str, object] = {}
-        if benchmark != "tsecbench":
-            options["repo_dir"] = repo_dir
-            options["work_root"] = output_dir / "work"
         try:
-            adapter = create_benchmark_adapter(benchmark, **options)
+            adapter = create_benchmark_adapter(benchmark)
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
@@ -2117,7 +2068,7 @@ def create_app(
 
         provider = settings.provider()
         config = AuditConfig(
-            target=repo_dir or benchmark,
+            target=benchmark,
             output_dir=str(output_dir),
             backend=settings.backend,
             model=provider.model if provider.mode == "custom" else None,
@@ -2134,7 +2085,7 @@ def create_app(
                 store.create_bench_run,
                 benchmark=benchmark,
                 adapter=type(adapter).__name__,
-                repo_dir=repo_dir,
+                repo_dir="",
                 output_dir=str(output_dir),
                 backend=config.backend,
                 model=config.model,

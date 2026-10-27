@@ -666,12 +666,6 @@
             <select id="benchmark-start-adapter" required></select>
           </label>
           <p id="benchmark-start-requirements" class="hint settings-wide-field"></p>
-          <label class="settings-wide-field">
-            Dataset directory
-            <input id="benchmark-start-repo" type="text" maxlength="4096"
-                   autocomplete="off" placeholder="/data/CTFTiny" />
-            <span class="hint">CTFTiny/CyBench need a checkout under state-dir <code>benchmarks/</code>, the managed repos directory, or <code>CODE_AUDITOR_BENCH_ROOTS</code>; TSECBench ignores this field.</span>
-          </label>
           <label>
             Max turns
             <input id="benchmark-start-turns" type="number" min="1" max="500" value="100" required />

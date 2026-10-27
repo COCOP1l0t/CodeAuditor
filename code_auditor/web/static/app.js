@@ -5063,17 +5063,10 @@ function benchCell(row, text) {
   return cell;
 }
 
-function updateBenchmarkRepoField() {
+function updateBenchmarkRequirements() {
   const select = $("benchmark-start-adapter");
-  const repo = $("benchmark-start-repo");
-  if (!select || !repo) return;
+  if (!select) return;
   const capability = benchmarkCapabilities[select.value] || null;
-  const tsec = select.value === "tsecbench";
-  repo.disabled = tsec;
-  repo.required = !tsec;
-  repo.placeholder = tsec
-    ? "Not used for TSECBench (platform API + VPN)"
-    : "~/.code_auditor/benchmarks/CTFTiny or an allowed root";
   const requirements = $("benchmark-start-requirements");
   if (requirements) {
     requirements.textContent = capability
@@ -5107,17 +5100,16 @@ async function loadBenchmarkAdapters() {
     if ([...select.options].some((option) => option.value === current)) {
       select.value = current;
     }
-    updateBenchmarkRepoField();
+    updateBenchmarkRequirements();
   } catch (error) {
     $("benchmark-start-message").textContent = `Could not load adapters: ${error}`;
   }
 }
 
-$("benchmark-start-adapter")?.addEventListener("change", updateBenchmarkRepoField);
+$("benchmark-start-adapter")?.addEventListener("change", updateBenchmarkRequirements);
 $("benchmark-start-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const benchmark = $("benchmark-start-adapter").value;
-  const repo = $("benchmark-start-repo").value.trim();
   const maxTurns = Number($("benchmark-start-turns").value || 100);
   const capture = $("benchmark-start-trajectory").checked;
   const message = $("benchmark-start-message");
@@ -5131,16 +5123,11 @@ $("benchmark-start-form")?.addEventListener("submit", async (event) => {
     message.textContent = capability.reason;
     return;
   }
-  if (benchmark !== "tsecbench" && !repo) {
-    message.textContent = "This adapter needs a dataset directory.";
-    return;
-  }
   const payload = {
     benchmark,
     max_turns: maxTurns,
     capture_trajectory: capture,
   };
-  if (benchmark !== "tsecbench") payload.repo_dir = repo;
   button.disabled = true;
   message.textContent = `Starting ${benchmark}…`;
   try {
@@ -5172,7 +5159,7 @@ async function cancelBenchmarkRun(runId) {
 
 async function loadBenchmarks() {
   loadBenchmarkAdapters();
-  updateBenchmarkRepoField();
+  updateBenchmarkRequirements();
   const message = $("benchmarks-message");
   const tbody = document.querySelector("#benchmarks-table tbody");
   if (!tbody) return;

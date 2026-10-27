@@ -12,9 +12,8 @@ benchmark needs:
 * best-effort scrubbing of the flag from the agent log (and trajectories when
   capture is enabled).
 
-It runs instances sequentially. CTF task servers commonly use fixed container
-names, ports and Docker network aliases, so parallel execution needs adapter
-support and is intentionally left to the caller.
+It runs instances sequentially; parallel execution needs adapter support and
+is intentionally left to the caller.
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from .base import BenchAdapter, BenchTask, InstanceSpec, Outcome, Submission
-from .ctf import safe_component
 from ..agent import run_agent
 from ..config import AuditConfig
 from ..logger import get_logger
@@ -47,8 +45,14 @@ _ANSWER_RE = re.compile(r"(?im)^\s*(?:ANSWER|FLAG)\s*:\s*(.+?)\s*$")
 _FLAG_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]{1,32}\{[^{}\n]{1,500}\}")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_{}.:/+=\-]{4,4096}")
 _NOT_FLAGS = {"answer", "flag", "done", "none", "n/a"}
+_SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 AgentRunner = Callable[..., Awaitable[str]]
+
+
+def _safe_component(value: str, *, limit: int = 80) -> str:
+    cleaned = _SAFE_COMPONENT_RE.sub("_", value.strip().lower()).strip("._-")
+    return cleaned[:limit] or "instance"
 
 
 class BenchRunError(RuntimeError):
@@ -307,7 +311,7 @@ class BenchRunner:
     async def _run_instance(self, instance: InstanceSpec) -> BenchResult:
         instance_id = str(instance.instance_id)
         started = time.time()
-        log_path = self.run_dir / safe_component(instance_id) / "agent.log"
+        log_path = self.run_dir / _safe_component(instance_id) / "agent.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         task: BenchTask | None = None
         expected = self._expected_flag(instance)
@@ -386,7 +390,7 @@ class BenchRunner:
         configured = task.metadata.get("workdir")
         if isinstance(configured, str) and Path(configured).is_dir():
             return Path(configured)
-        workspace = self.run_dir / "workspaces" / safe_component(instance_id)
+        workspace = self.run_dir / "workspaces" / _safe_component(instance_id)
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 

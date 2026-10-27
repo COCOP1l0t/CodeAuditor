@@ -4243,7 +4243,11 @@ def test_api_cancel_benchmark_run(tmp_path, monkeypatch) -> None:
         detail = None
         while _time.time() < deadline:
             detail = client.get(f"/api/bench/runs/{run_id}").json()
-            if detail["status"] == RUN_CANCELLED:
+            if (
+                detail["status"] == RUN_CANCELLED
+                and run_id not in app.state.bench_tasks
+                and run_id not in app.state.bench_task_meta
+            ):
                 break
             _time.sleep(0.02)
         assert detail is not None

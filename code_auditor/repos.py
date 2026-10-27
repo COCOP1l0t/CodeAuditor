@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import os
 import re
@@ -131,11 +132,12 @@ def repo_local_path(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
     local_path = Path(url).expanduser()
     if local_path.is_absolute():
         host = "local"
-        path = "/".join(
-            re.sub(r"[^A-Za-z0-9._-]+", "_", part.strip("\\/"))
-            for part in local_path.parts
-            if part.strip("\\/")
-        )
+        resolved = str(local_path.resolve())
+        safe_name = re.sub(
+            r"[^A-Za-z0-9._-]+", "_", local_path.name
+        ).strip("._-") or "repo"
+        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+        path = f"{safe_name}-{digest}"
     else:
         scp_match = _SCP_LIKE_RE.match(url)
         if scp_match and "://" not in url:

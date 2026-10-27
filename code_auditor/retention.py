@@ -560,6 +560,8 @@ def export_retained_artifacts(
             source / RETAIN_MANIFEST_FILENAME,
             staging / RETAIN_MANIFEST_FILENAME,
         )
+        staged_manifest = staging / RETAIN_MANIFEST_FILENAME
+        harden_private_file(staged_manifest)
         if destination.exists():
             os.replace(destination, backup)
             moved_previous = True
@@ -573,6 +575,7 @@ def export_retained_artifacts(
         if moved_previous:
             shutil.rmtree(backup)
             moved_previous = False
+        harden_private_file(destination / RETAIN_MANIFEST_FILENAME)
     finally:
         if staging.exists():
             shutil.rmtree(staging)

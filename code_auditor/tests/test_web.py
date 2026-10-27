@@ -3591,7 +3591,7 @@ def test_api_history_import_results_tree(tmp_path, monkeypatch) -> None:
     by_project = {Path(r["output_dir"]).parent.name: r for r in body["runs"]}
     assert by_project["qemu"]["target"] == "/repos/qemu"
     assert by_project["qemu"]["started_at"] is not None  # parsed from dir date
-    assert by_project["other"]["target"].endswith("/other")
+    assert Path(by_project["other"]["target"]).name == "other"
 
 
 def test_api_history_import_tree_without_outputs_returns_400(tmp_path) -> None:

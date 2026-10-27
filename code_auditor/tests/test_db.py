@@ -1557,7 +1557,7 @@ def test_record_run_populates_disclosure_catalogue_and_summary(tmp_path) -> None
     candidate = store.get_disclosed_terminal_candidate("qemu", entry["dedupe_key"])
     assert candidate is not None
     assert candidate["run_id"] == run_id
-    assert candidate["poc_dir"].endswith("stage5-pocs/H-01")
+    assert Path(candidate["poc_dir"]).as_posix().endswith("stage5-pocs/H-01")
 
 
 def test_retained_stage6_reproducer_survives_stage5_cleanup(tmp_path) -> None:

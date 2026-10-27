@@ -228,7 +228,15 @@ async def _run_git_command(
             ),
             env=env,
         )
-        process_job.assign_pid(proc.pid)
+        try:
+            process_job.assign_pid(proc.pid)
+        except Exception as exc:
+            # Fast git commands can exit before Windows Job Object assignment.
+            if getattr(exc, "args", ()) and exc.args[0] == 87:
+                pass
+            else:
+                process_job.close()
+                raise
     except OSError as exc:
         process_job.close()
         raise JobValidationError(f"Cannot run git for {context}: {exc}") from exc

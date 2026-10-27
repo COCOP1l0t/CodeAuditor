@@ -5046,6 +5046,7 @@ setupTerminalSplitter();
 // ── Benchmarks ─────────────────────────────────────────────────────────────
 
 let benchmarkDetailTimer = null;
+let benchmarkCapabilities = {};
 
 function benchStatusBadge(status) {
   const safe = String(status || "unknown").replace(/[^a-z_-]/g, "");
@@ -5066,12 +5067,21 @@ function updateBenchmarkRepoField() {
   const select = $("benchmark-start-adapter");
   const repo = $("benchmark-start-repo");
   if (!select || !repo) return;
+  const capability = benchmarkCapabilities[select.value] || null;
   const tsec = select.value === "tsecbench";
   repo.disabled = tsec;
   repo.required = !tsec;
   repo.placeholder = tsec
     ? "Not used for TSECBench (platform API + VPN)"
     : "~/.code_auditor/benchmarks/CTFTiny or an allowed root";
+  const requirements = $("benchmark-start-requirements");
+  if (requirements) {
+    requirements.textContent = capability
+      ? `${capability.available ? "Supported" : "Unavailable"} on ${capability.platform}. ${capability.reason}`
+      : "";
+  }
+  const start = $("btn-benchmark-start");
+  if (start && capability) start.disabled = !capability.available;
 }
 
 async function loadBenchmarkAdapters() {
@@ -5082,11 +5092,16 @@ async function loadBenchmarkAdapters() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const current = select.value;
+    benchmarkCapabilities = data.capabilities || {};
     select.innerHTML = "";
     for (const name of data.adapters || []) {
       const option = document.createElement("option");
       option.value = name;
-      option.textContent = name;
+      const capability = benchmarkCapabilities[name];
+      option.textContent = capability && !capability.available
+        ? `${name} — unavailable on ${capability.platform}`
+        : name;
+      option.disabled = Boolean(capability && !capability.available);
       select.appendChild(option);
     }
     if ([...select.options].some((option) => option.value === current)) {
@@ -5109,6 +5124,11 @@ $("benchmark-start-form")?.addEventListener("submit", async (event) => {
   const button = $("btn-benchmark-start");
   if (!benchmark) {
     message.textContent = "Select a benchmark adapter.";
+    return;
+  }
+  const capability = benchmarkCapabilities[benchmark];
+  if (capability && !capability.available) {
+    message.textContent = capability.reason;
     return;
   }
   if (benchmark !== "tsecbench" && !repo) {

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -13,6 +14,10 @@ from pathlib import Path
 import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts/sandbox"
+
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="gVisor setup targets Linux hosts"
+)
 
 
 def load_script(name):

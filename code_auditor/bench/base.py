@@ -9,11 +9,133 @@ adapter never decides success itself; it only translates.
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, Protocol, runtime_checkable
+
+from ..runtime_capabilities import current_platform_name
 
 Scenario = Literal["repo", "remote-target", "container", "workspace"]
 SubmissionKind = Literal["flag", "patch", "poc", "report"]
+PlatformName = Literal["linux", "macos", "windows"]
+
+
+@dataclass(frozen=True)
+class BenchmarkPlatformPrerequisites:
+    """Static platform and command requirements for one benchmark adapter."""
+
+    supported_platforms: tuple[PlatformName, ...]
+    required_commands: tuple[str, ...] = ()
+    optional_commands: tuple[str, ...] = ()
+    notes: str = ""
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "supported_platforms": list(self.supported_platforms),
+            "required_commands": list(self.required_commands),
+            "optional_commands": list(self.optional_commands),
+            "notes": self.notes,
+        }
+
+
+@dataclass(frozen=True)
+class BenchmarkPlatformCapability:
+    benchmark: str
+    platform: str
+    available: bool
+    reason: str
+    prerequisites: BenchmarkPlatformPrerequisites
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "benchmark": self.benchmark,
+            "platform": self.platform,
+            "available": self.available,
+            "reason": self.reason,
+            **self.prerequisites.public(),
+        }
+
+
+_BENCHMARK_PLATFORM_PREREQUISITES = {
+    "tsecbench": BenchmarkPlatformPrerequisites(
+        supported_platforms=("linux", "macos", "windows"),
+        notes=(
+            "Requires network access to the TSecBench API and a working VPN. "
+            "No local Docker or bash installation is required."
+        ),
+    ),
+    "ctftiny": BenchmarkPlatformPrerequisites(
+        supported_platforms=("linux", "macos", "windows"),
+        optional_commands=("docker",),
+        notes=(
+            "File-only challenges need no container runtime. Challenges marked "
+            "compose require Docker Compose; native Windows should use Docker "
+            "Desktop with Linux containers."
+        ),
+    ),
+    "cybench": BenchmarkPlatformPrerequisites(
+        supported_platforms=("linux", "macos"),
+        required_commands=("bash",),
+        optional_commands=("docker",),
+        notes=(
+            "CyBench executes dataset bash scripts. Docker-network tasks also "
+            "require Docker. Native Windows must run CodeAuditor in WSL2/Linux."
+        ),
+    ),
+}
+
+
+def benchmark_platform_prerequisites(
+    name: str,
+) -> BenchmarkPlatformPrerequisites:
+    try:
+        return _BENCHMARK_PLATFORM_PREREQUISITES[name.strip().lower()]
+    except KeyError:
+        raise KeyError(f"No platform prerequisites registered for {name!r}.") from None
+
+
+def benchmark_platform_capability(
+    name: str,
+    *,
+    platform_name: str | None = None,
+    command_exists: Callable[[str], str | None] = shutil.which,
+) -> BenchmarkPlatformCapability:
+    """Report whether a benchmark adapter can run on the current platform."""
+    key = name.strip().lower()
+    prerequisites = benchmark_platform_prerequisites(key)
+    platform = platform_name or current_platform_name()
+    if platform not in prerequisites.supported_platforms:
+        return BenchmarkPlatformCapability(
+            benchmark=key,
+            platform=platform,
+            available=False,
+            reason=(
+                f"{key} does not support {platform}; supported platforms: "
+                f"{', '.join(prerequisites.supported_platforms)}. "
+                f"{prerequisites.notes}"
+            ).strip(),
+            prerequisites=prerequisites,
+        )
+    missing = [
+        command
+        for command in prerequisites.required_commands
+        if command_exists(command) is None
+    ]
+    if missing:
+        return BenchmarkPlatformCapability(
+            benchmark=key,
+            platform=platform,
+            available=False,
+            reason=f"{key} requires missing command(s): {', '.join(missing)}.",
+            prerequisites=prerequisites,
+        )
+    return BenchmarkPlatformCapability(
+        benchmark=key,
+        platform=platform,
+        available=True,
+        reason=prerequisites.notes or "Platform prerequisites are satisfied.",
+        prerequisites=prerequisites,
+    )
 
 
 @dataclass(frozen=True)

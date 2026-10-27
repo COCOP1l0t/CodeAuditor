@@ -22,9 +22,24 @@ def test_windows_enables_only_local_worktree() -> None:
 def test_posix_keeps_stage56_modes_available() -> None:
     for mode in ("docker-networked", "docker-isolated", "local-worktree"):
         capability = stage56_execution_capability(
-            mode, "docker-default", platform_name="posix"
+            mode, "docker-default", platform_name="linux"
         )
         assert capability.available is True
+
+
+def test_macos_blocks_docker_but_keeps_local_worktree() -> None:
+    for mode in ("docker-networked", "docker-isolated"):
+        capability = stage56_execution_capability(
+            mode, "docker-default", platform_name="darwin"
+        )
+        assert capability.available is False
+        assert "Linux VM/container" in capability.reason
+
+    local = stage56_execution_capability(
+        "local-worktree", "docker-default", platform_name="macos"
+    )
+    assert local.available is True
+    assert "macOS worktree" in local.reason
 
 
 def test_windows_docker_requirement_raises_actionable_error() -> None:

@@ -41,7 +41,12 @@ from ..db import (
     RUN_RUNNING,
     AuditStore,
 )
-from ..bench import BenchRunner, create as create_benchmark_adapter, registered as registered_benchmarks
+from ..bench import (
+    BenchRunner,
+    benchmark_platform_capability,
+    create as create_benchmark_adapter,
+    registered as registered_benchmarks,
+)
 from ..logger import configure_logging, get_logger
 from ..repos import RepoError, list_cloned_repos, validate_remote_repo_url
 from ..retention import RetentionError, export_retained_artifacts
@@ -2056,7 +2061,14 @@ def create_app(
 
     @app.get("/api/bench/adapters")
     def list_benchmark_adapters() -> dict:
-        return {"adapters": registered_benchmarks()}
+        adapters = registered_benchmarks()
+        return {
+            "adapters": adapters,
+            "capabilities": {
+                name: benchmark_platform_capability(name).public()
+                for name in adapters
+            },
+        }
 
     @app.post("/api/bench/runs", status_code=202)
     async def start_benchmark_run(request: BenchStartRequest) -> dict:
@@ -2066,6 +2078,9 @@ def create_app(
                 status_code=400,
                 detail=f"Unknown benchmark adapter: {request.benchmark}",
             )
+        platform_capability = benchmark_platform_capability(benchmark)
+        if not platform_capability.available:
+            raise HTTPException(status_code=400, detail=platform_capability.reason)
         if benchmark in app.state.bench_task_meta.values():
             raise HTTPException(
                 status_code=409,

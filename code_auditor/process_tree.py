@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
 import time
 from contextvars import ContextVar
+from typing import Any
+
+import psutil
 
 AUDIT_PROCESS_MARKER_ENV = "CODE_AUDITOR_AUDIT_RUN_ID"
 CURRENT_AUDIT_PROCESS_MARKER: ContextVar[str | None] = ContextVar(
     "current_audit_process_marker",
     default=None,
 )
-PROC_ROOT = "/proc"
+
+_PROCESS_ACCESS_ERRORS = (psutil.Error, OSError)
 
 
 def current_audit_subprocess_env(
@@ -24,67 +29,118 @@ def current_audit_subprocess_env(
     return environment
 
 
-def _process_has_marker(pid: int, marker: str) -> bool:
-    expected = f"{AUDIT_PROCESS_MARKER_ENV}={marker}".encode()
+def _environment_has_marker(
+    environment: dict[str, str], marker: str, env_var: str
+) -> bool:
+    wanted = f"{env_var}={marker}"
+    return any(
+        f"{key}={value}" == wanted
+        for key, value in environment.items()
+    )
+
+
+def _process_has_marker(
+    process: psutil.Process, marker: str, env_var: str
+) -> bool:
     try:
-        with open(os.path.join(PROC_ROOT, str(pid), "environ"), "rb") as stream:
-            return expected in stream.read().split(b"\0")
-    except OSError:
+        return _environment_has_marker(process.environ(), marker, env_var)
+    except _PROCESS_ACCESS_ERRORS:
         return False
 
 
-def _read_process(pid: int) -> dict | None:
-    proc_dir = os.path.join(PROC_ROOT, str(pid))
+def process_has_marker(
+    pid: int,
+    marker: str,
+    env_var: str = AUDIT_PROCESS_MARKER_ENV,
+) -> bool:
+    """Return whether a live process has the exact marker in its environment."""
+    if pid == os.getpid():
+        return False
     try:
-        with open(os.path.join(proc_dir, "stat"), encoding="utf-8") as stream:
-            stat = stream.read()
-        closing_paren = stat.rfind(")")
-        if closing_paren < 0:
-            return None
-        fields = stat[closing_paren + 2 :].split()
-        state = fields[0]
-        ppid = int(fields[1])
-        with open(os.path.join(proc_dir, "comm"), encoding="utf-8") as stream:
-            name = stream.read().rstrip("\n")
-        with open(os.path.join(proc_dir, "cmdline"), "rb") as stream:
-            argv = [
-                part.decode("utf-8", errors="replace")
-                for part in stream.read().split(b"\0")
-                if part
-            ]
-    except (OSError, ValueError, IndexError):
+        process = psutil.Process(pid)
+    except _PROCESS_ACCESS_ERRORS:
+        return False
+    return _process_has_marker(process, marker, env_var)
+
+
+def marked_process_ids(
+    marker: str,
+    env_var: str = AUDIT_PROCESS_MARKER_ENV,
+) -> list[int]:
+    """Return same-user processes carrying an exact environment marker."""
+    pids: list[int] = []
+    for process in psutil.process_iter():
+        try:
+            pid = int(process.pid)
+        except _PROCESS_ACCESS_ERRORS:
+            continue
+        if pid == os.getpid():
+            continue
+        if _process_has_marker(process, marker, env_var):
+            pids.append(pid)
+    return sorted(pids)
+
+
+def _status_character(status: str) -> str:
+    return {
+        psutil.STATUS_RUNNING: "R",
+        psutil.STATUS_SLEEPING: "S",
+        psutil.STATUS_DISK_SLEEP: "D",
+        psutil.STATUS_STOPPED: "T",
+        psutil.STATUS_ZOMBIE: "Z",
+    }.get(status, (status[:1] or "?").upper())
+
+
+def _format_command(argv: list[str], name: str, pid: int) -> str:
+    if not argv:
+        return f"[{name or pid}]"
+    if os.name == "nt":
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
+
+
+def _read_process(process: psutil.Process) -> dict[str, Any] | None:
+    try:
+        pid = int(process.pid)
+        ppid = int(process.ppid())
+        name = process.name()
+        argv = list(process.cmdline())
+        status = process.status()
+    except _PROCESS_ACCESS_ERRORS:
         return None
 
     return {
         "pid": pid,
         "ppid": ppid,
         "name": name or str(pid),
-        "state": state,
-        "command": shlex.join(argv) if argv else f"[{name or pid}]",
+        "state": _status_character(status),
+        "command": _format_command(argv, name, pid),
         "children": [],
     }
 
 
-def snapshot_process_tree(marker: str) -> dict:
-    """Return the live process forest carrying one Audit Run marker."""
-    try:
-        entries = os.scandir(PROC_ROOT)
-    except OSError:
-        return {"sampled_at": time.time(), "total": 0, "roots": []}
+def snapshot_process_tree(marker: str) -> dict[str, Any]:
+    """Return the live process forest carrying one Audit Run marker.
 
-    nodes: dict[int, dict] = {}
-    with entries:
-        for entry in entries:
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if not _process_has_marker(pid, marker):
-                continue
-            process = _read_process(pid)
-            if process is not None:
-                nodes[pid] = process
+    ``psutil`` provides a common implementation across Linux, macOS, and
+    Windows. Access-denied and short-lived processes are skipped rather than
+    failing the whole Web status request.
+    """
+    nodes: dict[int, dict[str, Any]] = {}
+    for process in psutil.process_iter():
+        try:
+            pid = int(process.pid)
+        except _PROCESS_ACCESS_ERRORS:
+            continue
+        if pid == os.getpid() or not _process_has_marker(
+            process, marker, AUDIT_PROCESS_MARKER_ENV
+        ):
+            continue
+        node = _read_process(process)
+        if node is not None:
+            nodes[pid] = node
 
-    roots: list[dict] = []
+    roots: list[dict[str, Any]] = []
     for pid in sorted(nodes):
         node = nodes[pid]
         parent = nodes.get(node["ppid"])
@@ -93,7 +149,7 @@ def snapshot_process_tree(marker: str) -> dict:
         else:
             parent["children"].append(node)
 
-    def sort_children(node: dict) -> None:
+    def sort_children(node: dict[str, Any]) -> None:
         node["children"].sort(key=lambda child: child["pid"])
         for child in node["children"]:
             sort_children(child)

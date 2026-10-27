@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,10 @@ from code_auditor.sandbox import (
     inspect_docker_sandbox_environment,
 )
 from code_auditor.config import AuditConfig
+
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Docker sandbox paths target Linux"
+)
 
 
 def _option_value(command: list[str], option: str) -> str:

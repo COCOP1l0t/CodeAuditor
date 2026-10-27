@@ -697,7 +697,7 @@ def test_sandbox_ensure_backend_rebuilds_metadata_and_rolls_back_on_failure(
     assert scratch.backend == "claude"
 
 
-@pytest.mark.skipif(not os.path.isdir("/proc"), reason="requires Linux procfs")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX detached process-group cleanup")
 def test_run_agent_cleans_detached_descendant_after_completion(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -752,12 +752,13 @@ def test_run_agent_cleans_detached_descendant_after_completion(
             assert child_pid is not None
             assert child_marker is not None
             assert not agent._process_has_agent_marker(child_pid, child_marker)
-            try:
-                state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
-            except FileNotFoundError:
-                pass
-            else:
-                assert state == "Z"
+            if os.path.isdir("/proc"):
+                try:
+                    state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
+                except FileNotFoundError:
+                    pass
+                else:
+                    assert state == "Z"
         finally:
             if (
                 child_pid is not None

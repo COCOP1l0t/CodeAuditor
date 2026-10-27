@@ -11,12 +11,17 @@ from __future__ import annotations
 from .adapters import CTFTinyAdapter, CyBenchAdapter, TSecBenchAdapter
 from .base import (
     BenchAdapter,
+    BenchmarkPlatformCapability,
+    BenchmarkPlatformPrerequisites,
     BenchTask,
     InstanceSpec,
     Outcome,
+    PlatformName,
     Scenario,
     Submission,
     SubmissionKind,
+    benchmark_platform_capability,
+    benchmark_platform_prerequisites,
 )
 from .registry import create, register, registered
 from .runner import (
@@ -29,6 +34,8 @@ from .runner import (
 
 __all__ = [
     "BenchAdapter",
+    "BenchmarkPlatformCapability",
+    "BenchmarkPlatformPrerequisites",
     "BenchResult",
     "BenchRun",
     "BenchRunner",
@@ -36,9 +43,12 @@ __all__ = [
     "BenchTask",
     "InstanceSpec",
     "Outcome",
+    "PlatformName",
     "Scenario",
     "Submission",
     "SubmissionKind",
+    "benchmark_platform_capability",
+    "benchmark_platform_prerequisites",
     "CTFTinyAdapter",
     "CyBenchAdapter",
     "TSecBenchAdapter",

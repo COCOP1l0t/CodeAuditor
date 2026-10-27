@@ -381,10 +381,12 @@ def test_reopening_a_document_appends_a_repair_attempt(tmp_path: Path) -> None:
     assert validate_trajectory(document) == []
 
 
-def test_invalid_documents_are_written_as_invalid_instead_of_published() -> None:
+def test_invalid_documents_are_written_as_invalid_instead_of_published(
+    tmp_path: Path,
+) -> None:
     recorder = TrajectoryRecorder(agent_name="")
     recorder.finish()
-    path = Path("/tmp") / "code-auditor-invalid-trajectory.json"
+    path = tmp_path / "code-auditor-invalid-trajectory.json"
     written = recorder.write(path)
     try:
         assert written.name.endswith(".invalid.json")

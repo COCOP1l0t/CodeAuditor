@@ -2282,8 +2282,13 @@ def test_poc_terminal_websocket_starts_in_managed_stage5_directory(tmp_path) -> 
         ready = websocket.receive_json()
         assert ready["type"] == "ready"
         assert ready["cwd"] == str(Path(out) / "stage5-pocs" / "H-01")
+        command = (
+            "echo __POC_TERMINAL_OK__\r\nexit\r\n"
+            if os.name == "nt"
+            else "printf '__POC_TERMINAL_OK__\\n'; exit\n"
+        )
         websocket.send_json(
-            {"type": "input", "data": "printf '__POC_TERMINAL_OK__\\n'; exit\n"}
+            {"type": "input", "data": command}
         )
         for _ in range(30):
             message = websocket.receive()
@@ -2343,8 +2348,13 @@ def test_slop_disclosure_terminal_starts_from_registered_stage5_artifact(
         assert ready["type"] == "ready"
         assert ready["vuln_id"] == "H-01"
         assert ready["cwd"] == str(out / "stage5-pocs" / "H-01")
+        command = (
+            "echo __SLOP_TERMINAL_OK__\r\nexit\r\n"
+            if os.name == "nt"
+            else "printf '__SLOP_TERMINAL_OK__\\n'; exit\n"
+        )
         websocket.send_json(
-            {"type": "input", "data": "printf '__SLOP_TERMINAL_OK__\\n'; exit\n"}
+            {"type": "input", "data": command}
         )
         for _ in range(30):
             message = websocket.receive()
@@ -4060,6 +4070,13 @@ def test_api_benchmark_runs_results_and_agent_log(tmp_path) -> None:
 
     adapters = client.get("/api/bench/adapters").json()["adapters"]
     assert {"tsecbench", "ctftiny", "cybench"} <= set(adapters)
+    capabilities = client.get("/api/bench/adapters").json()["capabilities"]
+    assert capabilities["tsecbench"]["supported_platforms"] == [
+        "linux",
+        "macos",
+        "windows",
+    ]
+    assert capabilities["cybench"]["required_commands"] == ["bash"]
 
     html = client.get("/").text
     assert 'data-route="benchmarks"' in html
@@ -4220,3 +4237,25 @@ def test_api_cancel_benchmark_run(tmp_path, monkeypatch) -> None:
         )
         app.state.store.finish_bench_run(done_id, status=RUN_DONE)
         assert client.post(f"/api/bench/runs/{done_id}/cancel").status_code == 409
+
+
+def test_api_rejects_benchmark_when_platform_is_unsupported(tmp_path, monkeypatch) -> None:
+    app = _make_app(tmp_path)
+    monkeypatch.setattr(server_module, "registered_benchmarks", lambda: ["cybench"])
+    monkeypatch.setattr(
+        server_module,
+        "benchmark_platform_capability",
+        lambda _name: SimpleNamespace(
+            available=False,
+            reason="CyBench requires WSL2/Linux on native Windows.",
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/bench/runs",
+            json={"benchmark": "cybench", "repo_dir": str(tmp_path)},
+        )
+
+    assert response.status_code == 400
+    assert "WSL2/Linux" in response.json()["detail"]

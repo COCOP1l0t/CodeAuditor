@@ -22,6 +22,7 @@ from uuid import uuid4
 from .config import AuditConfig, AgentBackend, SandboxRuntime, SANDBOX_RUNTIMES
 from .logger import get_logger
 from .process_tree import current_audit_subprocess_env
+from .runtime_capabilities import require_stage56_execution
 from .sandbox_records import (
     create_execution_directory, read_execution_records, write_execution_record,
 )
@@ -253,6 +254,7 @@ class DockerScratch:
     """One disposable source/build/output tree backed by a Docker write boundary."""
 
     def __init__(self, config: AuditConfig, task_name: str) -> None:
+        require_stage56_execution("docker-networked", config.sandbox_runtime)
         self.image = config.sandbox_image
         self.docker_bin = config.sandbox_docker_bin
         self.root_parent = _require_tmp_root(config.sandbox_root)

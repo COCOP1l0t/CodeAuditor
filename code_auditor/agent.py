@@ -21,7 +21,12 @@ from .config import AuditConfig, ValidationIssue, resolve_agent_model
 from .secure_fs import SecureFSError, harden_private_file, require_regular_file
 from .logger import get_logger
 from .process_supervisor import ProcessJob
-from .process_tree import AUDIT_PROCESS_MARKER_ENV, CURRENT_AUDIT_PROCESS_MARKER
+from .process_tree import (
+    AUDIT_PROCESS_MARKER_ENV,
+    CURRENT_AUDIT_PROCESS_MARKER,
+    marked_process_ids,
+    process_has_marker,
+)
 from .trajectory import (
     BLOBS_DIRNAME,
     TrajectoryRecorder,
@@ -48,8 +53,6 @@ AGENT_NOISY_SYSTEM_EVENTS = {
 AGENT_PROCESS_MARKER_ENV = "CODE_AUDITOR_AGENT_RUN_ID"
 AGENT_PROCESS_TERM_TIMEOUT_SECONDS = 1.0
 AGENT_PROCESS_KILL_TIMEOUT_SECONDS = 1.0
-PROC_ROOT = "/proc"
-
 logger = get_logger("agent")
 
 # Errors that retrying cannot fix (quota/credit exhaustion, auth failures).
@@ -204,35 +207,12 @@ class _AgentRunControl:
 
 def _process_has_agent_marker(pid: int, process_marker: str) -> bool:
     """Return whether a live process inherited this exact agent-run marker."""
-    if pid == os.getpid():
-        return False
-    expected = f"{AGENT_PROCESS_MARKER_ENV}={process_marker}".encode()
-    try:
-        with open(os.path.join(PROC_ROOT, str(pid), "environ"), "rb") as proc_env:
-            return expected in proc_env.read().split(b"\0")
-    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
-        return False
+    return process_has_marker(pid, process_marker, AGENT_PROCESS_MARKER_ENV)
 
 
 def _marked_agent_process_ids(process_marker: str) -> list[int]:
     """Find same-user descendants even after they have been reparented."""
-    try:
-        entries = os.scandir(PROC_ROOT)
-    except OSError:
-        logger.warning(
-            "Cannot scan %s; detached agent process cleanup is unavailable.",
-            PROC_ROOT,
-        )
-        return []
-
-    with entries:
-        pids = [
-            int(entry.name)
-            for entry in entries
-            if entry.name.isdigit()
-            and _process_has_agent_marker(int(entry.name), process_marker)
-        ]
-    return sorted(pids)
+    return marked_process_ids(process_marker, AGENT_PROCESS_MARKER_ENV)
 
 
 def _signal_marked_agent_processes(

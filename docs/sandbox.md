@@ -4,6 +4,8 @@ CodeAuditor 的 Stage 5/6 支持 Docker 沙箱，可以选择 `docker-default`�
 
 本教程针对 **CodeAuditor 与 Docker daemon 位于同一台 Linux 主机、使用系统级 Docker Engine** 的部署。Docker 安装脚本支持 Ubuntu 22.04、24.04、26.04 的 amd64/arm64；其他发行版按 [Docker 官方安装入口](https://docs.docker.com/engine/install/)操作。当前 gVisor 要求 Linux 5.6+，支持 x86_64 和 ARM64，参见[官方安装说明](https://gvisor.dev/docs/user_guide/install/)。Docker Desktop、远程 daemon 和 rootless 组合尚未经过本项目验证。
 
+原生 macOS 和原生 Windows 不支持 Docker Stage 5/6 路径：前者无法把宿主 Agent 二进制挂载到 Linux 容器中执行，后者还缺少 Linux UID/GID 与进程组语义。两者应选择 **Local worktree**；需要 Docker 隔离时请运行在 Linux VM、Linux 主机或 WSL2/Linux 中。
+
 ## 配套脚本
 
 以下命令都在仓库根目录运行。Python 脚本使用 **Python 3.12+**；`sandboxctl.py` 使用 `uv sync` 创建的项目环境。

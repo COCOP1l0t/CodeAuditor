@@ -14,6 +14,7 @@ from code_auditor.secret_cipher import (
     SecretCipher,
     SecretCipherError,
 )
+from code_auditor.secure_fs import private_file_is_secure
 
 
 def test_secret_cipher_round_trip_and_key_file_permissions(tmp_path: Path) -> None:
@@ -27,7 +28,10 @@ def test_secret_cipher_round_trip_and_key_file_permissions(tmp_path: Path) -> No
     assert cipher.decrypt(token) == "super-secret"
     assert cipher.encrypt("") == ""
     assert cipher.decrypt("") == ""
-    assert os.stat(key_path).st_mode & 0o777 == 0o600
+    if os.name == "nt":
+        assert private_file_is_secure(key_path)
+    else:
+        assert os.stat(key_path).st_mode & 0o777 == 0o600
 
 
 def test_secret_cipher_rejects_a_symlinked_key_path(tmp_path: Path) -> None:

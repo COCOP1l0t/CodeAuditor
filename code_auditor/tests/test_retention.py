@@ -13,6 +13,7 @@ from code_auditor.retention import (
     load_retain_manifest,
     secure_generated_manifest_mode,
 )
+from code_auditor.secure_fs import private_file_is_secure
 
 
 def _write_retained_tree(root: Path) -> None:
@@ -133,7 +134,10 @@ def test_secure_generated_manifest_mode_tightens_regular_file(tmp_path: Path) ->
     manifest_path.chmod(0o644)
 
     assert secure_generated_manifest_mode(source) is True
-    assert manifest_path.stat().st_mode & 0o777 == 0o600
+    if os.name == "nt":
+        assert private_file_is_secure(manifest_path)
+    else:
+        assert manifest_path.stat().st_mode & 0o777 == 0o600
     assert load_retain_manifest(source).entrypoint == "reproduce.sh"
 
 

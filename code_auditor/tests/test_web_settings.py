@@ -12,6 +12,14 @@ from code_auditor.web.settings import (
     load_web_settings,
     update_agent_settings,
 )
+from code_auditor.secure_fs import private_file_is_secure
+
+
+def _assert_private_config(path: Path) -> None:
+    if os.name == "nt":
+        assert private_file_is_secure(path)
+    else:
+        assert os.stat(path).st_mode & 0o777 == 0o600
 
 
 def test_load_web_settings_creates_secure_debug_defaults(tmp_path: Path) -> None:
@@ -30,8 +38,9 @@ def test_load_web_settings_creates_secure_debug_defaults(tmp_path: Path) -> None
     assert settings.wikis_dir == str(state_dir / "wiki")
     assert settings.claude_provider.mode == "local"
     assert settings.codex_provider.mode == "local"
-    assert os.stat(state_dir).st_mode & 0o777 == 0o700
-    assert os.stat(config_path).st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert os.stat(state_dir).st_mode & 0o777 == 0o700
+    _assert_private_config(config_path)
 
 
 def test_load_web_settings_reads_valid_server_configuration(tmp_path: Path) -> None:
@@ -51,7 +60,7 @@ def test_load_web_settings_reads_valid_server_configuration(tmp_path: Path) -> N
     assert settings.backend == "codex"
     assert settings.log_level == "DEBUG"
     assert settings.max_parallel == 4
-    assert os.stat(config_path).st_mode & 0o777 == 0o600
+    _assert_private_config(config_path)
 
 
 def test_load_web_settings_removes_legacy_managed_paths(tmp_path: Path) -> None:
@@ -135,7 +144,7 @@ def test_load_web_settings_renames_legacy_web_config(tmp_path: Path) -> None:
     assert settings.config_path == str(settings_path)
     assert settings_path.is_file()
     assert not legacy_path.exists()
-    assert os.stat(settings_path).st_mode & 0o777 == 0o600
+    _assert_private_config(settings_path)
 
 
 def test_update_agent_settings_keeps_credentials_out_of_settings_json(
@@ -167,7 +176,7 @@ def test_update_agent_settings_keeps_credentials_out_of_settings_json(
     stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
     assert "providers" not in stored
     assert "secret-token" not in json.dumps(stored)
-    assert os.stat(tmp_path / "settings.json").st_mode & 0o777 == 0o600
+    _assert_private_config(tmp_path / "settings.json")
 
     preserved = update_agent_settings(
         updated,

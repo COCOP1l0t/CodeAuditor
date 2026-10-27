@@ -13,6 +13,7 @@ dependencies = [
     "cryptography>=42",
     "rich>=13.0",
     "fastapi>=0.110",
+    "psutil>=6.0",
     "uvicorn>=0.29",
     "websockets>=14",
     "pywinpty>=2.0; sys_platform == 'win32'",

@@ -6,6 +6,18 @@
 open_task -> run_agent -> extract_flag -> adapter.grade -> adapter.close
 ```
 
+## 平台前置条件
+
+| Benchmark | Linux | macOS | 原生 Windows | 额外依赖 |
+|---|---|---|---|---|
+| TSECBench | 支持 | 支持 | 支持 | 可访问平台 API 的网络/VPN，以及 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN`；不要求本地 Docker/bash |
+| CTFTiny | 支持 | 支持 | 支持 | 纯文件题无额外依赖；`compose: true` 的题需要 Docker Compose，Windows 应使用 Docker Desktop 的 Linux container backend |
+| CyBench | 支持 | 支持 | 不支持，需使用 WSL2/Linux | 必须能执行 `bash`；启动 Docker 服务的任务还需要 Docker |
+
+Web 的 `GET /api/bench/adapters` 同时返回 `capabilities`，其中包含当前平台、
+`available`、支持平台列表、必需/可选命令和说明。原生 Windows 上的 CyBench 会在
+启动前返回 400，而不是等到执行数据集脚本时才失败。
+
 ## 用法
 
 ```python

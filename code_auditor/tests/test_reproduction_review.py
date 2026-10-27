@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,7 @@ def test_persist_draft_rejects_symlinks_and_oversized_files(tmp_path: Path) -> N
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not use POSIX execute bits")
 def test_persist_draft_preserves_owner_execute_bit(tmp_path: Path) -> None:
     # The retain manifest rejects a persisted draft whose reproduce.sh lost its
     # owner-execute bit, so the copy must carry the source mode across.

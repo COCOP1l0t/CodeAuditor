@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,6 +14,10 @@ from code_auditor.config import AuditConfig
 from code_auditor.sandbox_records import (
     create_execution_directory, list_sandbox_executions,
     read_execution_records, write_execution_record,
+)
+
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Docker sandbox paths target Linux"
 )
 
 IMAGE_ID = "sha256:" + "a" * 64

@@ -76,7 +76,7 @@ MAX_MESSAGE_BYTES = 256 * 1024
 DEFAULT_AGENT_NAME = "code-auditor"
 _TRUNCATION_NOTICE = "\n…[truncated by CodeAuditor]"
 
-# Credentials and benchmark secrets that must never reach a trajectory file.
+# Credentials and tokens that must never reach a trajectory file.
 _REDACTION_PATTERNS = (
     re.compile(
         r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]+?"

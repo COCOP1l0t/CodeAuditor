@@ -12,6 +12,7 @@ from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, select_poc_model
 from ..disclosures import build_dedupe_key, display_list, single_line
+from ..layout import checkpoint_key, stage4_paths, stage6_paths
 from ..logger import get_logger
 from ..poc_artifacts import stage5_vuln_id
 from ..prompts import load_prompt
@@ -23,6 +24,7 @@ from ..reproduction_status import (
 )
 from ..retention import export_retained_artifacts, secure_generated_manifest_mode
 from ..sandbox import DockerScratch, docker_scratch
+from ..stage_runtime import finalize_checkpoint
 from ..utils import collect_parallel_results, extract_json_object, run_parallel_limited
 from ..validation.stage6 import _report_sections, validate_stage6_disclosure
 from ..wiki import build_wiki_context
@@ -46,7 +48,7 @@ class _DisclosureCandidate:
 
 
 def _task_key(vuln_id: str) -> str:
-    return f"stage6:{vuln_id}"
+    return checkpoint_key(6, vuln_id)
 
 
 def _vuln_id_from_report(report_path: str) -> str | None:
@@ -62,7 +64,9 @@ def _vuln_id_from_report(report_path: str) -> str | None:
 
 def _find_finding_file(vuln_id: str, output_dir: str) -> str | None:
     """Locate the stage 4 evaluated finding JSON for a vulnerability ID."""
-    path = os.path.join(output_dir, "stage4-vulnerabilities", f"{vuln_id}.json")
+    path = os.path.join(
+        stage4_paths(output_dir)["directory"], f"{vuln_id}.json"
+    )
     return path if os.path.exists(path) else None
 
 
@@ -296,8 +300,7 @@ async def _filter_semantic_duplicates(
             )
 
             log_file = os.path.join(
-                config.output_dir,
-                "stage6-disclosures",
+                stage6_paths(config.output_dir)["directory"],
                 ".dedupe-logs",
                 f"{candidate.vuln_id or 'unknown'}.log",
             )
@@ -436,7 +439,7 @@ async def _run_disclosure(
 
     key = _task_key(vuln_id)
     persistent_stage6_vuln_dir = os.path.join(
-        config.output_dir, "stage6-disclosures", vuln_id
+        stage6_paths(config.output_dir)["directory"], vuln_id
     )
     persistent_disclosure_dir = os.path.join(persistent_stage6_vuln_dir, "disclosure")
     persistent_disclosure_report = os.path.join(persistent_disclosure_dir, "report.md")
@@ -480,7 +483,7 @@ async def _run_disclosure(
                 finding_file = str(sandbox.copy_input(finding_file, "finding.json"))
 
         stage6_vuln_dir = os.path.join(
-            work_config.output_dir, "stage6-disclosures", vuln_id
+            stage6_paths(work_config.output_dir)["directory"], vuln_id
         )
         disclosure_dir = os.path.join(stage6_vuln_dir, "disclosure")
         disclosure_report = os.path.join(disclosure_dir, "report.md")
@@ -558,7 +561,7 @@ async def _run_disclosure(
                     f"Stage 6: Invalid retained artifacts for {vuln_id}: "
                     + "; ".join(issue.description for issue in issues)
                 )
-    checkpoint.mark_complete(key)
+    finalize_checkpoint(checkpoint, key, valid=True)
     has_report = os.path.exists(disclosure_report)
     logger.info("Stage 6: %s complete (report=%s)", vuln_id, has_report)
     return disclosure_report if has_report else None

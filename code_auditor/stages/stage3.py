@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 from contextlib import suppress
@@ -8,8 +7,10 @@ from contextlib import suppress
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AnalysisUnit, AuditConfig
+from ..layout import checkpoint_key, stage3_paths
 from ..logger import get_logger
 from ..prompts import load_prompt
+from ..stage_runtime import finalize_checkpoint, repair_until_valid
 from ..utils import (
     collect_parallel_results,
     format_validation_issues,
@@ -23,7 +24,7 @@ logger = get_logger("stage3")
 
 
 def _task_key(unit: AnalysisUnit) -> str:
-    return f"stage3:{unit.id}"
+    return checkpoint_key(3, unit.id)
 
 
 async def _run_unit(
@@ -36,8 +37,9 @@ async def _run_unit(
     total_units: int = 0,
 ) -> list[str]:
     key = _task_key(unit)
-    result_dir = os.path.join(config.output_dir, "stage3-findings")
-    log_file = os.path.join(result_dir, "logs", f"{unit.id}.log")
+    paths = stage3_paths(config.output_dir)
+    result_dir = paths["directory"]
+    log_file = os.path.join(paths["logs"], f"{unit.id}.log")
     escaped_id = re.escape(unit.id)
     finding_pattern = re.compile(rf"^{escaped_id}-F-\d+\.json$")
     progress = f"[{unit_index}/{total_units}]" if total_units else ""
@@ -80,35 +82,41 @@ async def _run_unit(
     valid_finding_files: list[str] = []
     had_unresolved_validation = False
     for finding_file in finding_files:
-        issues = validate_stage3_file(finding_file)
-        if issues:
-            logger.warning("Stage 3: Validation failed for %s\n%s", finding_file, format_validation_issues(issues))
-            repair_prompt = (
-                f"The finding file at `{finding_file}` failed validation. "
-                f"Please fix all issues listed below:\n\n```\n{format_validation_issues(issues)}\n```"
+        async def repair(prompt: str) -> object:
+            return await run_agent(
+                prompt,
+                config,
+                cwd=config.target,
+                max_turns=10,
+                log_file=log_file,
             )
-            try:
-                await asyncio.wait_for(
-                    run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file),
-                    timeout=300,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Stage 3 %s: Repair timed out for %s.", progress, finding_file)
 
-            issues = validate_stage3_file(finding_file)
-            if issues:
-                logger.warning("Stage 3: Repair failed for %s\n%s", finding_file, format_validation_issues(issues))
-                with suppress(OSError):
-                    os.remove(finding_file)
-                had_unresolved_validation = True
-                continue
-
+        issues = await repair_until_valid(
+            validator=lambda path=finding_file: validate_stage3_file(path),
+            repair=repair,
+            repair_prompt=lambda current, path=finding_file: (
+                f"The finding file at `{path}` failed validation. "
+                "Please fix all issues listed below:\n\n"
+                f"```\n{format_validation_issues(current)}\n```"
+            ),
+            max_attempts=1,
+            timeout_seconds=300,
+        )
+        if issues:
+            logger.warning(
+                "Stage 3: Repair failed for %s\n%s",
+                finding_file,
+                format_validation_issues(issues),
+            )
+            with suppress(OSError):
+                os.remove(finding_file)
+            had_unresolved_validation = True
+            continue
         valid_finding_files.append(finding_file)
 
-    if had_unresolved_validation:
-        checkpoint.clear(key)
-    else:
-        checkpoint.mark_complete(key)
+    finalize_checkpoint(
+        checkpoint, key, valid=not had_unresolved_validation
+    )
     logger.info("Stage 3 %s: %s complete. Findings: %d", progress, unit.id, len(valid_finding_files))
     return valid_finding_files
 

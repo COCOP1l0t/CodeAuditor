@@ -8,6 +8,7 @@ import shutil
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, select_poc_model
+from ..layout import checkpoint_key, stage5_paths
 from ..logger import get_logger
 from ..poc_artifacts import (
     ASAN_REPORT_FILENAME,
@@ -23,6 +24,7 @@ from ..retention import (
     secure_generated_manifest_mode,
 )
 from ..sandbox import DockerScratch, docker_scratch
+from ..stage_runtime import finalize_checkpoint, repair_until_valid
 from ..utils import collect_parallel_results, format_validation_issues, run_parallel_limited
 from ..validation.stage5 import validate_stage5_trigger_graph
 from ..wiki import build_wiki_context
@@ -56,7 +58,7 @@ def _poc_agent_kwargs(
 
 
 def _task_key(vuln_id: str) -> str:
-    return f"stage5:{vuln_id}"
+    return checkpoint_key(5, vuln_id)
 
 
 def _is_fp_report(report_path: str | None) -> bool:
@@ -132,7 +134,9 @@ async def _run_reproduce(
         return None
 
     key = _task_key(vuln_id)
-    persistent_poc_dir = os.path.join(config.output_dir, "stage5-pocs", vuln_id)
+    persistent_poc_dir = os.path.join(
+        stage5_paths(config.output_dir)["directory"], vuln_id
+    )
 
     if checkpoint.is_complete(key):
         resolved = _resolve_reproduction_report(persistent_poc_dir)
@@ -199,7 +203,9 @@ async def _run_reproduce(
             )
 
         poc_target = work_config.poc_worktree or work_config.target
-        poc_dir = os.path.join(work_config.output_dir, "stage5-pocs", vuln_id)
+        poc_dir = os.path.join(
+            stage5_paths(work_config.output_dir)["directory"], vuln_id
+        )
         os.makedirs(poc_dir, exist_ok=True)
 
         prompt = load_prompt(
@@ -239,20 +245,25 @@ async def _run_reproduce(
                     vuln_id,
                     format_validation_issues(issues),
                 )
-                repair_prompt = (
-                    f"The Stage 5 trigger graph at `{graph_path}` is missing or invalid. "
-                    "Create or repair it using only the call path verified while running "
-                    "the PoC. Do not invent stack frames, parameter values, sanitizer "
-                    "output, or runtime evidence. Fix every issue below:\n\n"
-                    f"```\n{format_validation_issues(issues)}\n```"
+                issues = await repair_until_valid(
+                    validator=lambda: validate_stage5_trigger_graph(
+                        resolved_poc_dir, vuln_id
+                    ),
+                    repair=lambda current_prompt: run_agent(
+                        current_prompt,
+                        work_config,
+                        max_turns=15,
+                        **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
+                    ),
+                    repair_prompt=lambda current: (
+                        f"The Stage 5 trigger graph at `{graph_path}` is missing or invalid. "
+                        "Create or repair it using only the call path verified while running "
+                        "the PoC. Do not invent stack frames, parameter values, sanitizer "
+                        "output, or runtime evidence. Fix every issue below:\n\n"
+                        f"```\n{format_validation_issues(current)}\n```"
+                    ),
+                    max_attempts=1,
                 )
-                await run_agent(
-                    repair_prompt,
-                    work_config,
-                    max_turns=15,
-                    **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
-                )
-                issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
                 if issues:
                     logger.warning(
                         "Stage 5: Trigger graph remains unavailable for %s\n%s",
@@ -327,7 +338,7 @@ async def _run_reproduce(
         )
         return None
 
-    checkpoint.mark_complete(key)
+    finalize_checkpoint(checkpoint, key, valid=True)
     if _is_fp_report(resolved_report):
         logger.info("Stage 5: %s marked as false positive.", vuln_id)
         return None

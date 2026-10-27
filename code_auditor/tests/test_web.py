@@ -1353,6 +1353,15 @@ async def test_disclosure_reproduction_pins_latest_and_runs_review_in_isolated_t
     assert persisted["finished"]["outcome"] == "reproduced"
     assert persisted["finished"]["disposition"] == "still-vulnerable"
     assert persisted["removed"][0] == str(tmp_path)
+    trajectory_path = (
+        Path(job.config.output_dir) / "trajectories" / "trajectory.json"
+    )
+    assert trajectory_path.is_file()
+    trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    from code_auditor.trajectory import validate_trajectory
+
+    assert validate_trajectory(trajectory) == []
+    assert trajectory["extra"]["run_kind"] == "reproduction"
 
 
 async def test_latest_reproduction_fetches_remote_head_without_moving_checkout(
@@ -2031,7 +2040,7 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="s-backend"' in res.text
     assert 'id="s-mode"' in res.text
     assert "Active jobs switch on their next agent call" in res.text
-    assert res.text.count('class="table-shell') == 7
+    assert res.text.count('class="table-shell') == 5
     assert 'class="table-shell history-table-shell"' in res.text
     assert 'id="history-search"' in res.text
     assert 'id="history-status"' in res.text
@@ -3005,6 +3014,33 @@ def test_run_stage_summary_marks_partial_failed_run(tmp_path) -> None:
     assert stages[3]["items_done"] == 1
     assert stages[3]["items_total"] == 2
     assert stages[4]["status"] == "pending"
+
+
+def test_run_stage_summary_prefers_persisted_stage_state(tmp_path) -> None:
+    from code_auditor.stage_state import StageStateStore
+    from code_auditor.web.server import _run_stage_summary
+
+    out = tmp_path / "audit-output-state"
+    out.mkdir()
+    store = StageStateStore(str(out))
+    store.begin(2, "decomposing")
+    store.update(2, items_done=7, items_total=9, detail="seven units")
+    store.complete(2)
+
+    stages = {
+        item["stage"]: item
+        for item in _run_stage_summary(
+            {"output_dir": str(out), "status": "done"}
+        )
+    }
+
+    assert stages[2] == {
+        "stage": 2,
+        "status": "done",
+        "detail": "seven units",
+        "items_done": 7,
+        "items_total": 9,
+    }
 
 
 def test_api_history_import_and_detail(tmp_path) -> None:
@@ -4021,244 +4057,3 @@ def test_api_history_trajectory_marks_invalid_child_documents(tmp_path) -> None:
         "stage5-pocs/H-1/agent.invalid.json"
     ]
     assert body["children"][0]["valid"] is False
-
-
-def test_api_benchmark_runs_results_and_agent_log(tmp_path) -> None:
-    app = _make_app(tmp_path)
-    store = app.state.store
-    output_dir = tmp_path / "bench-run"
-    (output_dir / "C-1").mkdir(parents=True)
-    (output_dir / "C-1" / "agent.log").write_text(
-        "solving\n[REDACTED]\n", encoding="utf-8"
-    )
-    run_id = store.create_bench_run(
-        benchmark="tsecbench",
-        adapter="TSecBenchAdapter",
-        repo_dir="",
-        output_dir=str(output_dir),
-        backend="claude",
-        model="claude-test",
-        started_at=100.0,
-    )
-    store.record_bench_result(
-        run_id,
-        {
-            "instance_id": "C-1",
-            "benchmark": "tsecbench",
-            "status": "succeeded",
-            "success": True,
-            "score": 50.0,
-            "extracted": True,
-            "submitted_length": 12,
-            "detail": {"category": "pwn"},
-            "agent_log": "C-1/agent.log",
-            "duration_seconds": 3.0,
-        },
-    )
-    store.finish_bench_run(run_id, status=RUN_DONE, ended_at=110.0)
-    client = TestClient(app)
-
-    listing = client.get("/api/bench/runs")
-    assert listing.status_code == 200
-    body = listing.json()
-    assert body["total"] == 1
-    assert body["runs"][0]["id"] == run_id
-    assert body["runs"][0]["succeeded"] == 1
-    assert body["runs"][0]["status"] == RUN_DONE
-
-    detail = client.get(f"/api/bench/runs/{run_id}")
-    assert detail.status_code == 200
-    payload = detail.json()
-    assert payload["benchmark"] == "tsecbench"
-    assert payload["results"][0]["instance_id"] == "C-1"
-    assert payload["results"][0]["success"] is True
-    assert payload["results"][0]["detail"] == {"category": "pwn"}
-
-    log = client.get(
-        f"/api/bench/runs/{run_id}/file", params={"path": "C-1/agent.log"}
-    )
-    assert log.status_code == 200
-    assert "[REDACTED]" in log.text
-    assert (
-        client.get(
-            f"/api/bench/runs/{run_id}/file", params={"path": "../escape"}
-        ).status_code
-        == 400
-    )
-    assert client.get("/api/bench/runs/9999").status_code == 404
-    assert client.get("/api/bench/runs?status=nope").status_code == 400
-
-    adapters = client.get("/api/bench/adapters").json()["adapters"]
-    assert adapters == ["tsecbench"]
-    capabilities = client.get("/api/bench/adapters").json()["capabilities"]
-    assert capabilities["tsecbench"]["supported_platforms"] == [
-        "linux",
-        "macos",
-        "windows",
-    ]
-    assert "tsecbench" in capabilities
-
-    html = client.get("/").text
-    assert 'data-route="benchmarks"' in html
-    assert 'id="view-benchmarks"' in html
-    assert 'id="view-benchmark-detail"' in html
-
-
-def test_api_start_benchmark_run_creates_output_and_records_db(
-    tmp_path, monkeypatch
-) -> None:
-    app = _make_app(tmp_path)
-    started: dict = {}
-
-    class FakeAdapter:
-        pass
-
-    class FakeRunner:
-        def __init__(self, adapter, config, **options):
-            started["adapter"] = adapter
-            started["config"] = config
-            started["options"] = options
-            self.store = options["store"]
-            self.run_id = options["db_run_id"]
-
-        async def run(self):
-            self.store.finish_bench_run(
-                self.run_id,
-                status="done",
-                summary={"total": 0, "succeeded": 0, "failed": 0, "errors": 0, "score": 0},
-            )
-
-    monkeypatch.setattr(server_module, "registered_benchmarks", lambda: ["tsecbench"])
-    monkeypatch.setattr(
-        server_module, "create_benchmark_adapter", lambda name, **opts: FakeAdapter()
-    )
-    monkeypatch.setattr(server_module, "BenchRunner", FakeRunner)
-
-    import time as _time
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/bench/runs",
-            json={
-                "benchmark": "tsecbench",
-                "max_turns": 7,
-                "capture_trajectory": True,
-            },
-        )
-        assert response.status_code == 202
-        body = response.json()
-        run_id = body["run_id"]
-        assert body["benchmark"] == "tsecbench"
-        assert body["status"] == RUN_RUNNING
-        assert Path(body["output_dir"]).is_dir()
-        assert str(app.state.web_settings.results_dir) in body["output_dir"]
-
-        deadline = _time.time() + 5
-        detail = None
-        while _time.time() < deadline:
-            detail = client.get(f"/api/bench/runs/{run_id}").json()
-            if detail["status"] == RUN_DONE:
-                break
-            _time.sleep(0.02)
-        assert detail is not None
-        assert detail["status"] == RUN_DONE
-        assert detail["repo_dir"] == ""
-        assert detail["adapter"] == "FakeAdapter"
-
-        assert started["options"]["max_turns"] == 7
-        assert started["options"]["capture_trajectory"] is True
-        assert started["config"].trajectory_enabled is True
-        assert started["config"].sandbox_enabled is False
-
-    # Unknown adapters are rejected before any task starts.
-    with TestClient(app) as client:
-        assert (
-            client.post(
-                "/api/bench/runs",
-                json={"benchmark": "nope"},
-            ).status_code
-            == 400
-        )
-
-
-def test_api_cancel_benchmark_run(tmp_path, monkeypatch) -> None:
-    app = _make_app(tmp_path)
-
-    class FakeAdapter:
-        pass
-
-    class SlowRunner:
-        def __init__(self, adapter, config, **options):
-            self.store = options["store"]
-            self.run_id = options["db_run_id"]
-
-        async def run(self):
-            import asyncio as _asyncio
-
-            await _asyncio.sleep(60)
-
-    monkeypatch.setattr(server_module, "registered_benchmarks", lambda: ["tsecbench"])
-    monkeypatch.setattr(
-        server_module, "create_benchmark_adapter", lambda name, **opts: FakeAdapter()
-    )
-    monkeypatch.setattr(server_module, "BenchRunner", SlowRunner)
-
-    import time as _time
-
-    with TestClient(app) as client:
-        started = client.post(
-            "/api/bench/runs",
-            json={"benchmark": "tsecbench", "max_turns": 5},
-        )
-        assert started.status_code == 202
-        run_id = started.json()["run_id"]
-        assert run_id in app.state.bench_tasks
-
-        cancelled = client.post(f"/api/bench/runs/{run_id}/cancel")
-        assert cancelled.status_code == 202
-        assert cancelled.json()["status"] == "cancelling"
-
-        deadline = _time.time() + 5
-        detail = None
-        while _time.time() < deadline:
-            detail = client.get(f"/api/bench/runs/{run_id}").json()
-            if (
-                detail["status"] == RUN_CANCELLED
-                and run_id not in app.state.bench_tasks
-                and run_id not in app.state.bench_task_meta
-            ):
-                break
-            _time.sleep(0.02)
-        assert detail is not None
-        assert detail["status"] == RUN_CANCELLED
-        assert run_id not in app.state.bench_tasks
-        assert run_id not in app.state.bench_task_meta
-
-        assert client.post("/api/bench/runs/9999/cancel").status_code == 404
-        done_id = app.state.store.create_bench_run(
-            benchmark="tsecbench", adapter="x", output_dir=str(tmp_path / "done")
-        )
-        app.state.store.finish_bench_run(done_id, status=RUN_DONE)
-        assert client.post(f"/api/bench/runs/{done_id}/cancel").status_code == 409
-
-
-def test_api_rejects_benchmark_when_platform_is_unsupported(tmp_path, monkeypatch) -> None:
-    app = _make_app(tmp_path)
-    monkeypatch.setattr(server_module, "registered_benchmarks", lambda: ["tsecbench"])
-    monkeypatch.setattr(
-        server_module,
-        "benchmark_platform_capability",
-        lambda _name: SimpleNamespace(
-            available=False,
-            reason="Benchmark platform is unsupported.",
-        ),
-    )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/bench/runs",
-            json={"benchmark": "tsecbench"},
-        )
-
-    assert response.status_code == 400
-    assert "unsupported" in response.json()["detail"]

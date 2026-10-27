@@ -32,6 +32,7 @@ from .db import (
 )
 from .disclosures import build_dedupe_key
 from .logger import configure_logging, get_logger
+from .orchestrator import finish_run_trajectory, start_run_trajectory
 from .poc_artifacts import resolve_stage5_report_path
 from .repos import capture_repo_identity, create_detached_worktree
 from .reproduction_status import is_reproduced_status, read_reproduction_status
@@ -469,6 +470,18 @@ async def _run_group(
     errors: list[str] = []
     warnings: list[str] = []
     provider_unavailable = False
+    trajectory_root = start_run_trajectory(
+        config,
+        run_kind="poc_backfill",
+        system_message=(
+            "CodeAuditor PoC backfill: recover missing Disclosure PoCs at a "
+            "pinned audit commit and prepare validated disclosure artifacts."
+        ),
+        user_message=(
+            f"Recover {len(candidates)} missing PoC candidate(s) for "
+            f"{first.project} at {first.commit}."
+        ),
+    )
     try:
         for candidate in candidates:
             result: dict[str, Any] = {
@@ -572,6 +585,7 @@ async def _run_group(
                     raise BackfillProviderUnavailable(message) from exc
             results.append(result)
     finally:
+        finish_run_trajectory(config, trajectory_root)
         status = (
             RUN_FAILED
             if provider_unavailable or (errors and len(errors) == len(candidates))

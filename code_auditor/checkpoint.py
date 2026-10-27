@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote, unquote
 
+from .layout import markers_dir, stage1_paths, stage4_paths
 from .logger import get_logger
 
 logger = get_logger("checkpoint")
@@ -83,7 +84,7 @@ class CheckpointManager:
     def __init__(self, output_dir: str, resume: bool) -> None:
         self._output_dir = output_dir
         self._resume = resume
-        self._markers_dir = os.path.join(output_dir, ".markers")
+        self._markers_dir = markers_dir(output_dir)
 
     def is_complete(self, task_key: str) -> bool:
         if not self._resume:
@@ -126,7 +127,7 @@ class CheckpointManager:
 
     def _resolve(self, task_key: str) -> str | None:
         if task_key == "stage1":
-            return os.path.join(self._output_dir, "stage1-security-context", "stage-1-security-context.json")
+            return stage1_paths(self._output_dir)["record"]
         if task_key == "stage2":
             return self._marker_path(task_key)
         if task_key.startswith("stage3:"):
@@ -148,7 +149,7 @@ class CheckpointManager:
                     filename,
                 )
                 return None
-            return os.path.join(self._output_dir, "stage4-vulnerabilities", "_pending", filename)
+            return os.path.join(stage4_paths(self._output_dir)["pending"], filename)
         if task_key.startswith("stage5:"):
             return self._marker_path(task_key)
         if task_key.startswith("stage6:"):

@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 
 from ..config import ValidationIssue
+from ..contracts import STAGE3_REQUIRED_FIELDS, STAGE3_SEVERITIES
 from .common import read_file_or_issues
-
-_REQUIRED_KEYS = ["finding_id", "title", "location", "vulnerability_class", "root_cause", "preliminary_severity"]
-_VALID_SEVERITIES = {"critical", "high", "medium", "low"}
 
 
 def validate_stage3_file(file_path: str) -> list[ValidationIssue]:
@@ -39,7 +37,7 @@ def validate_stage3_file(file_path: str) -> list[ValidationIssue]:
 
     validation_issues: list[ValidationIssue] = []
 
-    for key in _REQUIRED_KEYS:
+    for key in STAGE3_REQUIRED_FIELDS:
         if key not in data or not data[key]:
             validation_issues.append(ValidationIssue(
                 description=f'Missing required key: "{key}".',
@@ -48,7 +46,11 @@ def validate_stage3_file(file_path: str) -> list[ValidationIssue]:
             ))
 
     severity = data.get("preliminary_severity", "")
-    if isinstance(severity, str) and severity and severity.lower() not in _VALID_SEVERITIES:
+    if (
+        isinstance(severity, str)
+        and severity
+        and severity.lower() not in STAGE3_SEVERITIES
+    ):
         validation_issues.append(ValidationIssue(
             description=f'Invalid preliminary_severity: "{severity}".',
             expected="One of: Critical, High, Medium, Low.",

@@ -5,6 +5,7 @@ import os
 import subprocess
 
 from ..config import AuditConfig
+from ..layout import markers_dir, stage4_paths, stage_dir
 from ..logger import get_logger
 from ..process_tree import current_audit_subprocess_env
 
@@ -76,14 +77,14 @@ async def run_setup(config: AuditConfig) -> None:
 
     directories = [
         config.output_dir,
-        os.path.join(config.output_dir, ".markers"),
-        os.path.join(config.output_dir, "stage1-security-context"),
-        os.path.join(config.output_dir, "stage2-analysis-units"),
-        os.path.join(config.output_dir, "stage3-findings"),
-        os.path.join(config.output_dir, "stage4-vulnerabilities"),
-        os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending"),
-        os.path.join(config.output_dir, "stage5-pocs"),
-        os.path.join(config.output_dir, "stage6-disclosures"),
+        markers_dir(config.output_dir),
+        stage_dir(config.output_dir, 1),
+        stage_dir(config.output_dir, 2),
+        stage_dir(config.output_dir, 3),
+        stage_dir(config.output_dir, 4),
+        stage4_paths(config.output_dir)["pending"],
+        stage_dir(config.output_dir, 5),
+        stage_dir(config.output_dir, 6),
     ]
 
     for directory in directories:

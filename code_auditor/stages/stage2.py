@@ -6,15 +6,17 @@ import re
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AnalysisUnit, AuditConfig
+from ..layout import checkpoint_key, stage2_paths
 from ..logger import get_logger
 from ..parsing.stage2 import parse_au_files, parse_auditing_focus
 from ..prompts import load_prompt
+from ..stage_runtime import finalize_checkpoint, repair_until_valid
 from ..utils import format_validation_issues
 from ..validation.stage2 import validate_stage2_dir
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage2")
-_TASK_KEY = "stage2"
+_TASK_KEY = checkpoint_key(2)
 _AU_FILENAME = re.compile(r"^AU-\d+\.json$")
 
 
@@ -43,12 +45,28 @@ async def run_stage2(
     checkpoint: CheckpointManager,
     auditing_focus_path: str,
 ) -> list[AnalysisUnit]:
-    result_dir = os.path.join(config.output_dir, "stage2-analysis-units")
+    paths = stage2_paths(config.output_dir)
+    result_dir = paths["directory"]
     os.makedirs(result_dir, exist_ok=True)
-    log_file = os.path.join(result_dir, "agent.log")
+    log_file = paths["log"]
+
+    def validator():
+        return validate_stage2_dir(result_dir, max_aus=config.target_au_count)
+
+    async def repair(prompt: str) -> object:
+        return await run_agent(
+            prompt, config, cwd=config.target, max_turns=10, log_file=log_file
+        )
+
+    def repair_prompt(issues):
+        return (
+            f"The analysis unit files in `{result_dir}` failed validation. "
+            "Please fix all issues listed below:\n\n"
+            f"```\n{format_validation_issues(issues)}\n```"
+        )
 
     if checkpoint.is_complete(_TASK_KEY):
-        issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
+        issues = validator()
         if not issues:
             logger.info("Stage 2 already complete, loading existing output.")
             return parse_au_files(result_dir)
@@ -65,7 +83,7 @@ async def run_stage2(
     # The agent may have written AU files before the checkpoint marker was set.
     if config.resume and parse_au_files(result_dir):
         logger.info("Stage 2: Found existing intermediate results. Validating.")
-        issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
+        issues = validator()
         if not issues:
             logger.info("Stage 2: Existing output is valid. Skipping agent re-run.")
             checkpoint.mark_complete(_TASK_KEY)
@@ -77,13 +95,12 @@ async def run_stage2(
             format_validation_issues(issues),
         )
         logger.info("Stage 2: Running repair agent to fix validation issues.")
-        repair_prompt = (
-            f"The analysis unit files in `{result_dir}` failed validation. "
-            "Please fix all issues listed below:\n\n"
-            f"```\n{format_validation_issues(issues)}\n```"
+        issues = await repair_until_valid(
+            validator=validator,
+            repair=repair,
+            repair_prompt=repair_prompt,
+            max_attempts=1,
         )
-        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
-        issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
         if not issues:
             checkpoint.mark_complete(_TASK_KEY)
             units = parse_au_files(result_dir)
@@ -121,20 +138,18 @@ async def run_stage2(
     await run_agent(prompt, config, cwd=config.target, max_turns=200, log_file=log_file)
 
     logger.info("Stage 2: Agent finished. Validating output.")
-    issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
+    issues = validator()
     if issues:
         logger.warning(
             "Stage 2 validation issues:\n%s", format_validation_issues(issues),
         )
         logger.info("Stage 2: Running repair agent to fix validation issues.")
-        repair_prompt = (
-            f"The analysis unit files in `{result_dir}` failed validation. "
-            "Please fix all issues listed below:\n\n"
-            f"```\n{format_validation_issues(issues)}\n```"
+        issues = await repair_until_valid(
+            validator=validator,
+            repair=repair,
+            repair_prompt=repair_prompt,
+            max_attempts=1,
         )
-        await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
-
-        issues = validate_stage2_dir(result_dir, max_aus=config.target_au_count)
         if issues:
             logger.warning(
                 "Stage 2 validation still has issues after repair:\n%s",
@@ -153,6 +168,6 @@ async def run_stage2(
             len(units),
         )
         return []
-    checkpoint.mark_complete(_TASK_KEY)
+    finalize_checkpoint(checkpoint, _TASK_KEY, valid=not issues)
     logger.info("Stage 2 complete. Analysis units: %s", ", ".join(u.id for u in units))
     return units

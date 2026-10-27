@@ -16,8 +16,9 @@ import logging
 import time
 from collections import deque
 from contextvars import ContextVar
-from dataclasses import dataclass
 from typing import Callable
+
+from ..stage_state import StageStatus
 
 MAX_WEB_LOG_MESSAGE_CHARS = 20_000
 MAX_SSE_SUBSCRIBER_EVENTS = 500
@@ -229,25 +230,20 @@ def install_web_log_handler(
     return handler
 
 
-@dataclass
-class StageState:
-    status: str = "pending"  # pending | running | done
-    detail: str = ""
-    items_done: int = 0
-    items_total: int = 0
-    start_time: float = 0.0
-    end_time: float = 0.0
-
-
 class WebProgressReporter:
     """Publish audit stage updates to Web clients."""
 
     def __init__(self, bus: EventBus) -> None:
         self._bus = bus
-        self._stages: dict[int, StageState] = {}
+        self._stages: dict[int, StageStatus] = {}
 
     def begin_stage(self, stage: int, description: str) -> None:
-        state = StageState(status="running", detail=description, start_time=time.time())
+        state = StageStatus(
+            stage=stage,
+            status="running",
+            detail=description,
+            started_at=time.time(),
+        )
         self._stages[stage] = state
         self._bus.publish(
             {"type": "stage", "stage": stage, "status": "running", "detail": description}
@@ -260,7 +256,9 @@ class WebProgressReporter:
         items_total: int = 0,
         detail: str = "",
     ) -> None:
-        state = self._stages.setdefault(stage, StageState(status="running"))
+        state = self._stages.setdefault(
+            stage, StageStatus(stage=stage, status="running")
+        )
         state.items_done = items_done
         state.items_total = items_total
         if detail:
@@ -276,9 +274,9 @@ class WebProgressReporter:
         )
 
     def end_stage(self, stage: int) -> None:
-        state = self._stages.setdefault(stage, StageState())
+        state = self._stages.setdefault(stage, StageStatus(stage=stage))
         state.status = "done"
-        state.end_time = time.time()
+        state.ended_at = time.time()
         self._bus.publish(
             {"type": "stage", "stage": stage, "status": "done", "detail": state.detail}
         )
@@ -291,8 +289,10 @@ class WebProgressReporter:
                 "detail": state.detail,
                 "items_done": state.items_done,
                 "items_total": state.items_total,
-                "elapsed": round((state.end_time or time.time()) - state.start_time, 1)
-                if state.start_time
+                "elapsed": round(
+                    (state.ended_at or time.time()) - (state.started_at or 0.0), 1
+                )
+                if state.started_at
                 else 0.0,
             }
             for stage, state in sorted(self._stages.items())

@@ -173,9 +173,9 @@ Web API：
   （没有可靠的结果可记）。
 - **未做**：历史 run 的回填（`agent.log` 里没有工具参数，回填只能得到残缺轨迹）；
   把子轨迹内嵌进 run 级 `subagent_trajectories`（当前一律外链，避免单文件过大）。
-- **基准场景**尚未接入 orchestrator；`code_auditor/bench/` 已提供 TSECBench adapter 骨架
-  （见 `docs/tsecbench-integration.md`）。注意：基准 flag 会出现在工具输出里，接入时必须
-  先做精确擦除或关闭轨迹，`trajectory_redact` 的通用规则不认识任意 flag。
+- **独立 Reproduce/Backfill** 也使用运行级轨迹：Web latest-source Reproduce 和
+  PoC backfill 会在各自输出目录写入 `trajectories/trajectory.json`，并引用 Stage 5/6
+  与 Review Agent 的子轨迹。
 
 ## 代码位置
 
@@ -183,8 +183,7 @@ Web API：
 |---|---|
 | `code_auditor/trajectory.py` | recorder、路径布局、脱敏、blob、`validate_trajectory()`、usage→ATIF 映射 |
 | `code_auditor/agent.py` | `_open_trajectory` / `_flush_trajectory`，两个后端的消息 hook |
-| `code_auditor/orchestrator.py` | run 级轨迹的创建、阶段 system 步、收尾与 `final_metrics` |
+| `code_auditor/orchestrator.py` | audit、Reproduce、Backfill 共用的 run 级轨迹创建与收尾 |
 | `code_auditor/web/server.py` | `/api/history/{id}/trajectory`，results 列表的 `trajectories` |
 | `code_auditor/__main__.py` | `--validate-trajectory` |
 | `code_auditor/tests/test_trajectory.py` | 映射、约束、脱敏、续写、路径、resume、引用完整性 |
-| `code_auditor/bench/` | benchmark adapter 骨架（首个：TSECBench） |

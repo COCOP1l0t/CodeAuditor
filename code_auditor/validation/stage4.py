@@ -3,11 +3,8 @@ from __future__ import annotations
 import json
 
 from ..config import ValidationIssue
+from ..contracts import STAGE4_DATA_FLOW_TRACE_FIELDS, STAGE4_REQUIRED_FIELDS
 from .common import read_file_or_issues
-
-_REQUIRED_KEYS = ["id", "title", "location", "data_flow_trace", "cwe_id", "vulnerability_class", "trigger", "cvss_score"]
-
-_DATA_FLOW_TRACE_KEYS = ["entry_point", "propagation_chain", "neutralizing_checks", "sink"]
 
 
 def _is_blank(value: object) -> bool:
@@ -50,7 +47,7 @@ def validate_stage4_file(file_path: str) -> list[ValidationIssue]:
 
     validation_issues: list[ValidationIssue] = []
 
-    for key in _REQUIRED_KEYS:
+    for key in STAGE4_REQUIRED_FIELDS:
         if key not in data:
             validation_issues.append(ValidationIssue(
                 description=f'Missing required key: "{key}".',
@@ -68,7 +65,7 @@ def validate_stage4_file(file_path: str) -> list[ValidationIssue]:
 
     trace = data.get("data_flow_trace")
     if isinstance(trace, dict):
-        for subkey in _DATA_FLOW_TRACE_KEYS:
+        for subkey in STAGE4_DATA_FLOW_TRACE_FIELDS:
             if subkey not in trace:
                 validation_issues.append(ValidationIssue(
                     description=f'"data_flow_trace" is missing required key: "{subkey}".',

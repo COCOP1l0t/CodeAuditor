@@ -47,7 +47,7 @@ from ..process_tree import (
     current_audit_subprocess_env,
     snapshot_process_tree,
 )
-from ..orchestrator import run_audit
+from ..orchestrator import finish_run_trajectory, run_audit, start_run_trajectory
 from ..repos import (
     DEFAULT_REPOS_DIR,
     DEFAULT_RESULTS_DIR,
@@ -1108,6 +1108,8 @@ class AuditJob:
         evidence_level = ""
         result_path = ""
         assessment: dict = {}
+        trajectory_config: AuditConfig | None = None
+        trajectory_root = None
         try:
             if not _is_git_checkout(source_repo):
                 repo_url = str(candidate.get("repo_url") or "")
@@ -1188,6 +1190,7 @@ class AuditJob:
                 sandbox_runtime=params.sandbox_runtime,
                 sandbox_network_enabled=sandbox_network_enabled,
             )
+            trajectory_config = config
             if config.reproduction_reference_dir:
                 config.reproduction_reference_dir = _snapshot_reproduction_reference(
                     config.reproduction_reference_dir,
@@ -1197,6 +1200,19 @@ class AuditJob:
                 )
                 candidate["reference_dir"] = config.reproduction_reference_dir
             self._set_config(config)
+            trajectory_root = start_run_trajectory(
+                config,
+                run_kind="reproduction",
+                system_message=(
+                    "CodeAuditor latest-source reproduction: retest a retained "
+                    "PoC against the current remote HEAD, assess the outcome, "
+                    "and prepare a bounded Disclosure update."
+                ),
+                user_message=(
+                    f"Retest {candidate['project']}/{candidate['vuln_id']} at "
+                    f"pinned commit {tested_commit}."
+                ),
+            )
             self.reporter.begin_stage(
                 5,
                 f"Retesting {candidate['project']} {candidate['vuln_id']} at {tested_commit[:12]}",
@@ -1285,6 +1301,8 @@ class AuditJob:
             self.error = str(e)
             logger.exception("Reproduction failed: %s", e)
         finally:
+            if trajectory_config is not None:
+                finish_run_trajectory(trajectory_config, trajectory_root)
             if self.state in BUSY_STATES:
                 self.state = STATE_CANCELLED
                 self.error = self.error or INTERRUPTED_AUDIT_ERROR

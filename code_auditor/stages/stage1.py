@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from ..agent import run_with_validation
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig
+from ..layout import checkpoint_key, stage1_paths
 from ..logger import get_logger
 from ..prompts import load_prompt
+from ..stage_runtime import finalize_checkpoint
 from ..utils import format_validation_issues
 from ..validation.stage1 import validate_stage1_file, validate_stage1_outputs
 from ..wiki import build_wiki_context
 
 logger = get_logger("stage1")
-_TASK_KEY = "stage1"
+_TASK_KEY = checkpoint_key(1)
 
 
 @dataclass
@@ -28,10 +29,10 @@ async def run_stage1(
     config: AuditConfig,
     checkpoint: CheckpointManager,
 ) -> Stage1Output:
-    details_dir = os.path.join(config.output_dir, "stage1-security-context")
-    research_record_path = os.path.join(details_dir, "stage-1-security-context.json")
-    auditing_focus_path = os.path.join(details_dir, "auditing-focus.md")
-    vuln_criteria_path = os.path.join(details_dir, "vulnerability-criteria.md")
+    paths = stage1_paths(config.output_dir)
+    research_record_path = paths["record"]
+    auditing_focus_path = paths["focus"]
+    vuln_criteria_path = paths["criteria"]
 
     if checkpoint.is_complete(_TASK_KEY):
         issues = validate_stage1_outputs(
@@ -73,21 +74,21 @@ async def run_stage1(
         output_path=research_record_path,
         validator=validate_stage1_file,
         max_turns=200,
-        log_file=os.path.join(details_dir, "agent.log"),
+        log_file=paths["log"],
     )
 
     issues = validate_stage1_outputs(
         research_record_path, auditing_focus_path, vuln_criteria_path
     )
-    if not passed or issues:
+    valid = passed and not issues
+    if not valid:
         # Do not record a completed checkpoint: the record file's existence is
         # the Stage 1 marker, so the next resume re-validates and re-runs.
         logger.warning(
             "Stage 1 validation did not fully pass; a resume will re-run it.\n%s",
             format_validation_issues(issues),
         )
-    else:
-        checkpoint.mark_complete(_TASK_KEY)
+    finalize_checkpoint(checkpoint, _TASK_KEY, valid=valid)
     logger.info("Stage 1 complete. Research record: %s", research_record_path)
     return Stage1Output(
         research_record_path=research_record_path,

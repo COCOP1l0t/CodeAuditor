@@ -4,14 +4,20 @@ import json
 import os
 import shutil
 from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
 
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig
+from ..contracts import read_json_object
+from ..cvss import severity as cvss_severity
 from ..disclosures import build_dedupe_key
+from ..layout import checkpoint_key, stage4_paths
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
+from ..stage_runtime import finalize_checkpoint, repair_until_valid
 from ..utils import (
     collect_parallel_results,
     format_validation_issues,
@@ -29,58 +35,61 @@ _SEVERITY_PREFIX = {"Critical": "C", "High": "H", "Medium": "M", "Low": "L"}
 
 
 def _task_key(finding_filename: str) -> str:
-    return f"stage4:{finding_filename}"
+    return checkpoint_key(4, finding_filename)
 
 
-def _cvss_to_severity(cvss: float) -> str | None:
-    """Derive severity from CVSS v3.1 base score."""
-    if cvss >= 9.0:
-        return "Critical"
-    if cvss >= 7.0:
-        return "High"
-    if cvss >= 4.0:
-        return "Medium"
-    if cvss >= 0.1:
-        return "Low"
-    return None
+@dataclass
+class _VulnerabilityDocument:
+    path: Path
+    data: dict
 
+    @classmethod
+    def load(cls, path: str | Path) -> "_VulnerabilityDocument":
+        return cls(path=Path(path), data=read_json_object(path))
 
-def _read_severity_and_cvss(file_path: str) -> tuple[str | None, float]:
-    try:
-        with open(file_path) as f:
-            data = json.load(f)
+    @property
+    def vuln_id(self) -> str | None:
+        value = self.data.get("id")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def cvss_score(self) -> float:
         try:
-            cvss = float(data.get("cvss_score", 0))
+            return float(self.data.get("cvss_score", 0))
         except (TypeError, ValueError):
-            cvss = 0.0
-        severity = _cvss_to_severity(cvss)
-        return severity, cvss
-    except Exception as e:
-        logger.warning("Failed to read severity from %s: %s", file_path, e)
-        return None, 0.0
+            return 0.0
 
+    @property
+    def severity(self) -> str | None:
+        value = cvss_severity(self.cvss_score)
+        return None if value == "None" else value
 
-def _read_existing_id(file_path: str) -> str | None:
-    try:
-        with open(file_path) as f:
-            data = json.load(f)
-        return data.get("id")
-    except Exception:
-        return None
+    def set_identity(self, vuln_id: str, severity: str) -> None:
+        self.data["id"] = vuln_id
+        self.data["severity"] = severity
 
+    def move_to(self, path: str | Path) -> None:
+        self.path = Path(path)
 
-def _inject_id_and_severity(file_path: str, real_id: str, severity: str) -> None:
-    with open(file_path) as f:
-        data = json.load(f)
-    data["id"] = real_id
-    data["severity"] = severity
-    with open(file_path, "w") as f:
-        json.dump(data, f, indent=2)
+    def write(self) -> None:
+        self.path.write_text(
+            json.dumps(self.data, indent=2) + "\n", encoding="utf-8"
+        )
 
 
 def _list_existing_final_files(stage4_dir: str) -> list[str]:
     files = list_json_files(stage4_dir)
     return [f for f in files if os.path.basename(f) != "_pending"]
+
+
+def _load_existing_documents(paths: list[str]) -> list[_VulnerabilityDocument]:
+    documents: list[_VulnerabilityDocument] = []
+    for path in paths:
+        try:
+            documents.append(_VulnerabilityDocument.load(path))
+        except ValueError:
+            continue
+    return documents
 
 
 async def _run_finding(
@@ -91,19 +100,34 @@ async def _run_finding(
 ) -> str | None:
     stage3_filename = os.path.basename(stage3_file_path)
     key = _task_key(stage3_filename)
-    pending_dir = os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending")
+    paths = stage4_paths(config.output_dir)
+    pending_dir = paths["pending"]
     pending_path = os.path.join(pending_dir, stage3_filename)
     log_file = os.path.join(
-        config.output_dir, "stage4-vulnerabilities", "logs",
-        f"{os.path.splitext(stage3_filename)[0]}.log",
+        paths["logs"], f"{os.path.splitext(stage3_filename)[0]}.log"
     )
+
+    def validator():
+        return validate_stage4_file(pending_path)
+
+    async def repair(prompt: str) -> object:
+        return await run_agent(
+            prompt, config, cwd=config.target, max_turns=10, log_file=log_file
+        )
+
+    def repair_prompt(issues):
+        return (
+            f"The evaluation file at `{pending_path}` failed validation. "
+            "Please fix all issues below:\n\n"
+            f"```\n{format_validation_issues(issues)}\n```"
+        )
 
     if checkpoint.is_complete(key):
         if not os.path.exists(pending_path):
             logger.info("Stage 4: %s already complete, skipping.", stage3_filename)
             return None
 
-        issues = validate_stage4_file(pending_path)
+        issues = validator()
         if not issues:
             logger.info("Stage 4: %s already complete, skipping.", stage3_filename)
             checkpoint.mark_complete(key)
@@ -130,15 +154,15 @@ async def _run_finding(
 
     confirmed = os.path.exists(pending_path)
     if confirmed:
-        issues = validate_stage4_file(pending_path)
+        issues = validator()
         if issues:
             logger.warning("Stage 4: Validation failed for %s\n%s", pending_path, format_validation_issues(issues))
-            repair_prompt = (
-                f"The evaluation file at `{pending_path}` failed validation. "
-                f"Please fix all issues below:\n\n```\n{format_validation_issues(issues)}\n```"
+            issues = await repair_until_valid(
+                validator=validator,
+                repair=repair,
+                repair_prompt=repair_prompt,
+                max_attempts=1,
             )
-            await run_agent(repair_prompt, config, cwd=config.target, max_turns=10, log_file=log_file)
-            issues = validate_stage4_file(pending_path)
             if issues:
                 logger.warning("Stage 4: Repair failed for %s\n%s", pending_path, format_validation_issues(issues))
                 with suppress(OSError):
@@ -146,16 +170,16 @@ async def _run_finding(
                 checkpoint.clear(key)
                 return None
 
-    checkpoint.mark_complete(key)
+    finalize_checkpoint(checkpoint, key, valid=True)
     logger.info("Stage 4: %s complete (confirmed=%s)", stage3_filename, confirmed)
     return pending_path if confirmed else None
 
 
 def _dedupe_findings(
-    findings: list[tuple[str, str, float]],
-    existing_final_files: list[str],
+    findings: list[tuple[_VulnerabilityDocument, str, float]],
+    existing_documents: list[_VulnerabilityDocument],
     repo_url: str,
-) -> list[tuple[str, str, float]]:
+) -> list[tuple[_VulnerabilityDocument, str, float]]:
     """Remove duplicate findings that describe the same vulnerability.
 
     ``findings`` must already be sorted by severity (Critical first) and
@@ -163,51 +187,48 @@ def _dedupe_findings(
     """
     seen_keys: set[str] = set()
 
-    for file_path in existing_final_files:
+    for document in existing_documents:
         try:
-            with open(file_path) as f:
-                data = json.load(f)
-            seen_keys.add(build_dedupe_key(data, repo_url=repo_url))
+            seen_keys.add(build_dedupe_key(document.data, repo_url=repo_url))
         except Exception:
             pass
 
-    deduped: list[tuple[str, str, float]] = []
-    for pending_path, severity, cvss in findings:
+    deduped: list[tuple[_VulnerabilityDocument, str, float]] = []
+    for document, severity, cvss in findings:
         try:
-            with open(pending_path) as f:
-                data = json.load(f)
-            key = build_dedupe_key(data, repo_url=repo_url)
+            key = build_dedupe_key(document.data, repo_url=repo_url)
         except Exception as e:
             logger.warning(
                 "Stage 4: Could not compute dedupe key for %s: %s; keeping.",
-                os.path.basename(pending_path), e,
+                document.path.name, e,
             )
-            deduped.append((pending_path, severity, cvss))
+            deduped.append((document, severity, cvss))
             continue
 
         if key in seen_keys:
             logger.info(
                 "Stage 4: Skipping duplicate finding %s (dedupe_key=%s).",
-                os.path.basename(pending_path), key,
+                document.path.name, key,
             )
             with suppress(OSError):
-                os.remove(pending_path)
+                document.path.unlink()
             continue
 
         seen_keys.add(key)
-        deduped.append((pending_path, severity, cvss))
+        deduped.append((document, severity, cvss))
 
     return deduped
 
 
 def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> list[str]:
-    stage4_dir = os.path.join(config.output_dir, "stage4-vulnerabilities")
+    stage4_dir = stage4_paths(config.output_dir)["directory"]
     existing_final_files = _list_existing_final_files(stage4_dir)
+    existing_documents = _load_existing_documents(existing_final_files)
 
     counters: dict[str, int] = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
 
-    for file_path in existing_final_files:
-        existing_id = _read_existing_id(file_path)
+    for document in existing_documents:
+        existing_id = document.vuln_id
         if not existing_id or "-" not in existing_id:
             continue
         prefix, number_text = existing_id.split("-", 1)
@@ -216,10 +237,14 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
                 try:
                     counters[sev] = max(counters[sev], int(number_text))
                 except ValueError:
-                    logger.warning("Stage 4: Ignoring malformed existing vulnerability ID %s in %s", existing_id, file_path)
+                    logger.warning(
+                        "Stage 4: Ignoring malformed existing vulnerability ID %s in %s",
+                        existing_id,
+                        document.path,
+                    )
                 break
 
-    findings: list[tuple[str, str, float]] = []  # (pending_path, severity, cvss)
+    findings: list[tuple[_VulnerabilityDocument, str, float]] = []
     for pending_path in pending_paths:
         issues = validate_stage4_file(pending_path)
         if issues:
@@ -230,9 +255,10 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
             )
             continue
 
-        severity, cvss = _read_severity_and_cvss(pending_path)
+        document = _VulnerabilityDocument.load(pending_path)
+        severity = document.severity
         if severity:
-            findings.append((pending_path, severity, cvss))
+            findings.append((document, severity, document.cvss_score))
         else:
             logger.warning("Stage 4: Skipping %s because severity could not be derived from CVSS score.", os.path.basename(pending_path))
 
@@ -240,18 +266,21 @@ def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> l
     findings.sort(key=lambda x: (_SEVERITY_ORDER.index(x[1]), -x[2]))
 
     repo_url = capture_repo_identity(config.target).get("repo_url", "")
-    findings = _dedupe_findings(findings, existing_final_files, repo_url)
+    findings = _dedupe_findings(findings, existing_documents, repo_url)
 
     finalized: list[str] = list(existing_final_files)
-    for pending_path, severity, _cvss in findings:
+    for document, severity, _cvss in findings:
         next_count = counters[severity] + 1
         counters[severity] = next_count
         real_id = f"{_SEVERITY_PREFIX[severity]}-{next_count:02d}"
         final_path = os.path.join(stage4_dir, f"{real_id}.json")
-        shutil.move(pending_path, final_path)
-        _inject_id_and_severity(final_path, real_id, severity)
+        original_name = document.path.name
+        shutil.move(str(document.path), final_path)
+        document.move_to(final_path)
+        document.set_identity(real_id, severity)
+        document.write()
         finalized.append(final_path)
-        logger.info("Stage 4: Assigned %s to %s", real_id, os.path.basename(pending_path))
+        logger.info("Stage 4: Assigned %s to %s", real_id, original_name)
 
     finalized.sort(key=lambda a: (
         {"C": 0, "H": 1, "M": 2, "L": 3}.get(os.path.basename(a).split("-")[0], 99),
@@ -273,7 +302,7 @@ def _backfill_stage4_markers(
     to backfill; inferring completion from AU ordering can skip work after a
     parallel or interrupted run.
     """
-    pending_dir = os.path.join(config.output_dir, "stage4-vulnerabilities", "_pending")
+    pending_dir = stage4_paths(config.output_dir)["pending"]
     if not os.path.isdir(pending_dir):
         return
 
@@ -304,7 +333,9 @@ async def run_stage4(
 ) -> list[str]:
     if not finding_files:
         logger.info("Stage 4: No findings to evaluate.")
-        return _list_existing_final_files(os.path.join(config.output_dir, "stage4-vulnerabilities"))
+        return _list_existing_final_files(
+            stage4_paths(config.output_dir)["directory"]
+        )
 
     if config.resume:
         _backfill_stage4_markers(finding_files, config, checkpoint)

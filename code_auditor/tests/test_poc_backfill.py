@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from code_auditor.poc_backfill import (
     _is_nonfatal_cleanup_error,
     _provider_is_unavailable,
     _recovery_output,
+    _run_group,
 )
 from code_auditor.web.settings import WebSettings
 
@@ -84,3 +86,52 @@ def test_recovery_output_isolated_when_commit_tree_already_exists(tmp_path: Path
 
     retry = Path(_recovery_output(settings, candidate))
     assert retry == base.with_name(f"{base.name}-retry-2")
+
+
+async def test_backfill_group_writes_run_level_trajectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = WebSettings.for_state_dir(str(tmp_path), backend="codex")
+    candidate = _candidate(tmp_path)
+    finding = Path(candidate.finding_path)
+    finding.write_text(
+        json.dumps(
+            {
+                "id": "H-01",
+                "title": "Historical finding",
+                "location": "src/a.c:1",
+                "trigger": "crafted input",
+                "data_flow_trace": {"entry_point": "main", "sink": "memcpy"},
+                "cwe_id": ["CWE-120"],
+                "vulnerability_class": ["buffer-overflow"],
+                "cvss_score": "8.1",
+                "severity": "High",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeStore:
+        def create_run(self, *_args, **_kwargs):
+            return 7
+
+        def persist_artifacts(self, *_args, **_kwargs):
+            return None
+
+        def finish_run(self, *_args, **_kwargs):
+            return None
+
+    async def fake_reproduce(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("code_auditor.poc_backfill._pin_run_identity", lambda *_: None)
+    monkeypatch.setattr("code_auditor.poc_backfill._run_reproduce", fake_reproduce)
+
+    results = await _run_group(FakeStore(), settings, [candidate])
+
+    assert results[0]["result"] == "not-reproduced"
+    output_dir = Path(results[0]["recovery_output_dir"])
+    trajectory_path = output_dir / "trajectories" / "trajectory.json"
+    assert trajectory_path.is_file()
+    trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    assert trajectory["extra"]["run_kind"] == "poc_backfill"

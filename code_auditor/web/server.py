@@ -41,12 +41,6 @@ from ..db import (
     RUN_RUNNING,
     AuditStore,
 )
-from ..bench import (
-    BenchRunner,
-    benchmark_platform_capability,
-    create as create_benchmark_adapter,
-    registered as registered_benchmarks,
-)
 from ..logger import configure_logging, get_logger
 from ..repos import RepoError, list_cloned_repos, validate_remote_repo_url
 from ..retention import RetentionError, export_retained_artifacts
@@ -80,6 +74,7 @@ from .local_directories import (
     validate_local_audit_target,
 )
 from .progress import install_web_log_handler
+from .history import _run_stage_summary
 from .settings import (
     DEFAULT_SETTINGS_PATH,
     ModelProviderSettings,
@@ -356,88 +351,6 @@ def _output_file_response(output_dir: str, rel_path: str, download: bool):
     return PlainTextResponse(content)
 
 
-def _count_json_files(base: Path, pattern: str) -> int:
-    directory = base / pattern.split("/")[0]
-    if not directory.is_dir():
-        return 0
-    return sum(1 for p in base.glob(pattern) if p.is_file())
-
-
-def _run_stage_summary(run: dict) -> list[dict]:
-    """Reconstruct per-stage status for a finished run from on-disk evidence.
-
-    Live runs get stage updates from the progress reporter instead; this
-    summary lets the History detail page show Stages for completed, failed,
-    cancelled, and imported runs. Completion is derived from checkpoint
-    markers (``.markers/``), falling back to artifact presence for runs that
-    predate marker-based tracking.
-    """
-    base = Path(run.get("output_dir") or "")
-    markers: set[str] = set()
-    markers_dir = base / ".markers"
-    if markers_dir.is_dir():
-        markers = {p.name for p in markers_dir.iterdir() if p.is_file()}
-
-    au_total = len(run.get("analysis_units") or [])
-    findings_total = _count_json_files(base, "stage3-findings/*.json")
-    vuln_total = len(run.get("vulnerabilities") or []) + len(
-        run.get("poc_issues") or []
-    )
-    disclosures_total = int(run.get("disclosures_count") or 0)
-    failed = run.get("status") == "failed"
-
-    def entry(
-        stage: int,
-        done: bool,
-        items_done: int = 0,
-        items_total: int = 0,
-        detail: str = "",
-    ) -> dict:
-        if done:
-            status = "done"
-        elif failed and items_done > 0:
-            status = "failed"
-        else:
-            status = "pending"
-        return {
-            "stage": stage,
-            "status": status,
-            "detail": detail,
-            "items_done": items_done,
-            "items_total": items_total,
-        }
-
-    def marked(prefix: str, total: int, artifacts_exist: bool) -> tuple[bool, int]:
-        done_count = sum(1 for name in markers if name.startswith(prefix))
-        if done_count == 0 and not markers:
-            # Run predates checkpoint markers: fall back to artifact presence.
-            return artifacts_exist, total if artifacts_exist else 0
-        return total > 0 and done_count >= total, done_count
-
-    s3_done, s3_count = marked("stage3-", au_total, findings_total > 0)
-    s4_done, s4_count = marked("stage4-", findings_total, vuln_total > 0)
-    s5_done, s5_count = marked("stage5-", vuln_total, vuln_total > 0)
-    disclosures_exist = (base / "stage6-disclosures").is_dir() and any(
-        (base / "stage6-disclosures").iterdir()
-    )
-    s6_done, s6_count = marked("stage6-", disclosures_total, disclosures_exist)
-
-    return [
-        entry(0, base.is_dir()),
-        entry(
-            1,
-            (
-                base / "stage1-security-context" / "stage-1-security-context.json"
-            ).is_file(),
-        ),
-        entry(2, "stage2" in markers or au_total > 0, au_total, au_total),
-        entry(3, s3_done, min(s3_count, au_total), au_total),
-        entry(4, s4_done, min(s4_count, findings_total), findings_total),
-        entry(5, s5_done, min(s5_count, vuln_total), vuln_total),
-        entry(6, s6_done, min(s6_count, disclosures_total), disclosures_total),
-    ]
-
-
 def _resolve_output_file(output_dir: str, rel_path: str) -> str:
     if (
         not rel_path
@@ -499,21 +412,6 @@ def _safe_revision_component(value: object) -> str:
     return component.strip("-")[:40] or "previous"
 
 
-def _benchmark_output_dir(results_dir: str, benchmark: str) -> Path:
-    """Create a fresh managed output directory for one benchmark run."""
-    root = Path(results_dir) / "benchmarks"
-    root.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^a-z0-9_-]+", "-", benchmark.lower()).strip("-") or "benchmark"
-    for _attempt in range(5):
-        candidate = root / f"{safe}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
-        try:
-            candidate.mkdir()
-        except FileExistsError:
-            continue
-        return candidate
-    raise HTTPException(status_code=500, detail="Could not allocate a benchmark output directory.")
-
-
 def _tokens_match(provided: str, expected: str) -> bool:
     """Constant-time token comparison that tolerates non-ASCII input.
 
@@ -550,12 +448,6 @@ def _validate_http_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("URL must use http or https")
     return value
-
-
-class BenchStartRequest(StrictRequest):
-    benchmark: str = Field(min_length=1, max_length=64)
-    max_turns: int = Field(default=100, ge=1, le=500)
-    capture_trajectory: bool = False
 
 
 class ImportRequest(StrictRequest):
@@ -778,11 +670,6 @@ def create_app(
         try:
             yield
         finally:
-            bench_tasks = list(app.state.bench_tasks.values())
-            for task in bench_tasks:
-                task.cancel()
-            if bench_tasks:
-                await asyncio.gather(*bench_tasks, return_exceptions=True)
             await manager.shutdown()
             purge_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -798,8 +685,6 @@ def create_app(
     app.state.terminal_token = secrets.token_urlsafe(32)
     app.state.local_directory_selections = {}
     app.state.active_terminals = 0
-    app.state.bench_tasks = {}
-    app.state.bench_task_meta = {}
     # One process-wide log handler routes records to the owning job's bus.
     install_web_log_handler(manager.bus_for_job)
 
@@ -973,7 +858,6 @@ def create_app(
                 request.url.path.startswith("/api/")
                 and request.url.path.endswith("/sandbox-executions")
             )
-            or request.url.path.startswith("/api/bench/")
         ):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -2027,206 +1911,6 @@ def create_app(
         return _output_file_response(
             _get_history_run(run_id)["output_dir"], path, download
         )
-
-    # ── Benchmark runs ───────────────────────────────────────────────────
-
-    @app.get("/api/bench/adapters")
-    def list_benchmark_adapters() -> dict:
-        adapters = registered_benchmarks()
-        return {
-            "adapters": adapters,
-            "capabilities": {
-                name: benchmark_platform_capability(name).public()
-                for name in adapters
-            },
-        }
-
-    @app.post("/api/bench/runs", status_code=202)
-    async def start_benchmark_run(request: BenchStartRequest) -> dict:
-        benchmark = request.benchmark.strip().lower()
-        if benchmark not in registered_benchmarks():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown benchmark adapter: {request.benchmark}",
-            )
-        platform_capability = benchmark_platform_capability(benchmark)
-        if not platform_capability.available:
-            raise HTTPException(status_code=400, detail=platform_capability.reason)
-        if benchmark in app.state.bench_task_meta.values():
-            raise HTTPException(
-                status_code=409,
-                detail=f"A {benchmark} benchmark run is already active.",
-            )
-        output_dir = _benchmark_output_dir(settings.results_dir, benchmark)
-        try:
-            adapter = create_benchmark_adapter(benchmark)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not initialize the benchmark adapter: {exc}",
-            ) from exc
-
-        provider = settings.provider()
-        config = AuditConfig(
-            target=benchmark,
-            output_dir=str(output_dir),
-            backend=settings.backend,
-            model=provider.model if provider.mode == "custom" else None,
-            provider_mode=provider.mode,
-            provider_base_url=provider.base_url or None,
-            provider_api_key=provider.api_key or None,
-            max_parallel=1,
-            log_level=settings.log_level,
-            sandbox_enabled=False,
-            trajectory_enabled=request.capture_trajectory,
-        )
-        try:
-            run_id = await asyncio.to_thread(
-                store.create_bench_run,
-                benchmark=benchmark,
-                adapter=type(adapter).__name__,
-                repo_dir="",
-                output_dir=str(output_dir),
-                backend=config.backend,
-                model=config.model,
-                started_at=time.time(),
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500, detail=f"Could not record the benchmark run: {exc}"
-            ) from exc
-
-        try:
-            runner = BenchRunner(
-                adapter,
-                config,
-                output_dir=output_dir,
-                max_turns=request.max_turns,
-                capture_trajectory=request.capture_trajectory,
-                store=store,
-                db_run_id=run_id,
-            )
-        except Exception as exc:
-            with suppress(Exception):
-                await asyncio.to_thread(
-                    store.finish_bench_run,
-                    run_id,
-                    status=RUN_FAILED,
-                    error=f"{type(exc).__name__}: {exc}"[:2000],
-                )
-            raise HTTPException(
-                status_code=500, detail=f"Could not initialize the benchmark runner: {exc}"
-            ) from exc
-
-        async def run_benchmark() -> None:
-            try:
-                await runner.run()
-            except asyncio.CancelledError:
-                with suppress(Exception):
-                    await asyncio.to_thread(
-                        store.finish_bench_run,
-                        run_id,
-                        status=RUN_CANCELLED,
-                        error="cancelled",
-                    )
-                raise
-            except Exception as exc:
-                logger.exception("Benchmark run %s failed", run_id)
-                with suppress(Exception):
-                    await asyncio.to_thread(
-                        store.finish_bench_run,
-                        run_id,
-                        status=RUN_FAILED,
-                        error=f"{type(exc).__name__}: {exc}"[:2000],
-                    )
-            finally:
-                app.state.bench_tasks.pop(run_id, None)
-                app.state.bench_task_meta.pop(run_id, None)
-
-        task = asyncio.create_task(run_benchmark())
-        app.state.bench_tasks[run_id] = task
-        app.state.bench_task_meta[run_id] = benchmark
-
-        def forget_benchmark_task(_task: asyncio.Task) -> None:
-            app.state.bench_tasks.pop(run_id, None)
-            app.state.bench_task_meta.pop(run_id, None)
-
-        task.add_done_callback(forget_benchmark_task)
-        return {
-            "run_id": run_id,
-            "benchmark": benchmark,
-            "status": RUN_RUNNING,
-            "output_dir": str(output_dir),
-        }
-
-    @app.get("/api/bench/runs")
-    def list_benchmark_runs(
-        limit: int = Query(default=50, ge=1, le=200),
-        offset: int = Query(default=0, ge=0),
-        status: str | None = Query(default=None, max_length=32),
-        benchmark: str | None = Query(default=None, max_length=64),
-        q: str | None = Query(default=None, max_length=256),
-    ) -> dict:
-        try:
-            runs, total = store.list_bench_runs(
-                limit=limit,
-                offset=offset,
-                status=status or None,
-                benchmark=benchmark or None,
-                query=q or None,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"runs": runs, "total": total, "limit": limit, "offset": offset}
-
-    @app.post("/api/bench/runs/{run_id}/cancel", status_code=202)
-    async def cancel_benchmark_run(run_id: int) -> dict:
-        task = app.state.bench_tasks.get(run_id)
-        if task is None:
-            run = await asyncio.to_thread(store.get_bench_run, run_id)
-            if run is None:
-                raise HTTPException(status_code=404, detail="Benchmark run not found.")
-            if run.get("status") != RUN_RUNNING:
-                raise HTTPException(
-                    status_code=409, detail="Benchmark run is not running."
-                )
-            # The process restarted and lost the task; finalize the stale row.
-            await asyncio.to_thread(
-                store.finish_bench_run,
-                run_id,
-                status=RUN_CANCELLED,
-                error="cancelled by operator (no active task)",
-            )
-            return {"run_id": run_id, "status": RUN_CANCELLED}
-        if task.done() or not task.cancel():
-            raise HTTPException(
-                status_code=409, detail="Benchmark run is already finishing."
-            )
-        await asyncio.to_thread(
-            store.finish_bench_run,
-            run_id,
-            status=RUN_CANCELLED,
-            error="cancelled by operator",
-        )
-        return {"run_id": run_id, "status": "cancelling"}
-
-    @app.get("/api/bench/runs/{run_id}")
-    def get_benchmark_run(run_id: int) -> dict:
-        run = store.get_bench_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Benchmark run not found.")
-        return run
-
-    @app.get("/api/bench/runs/{run_id}/file")
-    def benchmark_run_file(
-        run_id: int,
-        path: str = Query(min_length=1, max_length=4096),
-        download: bool = Query(default=False),
-    ):
-        run = store.get_bench_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Benchmark run not found.")
-        return _output_file_response(run["output_dir"], path, download)
 
     @app.post("/api/history/import", status_code=201)
     def import_history(request: ImportRequest) -> dict:

@@ -19,6 +19,7 @@ import subprocess
 import threading
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
 
 from .logger import get_logger
 from .process_supervisor import ProcessJob
@@ -127,14 +128,23 @@ def repo_local_path(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
     if not url:
         raise RepoError("Empty git repository URL.")
 
-    scp_match = _SCP_LIKE_RE.match(url)
-    if scp_match and "://" not in url:
-        host = scp_match.group("host")
-        path = scp_match.group("path")
+    local_path = Path(url).expanduser()
+    if local_path.is_absolute():
+        host = "local"
+        path = "/".join(
+            re.sub(r"[^A-Za-z0-9._-]+", "_", part.strip("\\/"))
+            for part in local_path.parts
+            if part.strip("\\/")
+        )
     else:
-        parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
-        host = parsed.hostname or "local"
-        path = parsed.path
+        scp_match = _SCP_LIKE_RE.match(url)
+        if scp_match and "://" not in url:
+            host = scp_match.group("host")
+            path = scp_match.group("path")
+        else:
+            parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
+            host = parsed.hostname or "local"
+            path = parsed.path
 
     path = path.removesuffix(".git").strip("/")
     segments = [s for s in path.split("/") if s]

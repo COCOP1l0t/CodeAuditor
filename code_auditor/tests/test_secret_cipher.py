@@ -40,7 +40,7 @@ def test_secret_cipher_rejects_a_symlinked_key_path(tmp_path: Path) -> None:
     link = tmp_path / "linked.key"
     link.symlink_to(real_key)
 
-    with pytest.raises(SecretCipherError, match="regular file"):
+    with pytest.raises(SecretCipherError, match="regular file|reparse point"):
         SecretCipher(str(link)).encrypt("x")
 
 

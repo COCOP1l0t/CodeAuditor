@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 
 from .utils import path_is_within
 
@@ -36,7 +37,7 @@ def list_local_wikis(
             ".git" in dirs or "index.md" in files
         )
         if is_wiki:
-            name = os.path.relpath(resolved, base)
+            name = Path(resolved).relative_to(base).as_posix()
             if (
                 _SAFE_WIKI_NAME.fullmatch(name)
                 and all(segment not in {".", ".."} for segment in name.split("/"))

@@ -13,7 +13,12 @@ from code_auditor.retention import (
     load_retain_manifest,
     secure_generated_manifest_mode,
 )
-from code_auditor.secure_fs import private_file_is_secure
+from code_auditor.secure_fs import harden_private_file, private_file_is_secure
+
+
+def _harden_if_windows(path: Path) -> None:
+    if os.name == "nt":
+        harden_private_file(path)
 
 
 def _write_retained_tree(root: Path) -> None:
@@ -39,6 +44,7 @@ def _write_retained_tree(root: Path) -> None:
         encoding="utf-8",
     )
     manifest_path.chmod(0o600)
+    _harden_if_windows(manifest_path)
 
 
 def test_export_retained_artifacts_replaces_destination_with_manifest_only(
@@ -118,6 +124,9 @@ def test_manifest_rejects_hardlinked_files(tmp_path: Path) -> None:
         load_retain_manifest(source)
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows private-file enforcement uses DACLs"
+)
 def test_manifest_rejects_group_or_world_access(tmp_path: Path) -> None:
     source = tmp_path / "scratch"
     _write_retained_tree(source)
@@ -159,6 +168,7 @@ def test_manifest_rejects_nonportable_support_file(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["files"].append({"path": "config.json", "role": "support"})
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _harden_if_windows(manifest_path)
 
     with pytest.raises(RetentionError, match="references disposable"):
         load_retain_manifest(source)
@@ -172,6 +182,7 @@ def test_manifest_allows_bounded_binary_reproduction_input(tmp_path: Path) -> No
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["files"].append({"path": "state.sav", "role": "input"})
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _harden_if_windows(manifest_path)
 
     loaded = load_retain_manifest(source)
 

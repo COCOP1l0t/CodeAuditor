@@ -232,7 +232,7 @@ def load_web_settings(path: str = DEFAULT_SETTINGS_PATH) -> WebSettings:
         or added_sandbox_mode or added_sandbox_runtime
     ) and not migrated_legacy_file:
         _write_settings_file(config_path, {**defaults, **raw})
-    os.chmod(config_path, 0o600)
+    harden_private_file(config_path)
     return _validate_settings(config_path, {**defaults, **raw})
 
 

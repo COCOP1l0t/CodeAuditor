@@ -1472,6 +1472,19 @@ def _make_app(tmp_path):
     )
 
 
+def _force_stage56_available(monkeypatch) -> None:
+    capability = SimpleNamespace(
+        available=True,
+        reason="test platform",
+        public=lambda: {"available": True, "reason": "test platform"},
+    )
+    monkeypatch.setattr(
+        server_module,
+        "stage56_execution_capability",
+        lambda *_args, **_kwargs: capability,
+    )
+
+
 def _make_managed_repo(base, name: str = "github.com/user/repo") -> str:
     repo = base / "repo" / Path(name)
     (repo / ".git").mkdir(parents=True)
@@ -1665,6 +1678,7 @@ def test_api_dashboard_returns_compact_operational_summary(tmp_path) -> None:
 
 
 def test_api_sandbox_capability_reports_server_check(tmp_path, monkeypatch) -> None:
+    _force_stage56_available(monkeypatch)
     capability = SimpleNamespace(
         available=True,
         reason="runtime ready",
@@ -1693,6 +1707,7 @@ def test_api_sandbox_capability_reports_server_check(tmp_path, monkeypatch) -> N
 
 
 def test_api_rejects_unavailable_docker_sandbox_setting(tmp_path, monkeypatch) -> None:
+    _force_stage56_available(monkeypatch)
     capability = SimpleNamespace(available=False, reason="sandbox image missing")
     monkeypatch.setattr(
         server_module,
@@ -1718,6 +1733,7 @@ def test_api_rejects_unavailable_docker_sandbox_setting(tmp_path, monkeypatch) -
 
 
 def test_api_revalidates_docker_sandbox_before_start(tmp_path, monkeypatch) -> None:
+    _force_stage56_available(monkeypatch)
     repository = "github.com/user/repo"
     _make_managed_repo(tmp_path, repository)
     settings = WebSettings.for_state_dir(str(tmp_path))
@@ -3397,6 +3413,10 @@ def test_apply_reproduction_draft_archives_previous_disclosure(
     manifest_path = draft / "retain-manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     manifest_path.chmod(0o600)
+    if os.name == "nt":
+        from code_auditor.secure_fs import harden_private_file
+
+        harden_private_file(manifest_path)
     (draft / "unregistered.txt").write_text("must not be applied\n", encoding="utf-8")
     store.create_reproduction(
         job_key=job_key,
@@ -3568,7 +3588,7 @@ def test_api_history_import_results_tree(tmp_path, monkeypatch) -> None:
     body = res.json()
     assert body["imported"] == 2
 
-    by_project = {r["output_dir"].split("/")[-2]: r for r in body["runs"]}
+    by_project = {Path(r["output_dir"]).parent.name: r for r in body["runs"]}
     assert by_project["qemu"]["target"] == "/repos/qemu"
     assert by_project["qemu"]["started_at"] is not None  # parsed from dir date
     assert by_project["other"]["target"].endswith("/other")
@@ -3815,7 +3835,7 @@ def test_api_disclosure_artifact_uses_database_registered_path(tmp_path) -> None
         },
     )
     assert response.status_code == 200
-    assert response.content == b"# Local vulnerability report\n"
+    assert response.content.replace(b"\r\n", b"\n") == b"# Local vulnerability report\n"
     assert (
         client.get(
             "/api/disclosures/artifact",

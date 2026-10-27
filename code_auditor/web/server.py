@@ -277,7 +277,9 @@ def _scan_results(output_dir: str) -> dict:
         if not base.is_dir():
             return []
         return sorted(
-            str(p.relative_to(base)) for p in base.glob(pattern) if p.is_file()
+            p.relative_to(base).as_posix()
+            for p in base.glob(pattern)
+            if p.is_file()
         )
 
     return {
@@ -289,7 +291,8 @@ def _scan_results(output_dir: str) -> dict:
         "reproduction_result": rel("reproduction-result.json"),
         "trajectories": rel("trajectories/**/*.json"),
         "agent_logs": [
-            str(path.relative_to(base)) for path in _agent_log_paths(output_dir)
+            path.relative_to(base).as_posix()
+            for path in _agent_log_paths(output_dir)
         ],
     }
 
@@ -312,7 +315,7 @@ def _latest_agent_log(output_dir: str) -> tuple[Path, str] | None:
     if not paths:
         return None
     path = paths[-1]
-    return path, str(path.relative_to(Path(output_dir)))
+    return path, path.relative_to(Path(output_dir)).as_posix()
 
 
 def _agent_log_response(output_dir: str, download: bool):
@@ -2003,7 +2006,7 @@ def create_app(
         for path in sorted(base.rglob("*.json")):
             if path == root_path or not path.is_file():
                 continue
-            relative = str(path.relative_to(base))
+            relative = path.relative_to(base).as_posix()
             try:
                 size = path.stat().st_size
             except OSError:

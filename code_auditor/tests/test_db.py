@@ -24,6 +24,7 @@ from code_auditor.db import (
     scan_output_dir,
 )
 from code_auditor.disclosures import build_dedupe_key
+from code_auditor.secure_fs import harden_private_file
 from code_auditor.trajectory import TrajectoryRecorder, validate_trajectory
 
 
@@ -166,6 +167,8 @@ def _write_stage6_retention(out: Path, vuln_id: str = "H-01") -> Path:
         encoding="utf-8",
     )
     manifest.chmod(0o600)
+    if os.name == "nt":
+        harden_private_file(manifest)
     return disclosure
 
 
@@ -185,6 +188,8 @@ def _write_stage6_retained_evidence(out: Path, vuln_id: str = "H-01") -> Path:
     )
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     manifest_path.chmod(0o600)
+    if os.name == "nt":
+        harden_private_file(manifest_path)
     return disclosure
 
 

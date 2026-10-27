@@ -780,7 +780,7 @@ def scan_output_dir(
                         "; ".join(graph_errors),
                     )
                 else:
-                    trigger_graph_path = str(trigger_graph.relative_to(base))
+                    trigger_graph_path = trigger_graph.relative_to(base).as_posix()
             asan_report = report.parent / ASAN_REPORT_FILENAME
             asan_report_path = ""
             if asan_report.is_file():
@@ -792,12 +792,12 @@ def scan_output_dir(
                         "; ".join(asan_errors),
                     )
                 else:
-                    asan_report_path = str(asan_report.relative_to(base))
+                    asan_report_path = asan_report.relative_to(base).as_posix()
             result["pocs"].append(
                 {
                     "vuln_id": vuln_id,
                     "status": status,
-                    "report_path": str(report.relative_to(base)),
+                    "report_path": report.relative_to(base).as_posix(),
                     "trigger_graph_path": trigger_graph_path,
                     "asan_report_path": asan_report_path,
                 }
@@ -835,14 +835,14 @@ def scan_output_dir(
 
             def _rel(name: str) -> str:
                 p = disclosure / name
-                return str(p.relative_to(base)) if p.is_file() else ""
+                return p.relative_to(base).as_posix() if p.is_file() else ""
 
             trigger_graph_path, asan_report_path = _retained_stage6_evidence(
                 disclosure, entry.name
             )
 
             def _evidence_rel(path: str) -> str:
-                return str(Path(path).relative_to(base)) if path else ""
+                return Path(path).relative_to(base).as_posix() if path else ""
 
             result["disclosures"].append(
                 {
@@ -1953,7 +1953,11 @@ class AuditStore:
                 graph_path, asan_path = evidence_for(disclosure_dir)
 
                 def stored_path(path: str) -> str:
-                    return os.path.relpath(path, output_dir) if path else ""
+                    return (
+                        Path(os.path.relpath(path, output_dir)).as_posix()
+                        if path
+                        else ""
+                    )
 
                 cursor = conn.execute(
                     """

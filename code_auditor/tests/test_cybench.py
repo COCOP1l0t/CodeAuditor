@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,10 @@ import pytest
 from code_auditor.bench import Submission, create, registered
 from code_auditor.bench.adapters.cybench import CyBenchAdapter
 from code_auditor.bench.ctf import CommandResult, CTFWorkspaceError, run_command
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="CyBench requires bash; use WSL2/Linux on Windows"
+)
 
 OFFLINE = "benchmark/demo/crypto/easy-task"
 SERVER = "benchmark/demo/web/[Hard] server task"

@@ -120,7 +120,16 @@ class _AgentRunControl:
         if os.name == "nt" and isinstance(pid, int):
             try:
                 self.process_job.assign_pid(pid)
-            except Exception:
+            except Exception as exc:
+                # A status check can race a process which has already exited.
+                # Win32 error 87 means the PID is no longer assignable; there
+                # is no descendant tree left to contain in that case.
+                if getattr(exc, "args", ()) and exc.args[0] == 87:
+                    logger.warning(
+                        "Agent process pid=%s exited before Job Object assignment.",
+                        pid,
+                    )
+                    return
                 with contextlib.suppress(Exception):
                     process.kill()
                 raise
@@ -672,7 +681,10 @@ def _open_agent_log(log_file: str | None) -> TextIO | None:
         log_fh.write("\n--- new agent invocation ---\n\n")
         log_fh.flush()
     else:
-        os.utime(log_fh.fileno(), None)
+            if os.name == "nt":
+                os.utime(log_file, None)
+            else:
+                os.utime(log_fh.fileno(), None)
     return log_fh
 
 

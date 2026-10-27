@@ -2081,6 +2081,364 @@ async function viewLatestAgentLog(preferReproduction = false) {
 $("btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(false));
 $("r-btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(true));
 
+const trajectoryView = {
+  runId: null,
+  index: null,
+  document: null,
+  documentPath: "__root__",
+  selectedStepId: null,
+  actualTime: true,
+  expanded: false,
+  query: "",
+  cache: new Map(),
+};
+
+function trajectoryContentText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => trajectoryContentText(item)).filter(Boolean).join("\n");
+  }
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.content === "string") return value.content;
+    if (typeof value.message === "string") return value.message;
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function trajectoryPretty(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function trajectoryPreview(value, limit = 150) {
+  const text = trajectoryContentText(value).replace(/\s+/g, " ").trim();
+  if (!text) return "—";
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function trajectoryStepKind(step) {
+  const source = String(step?.source || "agent").toLowerCase();
+  if (source === "agent" && Array.isArray(step.tool_calls) && step.tool_calls.length) {
+    return "tool";
+  }
+  return ["user", "system", "agent"].includes(source) ? source : "agent";
+}
+
+function trajectoryStepLabel(step) {
+  const tools = Array.isArray(step?.tool_calls) ? step.tool_calls : [];
+  if (tools.length) {
+    return tools.map((call) => call.function_name || "tool").join(", ");
+  }
+  const message = trajectoryContentText(step?.message);
+  if (message) return trajectoryPreview(message, 90);
+  return step?.source === "system" ? "system event" : "agent step";
+}
+
+function trajectoryStepSearchText(step) {
+  return JSON.stringify(step || {}).toLowerCase();
+}
+
+function trajectoryDurationMs(step) {
+  const metrics = step?.metrics;
+  const extra = metrics && typeof metrics === "object" ? metrics.extra : null;
+  for (const value of [extra?.duration_ms, metrics?.duration_ms]) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return value;
+    }
+  }
+  return 0;
+}
+
+function trajectoryTimestampMs(step) {
+  const value = Date.parse(String(step?.timestamp || ""));
+  return Number.isFinite(value) ? value : null;
+}
+
+function trajectoryDocumentStats(document) {
+  const steps = Array.isArray(document?.steps) ? document.steps : [];
+  const toolCalls = steps.reduce(
+    (count, step) => count + (Array.isArray(step.tool_calls) ? step.tool_calls.length : 0),
+    0,
+  );
+  const metrics = document?.final_metrics && typeof document.final_metrics === "object"
+    ? document.final_metrics
+    : {};
+  const tokens = Number(metrics.total_prompt_tokens || 0) + Number(metrics.total_completion_tokens || 0);
+  const cost = Number(metrics.total_cost_usd || 0);
+  return { steps: steps.length, toolCalls, tokens, cost };
+}
+
+function trajectoryTimingRows(steps) {
+  const timestamps = steps.map(trajectoryTimestampMs);
+  const valid = trajectoryView.actualTime && timestamps.every((value) => value !== null);
+  if (!valid) {
+    return steps.map((_step, index) => ({
+      start: index,
+      end: index + 1,
+      duration: 1,
+    }));
+  }
+  const starts = timestamps.slice();
+  const durations = steps.map(trajectoryDurationMs);
+  const ends = starts.map((start, index) => {
+    if (durations[index] > 0) return start + durations[index];
+    const next = starts[index + 1];
+    return next !== undefined && next > start ? next : start + 1;
+  });
+  return starts.map((start, index) => ({
+    start,
+    end: Math.max(ends[index], start + 1),
+    duration: Math.max(ends[index] - start, 1),
+  }));
+}
+
+function renderTrajectoryStats(document) {
+  const stats = trajectoryDocumentStats(document);
+  const chips = [
+    `${stats.steps} steps`,
+    `${stats.toolCalls} tools`,
+    `${stats.tokens.toLocaleString()} tokens`,
+  ];
+  if (stats.cost > 0) chips.push(`$${stats.cost.toFixed(4)}`);
+  const runtime = document?.final_metrics?.wall_time_seconds;
+  if (typeof runtime === "number" && runtime > 0) chips.push(`${runtime.toFixed(1)}s`);
+  $("trajectory-stats").innerHTML = chips
+    .map((text) => `<span class="trajectory-stat">${escapeHtml(text)}</span>`)
+    .join("");
+}
+
+function renderTrajectoryTimeline(document) {
+  const timeline = $("trajectory-timeline");
+  const steps = Array.isArray(document?.steps) ? document.steps : [];
+  if (!steps.length) {
+    timeline.innerHTML = '<div class="trajectory-empty">No trajectory steps.</div>';
+    return;
+  }
+  const rows = trajectoryTimingRows(steps);
+  const domainStart = Math.min(...rows.map((row) => row.start));
+  const domainEnd = Math.max(...rows.map((row) => row.end));
+  const domain = Math.max(domainEnd - domainStart, 1);
+  timeline.innerHTML = rows
+    .map((row, index) => {
+      const step = steps[index];
+      const kind = trajectoryStepKind(step);
+      const left = ((row.start - domainStart) / domain) * 100;
+      const width = Math.max((row.duration / domain) * 100, 0.6);
+      const title = `${trajectoryStepLabel(step)} · ${row.duration}${trajectoryView.actualTime ? "ms" : " slot"}`;
+      return `
+        <div class="trajectory-time-row">
+          <span class="trajectory-time-label" title="${escapeHtml(trajectoryStepLabel(step))}">
+            #${step.step_id || index + 1} ${escapeHtml(step.source || "agent")}
+          </span>
+          <span class="trajectory-time-track">
+            <button type="button" class="trajectory-time-span source-${kind} ${Array.isArray(step.tool_calls) && step.tool_calls.length ? "has-tools" : ""} ${trajectoryView.selectedStepId === step.step_id ? "is-selected" : ""}"
+                    data-trajectory-step="${escapeHtml(String(step.step_id || index + 1))}"
+                    style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%"
+                    title="${escapeHtml(title)}"></button>
+          </span>
+        </div>`;
+    })
+    .join("");
+}
+
+function renderTrajectoryLedger(document) {
+  const ledger = $("trajectory-ledger");
+  const steps = Array.isArray(document?.steps) ? document.steps : [];
+  const query = trajectoryView.query.trim().toLowerCase();
+  const visible = steps.filter((step) => !query || trajectoryStepSearchText(step).includes(query));
+  if (!visible.length) {
+    ledger.innerHTML = `<div class="trajectory-empty">${steps.length ? "No matching steps." : "No trajectory steps."}</div>`;
+    return;
+  }
+  ledger.innerHTML = "";
+  for (const step of visible) {
+    const stepId = Number(step.step_id || 0);
+    const kind = trajectoryStepKind(step);
+    const tools = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+    const results = Array.isArray(step.observation?.results) ? step.observation.results : [];
+    const metrics = step.metrics && typeof step.metrics === "object" ? step.metrics : {};
+    const tokenCount = Number(metrics.prompt_tokens || 0) + Number(metrics.completion_tokens || 0);
+    const duration = trajectoryDurationMs(step);
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `trajectory-row ${trajectoryView.selectedStepId === stepId ? "is-selected" : ""}`;
+    row.dataset.trajectoryStep = String(stepId);
+    row.setAttribute("role", "listitem");
+    row.innerHTML = `
+      <span class="trajectory-index">#${stepId}</span>
+      <span class="trajectory-kind trajectory-kind-${kind}">${escapeHtml(kind)}</span>
+      <span class="trajectory-row-main">
+        <span class="trajectory-row-title">${escapeHtml(trajectoryStepLabel(step))}</span>
+        <span class="trajectory-row-preview">${escapeHtml(trajectoryPreview(step.message || tools.map((call) => call.arguments) || results.map((result) => result.content)))}</span>
+      </span>
+      <span class="trajectory-row-meta">${duration ? `${duration}ms` : ""}${duration && tokenCount ? " · " : ""}${tokenCount ? `${tokenCount} tok` : ""}</span>`;
+    ledger.appendChild(row);
+    for (const call of tools) {
+      const subrow = document.createElement("div");
+      subrow.className = `trajectory-subrow ${trajectoryView.expanded || query ? "" : "is-hidden"}`;
+      subrow.innerHTML = `<span>└</span><strong>${escapeHtml(call.function_name || "tool")}</strong><span>${escapeHtml(trajectoryPreview(call.arguments, 110))}</span>`;
+      ledger.appendChild(subrow);
+    }
+  }
+}
+
+function renderTrajectoryInspector() {
+  const inspector = $("trajectory-inspector");
+  const step = Array.isArray(trajectoryView.document?.steps)
+    ? trajectoryView.document.steps.find((item) => item.step_id === trajectoryView.selectedStepId)
+    : null;
+  if (!step) {
+    inspector.innerHTML = '<div class="trajectory-inspector-empty">Select a step to inspect its message, tool calls, results, and metrics.</div>';
+    return;
+  }
+  const tools = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+  const results = Array.isArray(step.observation?.results) ? step.observation.results : [];
+  const meta = [
+    `step ${step.step_id}`,
+    step.source || "agent",
+    step.timestamp || "no timestamp",
+    trajectoryDurationMs(step) ? `${trajectoryDurationMs(step)}ms` : "duration unknown",
+  ];
+  inspector.innerHTML = `
+    <div class="trajectory-inspector-header">
+      <h3>Step #${escapeHtml(String(step.step_id || "?"))}</h3>
+      <span class="trajectory-kind trajectory-kind-${trajectoryStepKind(step)}">${escapeHtml(step.source || "agent")}</span>
+    </div>
+    <div class="trajectory-inspector-meta">
+      ${meta.map((text) => `<span class="trajectory-stat">${escapeHtml(text)}</span>`).join("")}
+    </div>
+    ${step.message ? `<section class="trajectory-inspector-section"><h4>Message</h4><pre>${escapeHtml(trajectoryPretty(step.message))}</pre></section>` : ""}
+    ${step.reasoning_content ? `<section class="trajectory-inspector-section"><h4>Reasoning</h4><pre>${escapeHtml(trajectoryPretty(step.reasoning_content))}</pre></section>` : ""}
+    ${tools.length ? `<section class="trajectory-inspector-section"><h4>Tool calls</h4>${tools.map((call) => `<div class="trajectory-tool-card"><strong>${escapeHtml(call.function_name || "tool")}</strong><pre>${escapeHtml(trajectoryPretty(call.arguments || {}))}</pre></div>`).join("")}</section>` : ""}
+    ${results.length ? `<section class="trajectory-inspector-section"><h4>Results</h4>${results.map((result) => `<pre>${escapeHtml(trajectoryPretty(result.content ?? result))}</pre>`).join("")}</section>` : ""}
+    ${step.metrics ? `<section class="trajectory-inspector-section"><h4>Metrics</h4><pre>${escapeHtml(trajectoryPretty(step.metrics))}</pre></section>` : ""}
+    ${step.extra ? `<section class="trajectory-inspector-section"><h4>Extra</h4><pre>${escapeHtml(trajectoryPretty(step.extra))}</pre></section>` : ""}
+  `;
+}
+
+function renderTrajectoryDocument() {
+  renderTrajectoryStats(trajectoryView.document);
+  renderTrajectoryTimeline(trajectoryView.document);
+  renderTrajectoryLedger(trajectoryView.document);
+  renderTrajectoryInspector();
+}
+
+function selectTrajectoryStep(stepId) {
+  trajectoryView.selectedStepId = Number(stepId);
+  renderTrajectoryTimeline(trajectoryView.document);
+  renderTrajectoryLedger(trajectoryView.document);
+  renderTrajectoryInspector();
+}
+
+async function loadTrajectoryDocument(path) {
+  const runId = trajectoryView.runId;
+  if (path === "__root__") return trajectoryView.index?.root || null;
+  const key = `${runId}:${path}`;
+  if (trajectoryView.cache.has(key)) return trajectoryView.cache.get(key);
+  const filePath = `trajectories/${path}`;
+  const res = await fetch(
+    `/api/history/${encodeURIComponent(runId)}/file?path=${encodeURIComponent(filePath)}`,
+    { cache: "no-store" },
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const document = JSON.parse(await res.text());
+  trajectoryView.cache.set(key, document);
+  return document;
+}
+
+async function showTrajectoryDocument(path) {
+  trajectoryView.documentPath = path;
+  trajectoryView.selectedStepId = null;
+  trajectoryView.document = await loadTrajectoryDocument(path);
+  renderTrajectoryDocument();
+}
+
+async function loadTrajectoryVisualization(runId) {
+  const panel = $("trajectory-visualizer-panel");
+  trajectoryView.runId = String(runId);
+  trajectoryView.index = null;
+  trajectoryView.document = null;
+  trajectoryView.selectedStepId = null;
+  trajectoryView.cache.clear();
+  try {
+    const res = await fetch(`/api/history/${encodeURIComponent(runId)}/trajectory`, {
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const index = await res.json();
+    const children = Array.isArray(index.children) ? index.children : [];
+    if (!index.root && !children.length) {
+      panel.hidden = true;
+      return;
+    }
+    trajectoryView.index = index;
+    const select = $("trajectory-document-select");
+    select.innerHTML = "";
+    if (index.root) {
+      select.appendChild(new Option("Run overview · trajectory.json", "__root__"));
+    }
+    for (const child of children) {
+      const suffix = child.valid === false ? " · invalid" : child.steps ? ` · ${child.steps} steps` : "";
+      select.appendChild(new Option(`${child.path}${suffix}`, child.path));
+    }
+    const first = index.root ? "__root__" : children[0]?.path;
+    if (!first) {
+      panel.hidden = true;
+      return;
+    }
+    select.value = first;
+    await showTrajectoryDocument(first);
+    panel.hidden = false;
+  } catch {
+    panel.hidden = true;
+  }
+}
+
+$("trajectory-document-select")?.addEventListener("change", async (event) => {
+  try {
+    await showTrajectoryDocument(event.target.value);
+  } catch (error) {
+    $("trajectory-ledger").innerHTML = `<div class="trajectory-empty">Could not load trajectory: ${escapeHtml(String(error))}</div>`;
+  }
+});
+
+$("trajectory-search")?.addEventListener("input", (event) => {
+  trajectoryView.query = String(event.target.value || "");
+  renderTrajectoryLedger(trajectoryView.document);
+});
+
+$("trajectory-actual-time")?.addEventListener("change", (event) => {
+  trajectoryView.actualTime = Boolean(event.target.checked);
+  renderTrajectoryTimeline(trajectoryView.document);
+});
+
+$("btn-trajectory-expand")?.addEventListener("click", (event) => {
+  trajectoryView.expanded = !trajectoryView.expanded;
+  event.currentTarget.textContent = trajectoryView.expanded ? "Collapse all" : "Expand all";
+  renderTrajectoryLedger(trajectoryView.document);
+});
+
+$("btn-trajectory-refresh")?.addEventListener("click", () => {
+  if (trajectoryView.runId) void loadTrajectoryVisualization(trajectoryView.runId);
+});
+
+$("trajectory-ledger")?.addEventListener("click", (event) => {
+  const row = event.target.closest("[data-trajectory-step]");
+  if (row) selectTrajectoryStep(row.dataset.trajectoryStep);
+});
+
+$("trajectory-timeline")?.addEventListener("click", (event) => {
+  const span = event.target.closest("[data-trajectory-step]");
+  if (span) selectTrajectoryStep(span.dataset.trajectoryStep);
+});
+
 async function loadRunResults(run) {
   const viewer = (path) => viewHistoryFile(run.id, path);
   try {
@@ -2094,8 +2452,10 @@ async function loadRunResults(run) {
     fillFileList("results-agent-logs", data.agent_logs, viewer);
     fillFileList("results-trajectories", data.trajectories, viewer);
     resultsPanel.hidden = false;
+    await loadTrajectoryVisualization(run.id);
   } catch {
     resultsPanel.hidden = true;
+    $("trajectory-visualizer-panel").hidden = true;
   }
 }
 
@@ -2736,6 +3096,7 @@ async function loadRunDetail(runId) {
 
 async function reloadRunDetail(runId) {
   stopAuditProcessTree();
+  $("trajectory-visualizer-panel").hidden = true;
   const resumeButton = $("btn-run-resume");
   resumeButton.hidden = true;
   resumeButton.dataset.resumeRun = "";
@@ -2803,6 +3164,7 @@ async function reloadRunDetail(runId) {
       `/api/history/${run.id}/agent-log?download=true`;
     resultsPanel.hidden = true;
     viewerPanel.hidden = true;
+    void loadTrajectoryVisualization(run.id);
     if (status.state === "running") startAuditProcessTree(run.id);
     connectDetailEvents(run.id);
   } else {

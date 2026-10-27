@@ -2028,6 +2028,10 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="process-command-panel"' in res.text
     assert 'id="process-command"' in res.text
     assert 'id="results-agent-logs"' in res.text
+    assert 'id="trajectory-visualizer-panel"' in res.text
+    assert 'id="trajectory-timeline"' in res.text
+    assert 'id="trajectory-ledger"' in res.text
+    assert 'id="trajectory-inspector"' in res.text
     assert 'id="btn-settings"' in res.text
     assert 'id="settings-dialog"' in res.text
     assert 'id="auth-gate"' in res.text
@@ -2075,6 +2079,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert script.status_code == 200
     assert script.headers["cache-control"] == "no-cache"
     assert "Original PoC status" in script.text
+    assert "loadTrajectoryVisualization" in script.text
+    assert "renderTrajectoryTimeline" in script.text
     assert "loadReproductionHistory" in script.text
     assert "openPocTerminal" in script.text
     assert "disclosureTerminalButtonHtml" in script.text

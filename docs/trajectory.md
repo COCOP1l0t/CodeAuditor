@@ -160,7 +160,9 @@ Web API：
   `blobs[]` 扫描整棵树的 `*/blobs/*`，路径相对 `trajectories/`）
 - `GET /api/history/{run_id}/file?path=trajectories/...` → 完整子文档原文
 - `GET /api/history/{run_id}/results` 的 `trajectories` 字段列出所有轨迹文件
-- Web run 详情页的 Results 面板有 **Trajectories** 分组，可直接点开全文
+- Web run 详情页的 Results 面板保留 **Trajectories** 文件列表；下方的 Trajectory
+  可视化窗口提供 run/child 文档切换、时间概览、Step ledger、工具调用/结果检查器、
+  搜索以及实际时间/等宽模式
 
 ## 已知边界
 

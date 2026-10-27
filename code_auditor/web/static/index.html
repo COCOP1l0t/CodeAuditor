@@ -513,6 +513,45 @@
         </div>
       </section>
 
+      <section class="panel" id="trajectory-visualizer-panel" hidden>
+        <header class="trajectory-header">
+          <div>
+            <h2>Trajectory</h2>
+            <p class="hint">ATIF event ledger and timing overview</p>
+          </div>
+          <div class="trajectory-stats" id="trajectory-stats"></div>
+        </header>
+        <div class="trajectory-toolbar">
+          <label class="trajectory-document-picker">
+            <span>Document</span>
+            <select id="trajectory-document-select"></select>
+          </label>
+          <label class="toolbar-search trajectory-search">
+            <span>Search</span>
+            <input id="trajectory-search" type="search" maxlength="256"
+                   autocomplete="off" placeholder="Search steps, tools, output…" />
+          </label>
+          <label class="trajectory-mode">
+            <input id="trajectory-actual-time" type="checkbox" checked />
+            Actual timing
+          </label>
+          <button type="button" id="btn-trajectory-refresh" class="btn btn-compact">Refresh</button>
+          <button type="button" id="btn-trajectory-expand" class="btn btn-compact">Expand all</button>
+        </div>
+        <div class="trajectory-overview" id="trajectory-overview">
+          <div class="trajectory-overview-title">Overview</div>
+          <div id="trajectory-timeline" class="trajectory-timeline" aria-label="Trajectory timing overview"></div>
+        </div>
+        <div class="trajectory-layout">
+          <div class="trajectory-ledger-shell">
+            <div id="trajectory-ledger" class="trajectory-ledger" role="list"></div>
+          </div>
+          <aside id="trajectory-inspector" class="trajectory-inspector">
+            <div class="trajectory-inspector-empty">Select a step to inspect its message, tool calls, results, and metrics.</div>
+          </aside>
+        </div>
+      </section>
+
       <section class="panel" id="viewer-panel" hidden>
         <h2 id="viewer-title">File</h2>
         <pre id="viewer-content"></pre>

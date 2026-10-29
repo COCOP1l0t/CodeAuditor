@@ -275,6 +275,10 @@ async def run_reproduction_review(
                 max_file_bytes=config.retain_max_file_bytes,
                 max_total_bytes=config.retain_max_total_bytes,
             )
+            # The sandbox agent may create this manifest with the process umask
+            # (commonly 0644). Finalize its mode before the first validation so
+            # a valid draft is not rejected solely for inherited permissions.
+            secure_generated_manifest_mode(str(persistent_draft))
             issues = validate_stage6_disclosure(str(persistent_draft))
             if issues:
                 _record_draft_issues(persistent_draft, issues)

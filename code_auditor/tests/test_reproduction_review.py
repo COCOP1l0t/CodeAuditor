@@ -61,11 +61,17 @@ async def test_local_reproduction_review_normalizes_disclosure_draft(
         }
         manifest_path = draft / "retain-manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        manifest_path.chmod(0o600)
+        # Reproduce a sandbox agent creating the manifest with the usual umask.
+        manifest_path.chmod(0o644)
 
     monkeypatch.setattr(reproduction_review, "run_agent", fake_run_agent)
+    def validate_secured_draft(path: str) -> list[ValidationIssue]:
+        manifest = Path(path) / "retain-manifest.json"
+        assert manifest.stat().st_mode & 0o777 == 0o600
+        return []
+
     monkeypatch.setattr(
-        reproduction_review, "validate_stage6_disclosure", lambda path: []
+        reproduction_review, "validate_stage6_disclosure", validate_secured_draft
     )
     config = AuditConfig(
         target=str(source),

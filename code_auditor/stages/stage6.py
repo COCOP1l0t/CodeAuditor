@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import re
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,9 +24,22 @@ from ..reproduction_status import (
     read_reproduction_status,
 )
 from ..retention import export_retained_artifacts, secure_generated_manifest_mode
+from ..retention import (
+    RETAIN_MANIFEST_FILENAME,
+    RetentionError,
+    load_retain_manifest,
+    write_retain_manifest_v2,
+)
 from ..sandbox import DockerScratch, docker_scratch
 from ..stage_runtime import finalize_checkpoint
+from ..submission_policy import (
+    SubmissionPolicy,
+    detect_submission_policy,
+    enforce_email_policy,
+    write_submission_policy,
+)
 from ..utils import collect_parallel_results, extract_json_object, run_parallel_limited
+from ..validation.stage5 import validate_stage5_trigger_graph
 from ..validation.stage6 import _report_sections, validate_stage6_disclosure
 from ..wiki import build_wiki_context
 
@@ -49,6 +63,133 @@ class _DisclosureCandidate:
 
 def _task_key(vuln_id: str) -> str:
     return checkpoint_key(6, vuln_id)
+
+
+def _stage5_evidence_status(
+    report_path: str,
+    config: AuditConfig,
+) -> tuple[bool, str]:
+    """Return whether Stage 5's retained evidence can be reused verbatim."""
+    poc_dir = Path(report_path).parent
+    status = read_reproduction_status(report_path)
+    if not is_reproduced_status(status):
+        return False, f"Stage 5 reproduction status is {status or 'missing'}"
+    vuln_id = stage5_vuln_id(poc_dir.name)
+    if vuln_id is None:
+        return False, "Stage 5 vulnerability id is invalid"
+    graph_issues = validate_stage5_trigger_graph(str(poc_dir), vuln_id)
+    if graph_issues:
+        return False, "trigger graph is missing or invalid"
+    # Agents commonly create manifests with the process umask. Tightening this
+    # single known metadata file is deterministic and required by the retention
+    # contract; it does not change any retained content hash.
+    secure_generated_manifest_mode(str(poc_dir))
+    try:
+        load_retain_manifest(
+            poc_dir,
+            required_paths=("report.md", "reproduce.sh"),
+            max_file_bytes=config.retain_max_file_bytes,
+            max_total_bytes=config.retain_max_total_bytes,
+        )
+    except RetentionError as exc:
+        return False, f"retained evidence manifest is invalid: {exc}"
+    return True, "Stage 5 report, trigger graph, retained manifest, sizes, and hashes are valid"
+
+
+def _submission_policy_context(policy: SubmissionPolicy) -> str:
+    if policy.submission_ready:
+        return (
+            "No target policy blocks generated reports. Still require independent "
+            "human validation before external submission."
+        )
+    return (
+        "TARGET SUBMISSION POLICY BLOCK: "
+        f"{policy.reason} Source: {policy.source}. "
+        f"Policy quote: {policy.quote or '(not extracted)'} "
+        "The email must be clearly marked as an internal draft and must not be "
+        "presented as ready to send."
+    )
+
+
+def _normalize_disclosure_package(disclosure_dir: str) -> None:
+    """Rebuild the ZIP at its root and refresh hashes after email policy edits."""
+    base = Path(disclosure_dir)
+    manifest_path = base / RETAIN_MANIFEST_FILENAME
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+
+    entrypoint_data = raw.get("entrypoint") if isinstance(raw, dict) else None
+    if isinstance(entrypoint_data, str):
+        entrypoint = entrypoint_data
+        platform = "linux"
+        interpreter = "sh"
+        argv: tuple[str, ...] = ()
+    elif isinstance(entrypoint_data, dict):
+        entrypoint = entrypoint_data.get("path")
+        platform = entrypoint_data.get("platform")
+        interpreter = entrypoint_data.get("interpreter")
+        raw_argv = entrypoint_data.get("argv", [])
+        argv = tuple(raw_argv) if isinstance(raw_argv, list) else ()
+    else:
+        return
+    if not all(isinstance(value, str) and value for value in (entrypoint, platform, interpreter)):
+        return
+
+    raw_entries = raw.get("files") if isinstance(raw, dict) else None
+    if not isinstance(raw_entries, list):
+        return
+    role_by_path: dict[str, str] = {}
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        role = entry.get("role")
+        if isinstance(path, str) and isinstance(role, str):
+            role_by_path[path] = role
+
+    required = {"report.md", "reproduce.sh", "email.txt", "disclosure.zip"}
+    for name in required:
+        if role_by_path.get(name):
+            continue
+        role_by_path[name] = (
+            "entrypoint"
+            if name == "reproduce.sh"
+            else "report"
+            if name == "report.md"
+            else "disclosure"
+        )
+
+    zip_roles = {"entrypoint", "script", "support", "report", "evidence", "input"}
+    zip_paths = [
+        path
+        for path, role in sorted(role_by_path.items())
+        if path not in {"email.txt", "disclosure.zip"}
+        and role in zip_roles
+        and (base / path).is_file()
+    ]
+    temporary = base / ".disclosure.zip.tmp"
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative in zip_paths:
+            archive.write(base / relative, arcname=relative)
+    os.replace(temporary, base / "disclosure.zip")
+
+    retained_paths = [
+        path
+        for path in role_by_path
+        if path != RETAIN_MANIFEST_FILENAME and (base / path).is_file()
+    ]
+    write_retain_manifest_v2(
+        base,
+        entrypoint=entrypoint,
+        platform=platform,
+        interpreter=interpreter,
+        argv=argv,
+        files=[(path, role_by_path[path]) for path in sorted(retained_paths)],
+    )
 
 
 def _vuln_id_from_report(report_path: str) -> str | None:
@@ -443,6 +584,10 @@ async def _run_disclosure(
     )
     persistent_disclosure_dir = os.path.join(persistent_stage6_vuln_dir, "disclosure")
     persistent_disclosure_report = os.path.join(persistent_disclosure_dir, "report.md")
+    submission_policy = detect_submission_policy(config.target)
+    submission_policy_path = os.path.join(
+        persistent_stage6_vuln_dir, "submission-policy.json"
+    )
 
     if checkpoint.is_complete(key):
         issues = validate_stage6_disclosure(persistent_disclosure_dir)
@@ -452,12 +597,42 @@ async def _run_disclosure(
                 f"Stage 6: Invalid completed artifacts for {vuln_id}: "
                 + "; ".join(issue.description for issue in issues)
             )
-        logger.info("Stage 6: %s already complete and validated, skipping.", vuln_id)
-        return persistent_disclosure_report
+        email_path = Path(persistent_disclosure_dir) / "email.txt"
+        email_text = _read_text(str(email_path))
+        if (
+            not submission_policy.submission_ready
+            and "X-CodeAuditor-Submission: blocked" not in email_text
+        ):
+            logger.warning(
+                "Stage 6: %s predates the submission-policy guard; regenerating.", vuln_id
+            )
+            checkpoint.clear(key)
+        else:
+            os.makedirs(persistent_stage6_vuln_dir, exist_ok=True)
+            write_submission_policy(submission_policy_path, submission_policy)
+            logger.info("Stage 6: %s already complete and validated, skipping.", vuln_id)
+            return persistent_disclosure_report
 
     logger.info("Stage 6: Starting disclosure preparation for %s.", vuln_id)
     poc_dir = str(Path(report_path).parent)
     finding_file = _find_finding_file(vuln_id, config.output_dir)
+    evidence_ok, evidence_reason = _stage5_evidence_status(report_path, config)
+    if evidence_ok:
+        evidence_context = (
+            f"{evidence_reason}. Reuse the Stage 5 retained report, evidence files, "
+            "reproduce entrypoint, manifest, and hashes. Do not rebuild the target or "
+            "rerun the PoC unless you discover a concrete missing or invalid artifact. "
+            "Create the disclosure report and email from the retained evidence; preserve "
+            "the verified observed output and do not invent new runtime results."
+        )
+        logger.info("Stage 6: Reusing validated Stage 5 evidence for %s.", vuln_id)
+    else:
+        evidence_context = (
+            f"Stage 5 evidence cannot be reused: {evidence_reason}. Re-verify the "
+            "reproduction and repair only the missing or invalid artifacts before "
+            "packaging the disclosure."
+        )
+        logger.warning("Stage 6: Stage 5 evidence reuse rejected for %s: %s", vuln_id, evidence_reason)
     if config.sandbox_enabled:
         identity = capture_repo_identity(config.target)
         source_commit = config.poc_source_commit or identity.get("commit") or ""
@@ -513,26 +688,55 @@ async def _run_disclosure(
                 "target_path": poc_target,
                 "disclosure_dir": disclosure_dir,
                 "vuln_id": vuln_id,
+                "stage5_evidence_context": evidence_context,
+                "submission_policy_context": _submission_policy_context(
+                    submission_policy
+                ),
                 "wiki_context": build_wiki_context(config, stage=6),
             },
         )
 
         log_file = os.path.join(stage6_vuln_dir, "agent.log")
-        await run_agent(
-            prompt,
-            work_config,
-            cwd=poc_target,
-            max_turns=_MAX_TURNS,
-            model=select_poc_model(config),
-            effort=_DEFAULT_EFFORT,
-            log_file=log_file,
-            sandbox=sandbox,
-        )
-        issues = validate_stage6_disclosure(disclosure_dir)
-        if issues:
-            raise ValueError(
-                f"Stage 6: Invalid disclosure artifacts for {vuln_id}: "
-                + "; ".join(issue.description for issue in issues)
+        current_prompt = prompt
+        issues = []
+        for attempt in range(2):
+            await run_agent(
+                current_prompt,
+                work_config,
+                cwd=poc_target,
+                max_turns=_MAX_TURNS,
+                model=select_poc_model(config),
+                effort=_DEFAULT_EFFORT,
+                log_file=log_file,
+                sandbox=sandbox,
+            )
+            enforce_email_policy(disclosure_dir, submission_policy)
+            _normalize_disclosure_package(disclosure_dir)
+            # Local-worktree agents commonly create metadata with the process
+            # umask too; harden before validation instead of only after export.
+            secure_generated_manifest_mode(disclosure_dir)
+            issues = validate_stage6_disclosure(disclosure_dir)
+            if not issues:
+                break
+            if attempt:
+                raise ValueError(
+                    f"Stage 6: Invalid disclosure artifacts for {vuln_id}: "
+                    + "; ".join(issue.description for issue in issues)
+                )
+            repair_lines = "\n".join(
+                f"- {issue.description}" for issue in issues
+            )
+            current_prompt = (
+                prompt
+                + "\n\n## Bounded disclosure validation repair pass\n"
+                + "Repair only the delivery defects listed below. Do not redo "
+                + "vulnerability analysis, invent evidence, or change the "
+                + "verified technical conclusion. Preserve the existing PoC "
+                + "and observed results.\n"
+                + repair_lines
+                + "\nUse the canonical report values for the email CVSS text. "
+                + "For binary evidence, register the file as an input/support "
+                + "artifact instead of forcing it to UTF-8 text."
             )
         if sandbox is not None:
             secure_generated_manifest_mode(disclosure_dir)
@@ -562,6 +766,8 @@ async def _run_disclosure(
                     + "; ".join(issue.description for issue in issues)
                 )
     finalize_checkpoint(checkpoint, key, valid=True)
+    os.makedirs(persistent_stage6_vuln_dir, exist_ok=True)
+    write_submission_policy(submission_policy_path, submission_policy)
     has_report = os.path.exists(disclosure_report)
     logger.info("Stage 6: %s complete (report=%s)", vuln_id, has_report)
     return disclosure_report if has_report else None
@@ -571,6 +777,7 @@ async def run_stage6(
     stage5_reports: list[str],
     config: AuditConfig,
     checkpoint: CheckpointManager,
+    progress: object | None = None,
 ) -> list[str]:
     """Prepare disclosure artifacts for each reproduced vulnerability in parallel."""
     reproduced = _filter_reproduced(stage5_reports)
@@ -581,6 +788,12 @@ async def run_stage6(
         return []
 
     repo_url = capture_repo_identity(config.target).get("repo_url", "")
+    if progress is not None:
+        progress.update(
+            items_done=0,
+            items_total=len(reproduced),
+            detail="Deduplicating reproduced findings",
+        )
     candidates = await _select_disclosure_candidates(
         reproduced,
         config,
@@ -589,15 +802,36 @@ async def run_stage6(
     if not candidates:
         return []
 
+    # Runtime-only counter for the orchestrator's final Stage 6 progress row.
+    config.stage6_candidate_total = len(candidates)
+    if progress is not None:
+        progress.update(
+            items_done=0,
+            items_total=len(candidates),
+            detail=f"Preparing {len(candidates)} deduplicated disclosures",
+        )
     logger.info(
-        "Stage 6: Preparing disclosures for %d reproduced vulnerabilities.",
+        "Stage 6: Preparing disclosures for %d reproduced vulnerabilities after dedupe.",
         len(candidates),
     )
+
+    completed = 0
+
+    def task_complete(index: int, candidate: _DisclosureCandidate) -> None:
+        nonlocal completed
+        completed += 1
+        if progress is not None:
+            progress.update(
+                items_done=completed,
+                items_total=len(candidates),
+                detail=f"Prepared {completed}/{len(candidates)} disclosure packages",
+            )
 
     results = await run_parallel_limited(
         candidates,
         config.max_parallel,
         lambda candidate, _: _run_disclosure(candidate.report_path, config, checkpoint),
+        on_complete=task_complete,
     )
 
     disclosure_reports = collect_parallel_results(

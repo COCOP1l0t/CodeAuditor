@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from types import SimpleNamespace
 
-from code_auditor.utils import collect_parallel_results
+from code_auditor.utils import collect_parallel_results, run_parallel_limited
 
 
 def test_collect_parallel_results_preserves_truthy_values_and_records_errors(caplog) -> None:
@@ -46,3 +47,28 @@ def test_collect_parallel_results_handles_empty_results() -> None:
         item_id=str,
     ) == []
     assert config.task_errors == []
+
+
+def test_run_parallel_limited_reports_each_completion() -> None:
+    completed: list[tuple[int, str]] = []
+
+    async def worker(item: str, index: int) -> str:
+        if item == "bad":
+            raise ValueError("broken")
+        return item.upper()
+
+    results = asyncio.run(
+        run_parallel_limited(
+            ["a", "bad", "c"],
+            2,
+            worker,
+            on_complete=lambda index, item: completed.append((index, item)),
+        )
+    )
+
+    assert [status for status, _value, _error in results] == [
+        "fulfilled",
+        "rejected",
+        "fulfilled",
+    ]
+    assert sorted(completed) == [(0, "a"), (1, "bad"), (2, "c")]

@@ -49,11 +49,13 @@ Start the Web UI and open `http://127.0.0.1:8000`:
 uv run code-auditor
 ```
 
+The Web UI has no account, password, login, or session authentication. It binds to `127.0.0.1` by default; only bind to another interface on a trusted network or behind your own access proxy.
+
 Web server options:
 
 | Flag | Description |
 |------|-------------|
-| `--host` | Bind address; default `0.0.0.0` |
+| `--host` | Bind address; default `127.0.0.1` |
 | `--port` | Listen port; default `8000` |
 
 Audit parameters such as repository, Wiki, backend, model, sandbox mode, parallelism, and output paths are managed in the Web UI and `~/.code_auditor/settings.json`. In **New Audit**, the target can be a managed checkout, a remote Git URL, or a local code folder selected with the native folder picker. Local folders are audited in place without running `git pull`. Run `code-auditor --help` for maintenance commands.
@@ -67,7 +69,7 @@ docker build -f docker/code-auditor-sandbox.Dockerfile \
 
 In **Settings → Stage 5/6 execution**, select **Docker** (the server's default Docker runtime), **gVisor** (`runsc`), or **Local worktree**. For containers, choose bridge networking or no network separately. The selected runtime must already be registered in Docker; an unavailable runtime fails the check or launch without falling back. Settings apply to new jobs and resumed executions. Offline mode also disables the containerized Agent's access to model APIs.
 
-Each new container launch pins the image ID and records the inspected runtime, resource settings, exit status, and verified cleanup under `.sandbox-executions/`. Its Agent logs are written by the host outside the container's mounts and survive scratch cleanup; these host-side records are not displayed in the Web UI and remain readable through the authenticated API. Older artifacts without records retain an unknown environment. See [sandbox operation and optional gVisor checks](docs/sandbox.md).
+Each new container launch pins the image ID and records the inspected runtime, resource settings, exit status, and verified cleanup under `.sandbox-executions/`. Its Agent logs are written by the host outside the container's mounts and survive scratch cleanup; these host-side records are not displayed in the Web UI and remain readable through the API. Older artifacts without records retain an unknown environment. See [sandbox operation and optional gVisor checks](docs/sandbox.md).
 
 The **Reproduce** tab retests an active Disclosure against the fetched remote default-branch HEAD. It records the immutable tested SHA, runs the retained reproducer in the configured Stage 5/6 sandbox, and then asks an Agent to analyze the current source and propose a Disclosure update. Runtime outcome, evidence level, and Agent disposition are stored separately. A successful retest creates a local draft only; **Apply Draft** archives the previous Disclosure revision and installs the validated draft without sending or publishing it.
 
@@ -95,6 +97,12 @@ See [QEMU-Security-Wiki](https://github.com/qianfei11/QEMU-Security-Wiki) for an
 ```
 
 The same repository commit reuses its output directory and resumes from checkpoints. Delete the output directory, or its `.markers/` directory, to start over.
+
+## Reliability controls
+
+Interrupted Web jobs are resumed automatically by default. Set `CODE_AUDITOR_AUTO_RESUME_INTERRUPTED=0` to disable this. Large clones can use a shallow depth with `CODE_AUDITOR_GIT_CLONE_DEPTH=1`; a full-history clone that reaches the timeout automatically retries once at depth 1. `CODE_AUDITOR_GIT_CLONE_TIMEOUT_SECONDS` changes the timeout.
+
+Stage 5 reproduces **Critical and High** findings by default. Enable **Full analysis** in New Audit, or set `CODE_AUDITOR_FULL_ANALYSIS=1`, to reproduce every severity. `CODE_AUDITOR_MAX_STAGE5_VULNS` can cap PoC work and `CODE_AUDITOR_MIN_STAGE5_CVSS` can apply an additional threshold. Stage 6 validates disclosure artifacts and performs one bounded delivery repair when only packaging defects remain.
 
 ## Development
 

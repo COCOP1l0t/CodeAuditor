@@ -6,6 +6,7 @@ import pytest
 
 from code_auditor.config import AuditConfig
 from code_auditor.layout import stage1_paths, stage4_paths, stage_state_path
+from code_auditor.orchestrator import _select_stage5_vulnerabilities
 from code_auditor.stage_runtime import repair_until_valid, stage_span
 from code_auditor.stage_state import StageStateStore, read_stage_state
 
@@ -75,3 +76,75 @@ async def test_stage_span_persists_done_state_and_progress(tmp_path: Path) -> No
         ("progress", 3, {"items_done": 2, "items_total": 4, "detail": "half"}),
         ("end", 3),
     ]
+
+
+def test_stage_state_resume_preserves_completed_timing(tmp_path: Path) -> None:
+    store = StageStateStore(str(tmp_path))
+    store.begin(1, "research")
+    store.complete(1)
+    before = read_stage_state(str(tmp_path))[1]
+
+    resumed = StageStateStore(str(tmp_path))
+    resumed.reset(preserve_completed=True)
+    resumed.begin(1, "research again")
+    resumed.complete(1)
+    after = read_stage_state(str(tmp_path))[1]
+
+    assert after["status"] == "done"
+    assert after["started_at"] == before["started_at"]
+    assert after["ended_at"] == before["ended_at"]
+
+
+def test_stage5_priority_budget_sorts_and_caps(tmp_path: Path, monkeypatch) -> None:
+    low = tmp_path / "M-01.json"
+    high = tmp_path / "H-01.json"
+    medium = tmp_path / "M-02.json"
+    low.write_text('{"cvss_score": "5.3"}', encoding="utf-8")
+    high.write_text('{"cvss_score": "8.3"}', encoding="utf-8")
+    medium.write_text('{"cvss_score": "6.9"}', encoding="utf-8")
+    monkeypatch.setenv("CODE_AUDITOR_MIN_STAGE5_CVSS", "6.0")
+    monkeypatch.setenv("CODE_AUDITOR_MAX_STAGE5_VULNS", "1")
+
+    selected = _select_stage5_vulnerabilities([str(low), str(medium), str(high)])
+
+    assert selected == [str(high)]
+
+
+def test_stage5_defaults_to_high_and_critical(
+    tmp_path: Path, monkeypatch
+) -> None:
+    critical = tmp_path / "C-01.json"
+    high = tmp_path / "H-01.json"
+    medium = tmp_path / "M-01.json"
+    critical.write_text('{"severity": "Critical", "cvss_score": "9.8"}', encoding="utf-8")
+    high.write_text('{"severity": "High", "cvss_score": "7.5"}', encoding="utf-8")
+    medium.write_text('{"severity": "Medium", "cvss_score": "6.9"}', encoding="utf-8")
+    monkeypatch.delenv("CODE_AUDITOR_FULL_ANALYSIS", raising=False)
+    monkeypatch.delenv("CODE_AUDITOR_MIN_STAGE5_CVSS", raising=False)
+    monkeypatch.delenv("CODE_AUDITOR_MAX_STAGE5_VULNS", raising=False)
+
+    selected = _select_stage5_vulnerabilities(
+        [str(critical), str(high), str(medium)]
+    )
+
+    assert selected == [str(critical), str(high)]
+
+
+def test_stage5_full_analysis_includes_all_severities(
+    tmp_path: Path, monkeypatch
+) -> None:
+    critical = tmp_path / "C-01.json"
+    high = tmp_path / "H-01.json"
+    medium = tmp_path / "M-01.json"
+    critical.write_text('{"severity": "Critical", "cvss_score": "9.8"}', encoding="utf-8")
+    high.write_text('{"severity": "High", "cvss_score": "7.5"}', encoding="utf-8")
+    medium.write_text('{"severity": "Medium", "cvss_score": "6.9"}', encoding="utf-8")
+    monkeypatch.delenv("CODE_AUDITOR_FULL_ANALYSIS", raising=False)
+    monkeypatch.delenv("CODE_AUDITOR_MIN_STAGE5_CVSS", raising=False)
+    monkeypatch.delenv("CODE_AUDITOR_MAX_STAGE5_VULNS", raising=False)
+
+    selected = _select_stage5_vulnerabilities(
+        [str(critical), str(high), str(medium)], full_analysis=True
+    )
+
+    assert selected == [str(critical), str(high), str(medium)]

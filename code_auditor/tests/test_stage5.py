@@ -9,6 +9,7 @@ from pathlib import Path
 from code_auditor.checkpoint import CheckpointManager
 from code_auditor.config import AuditConfig
 from code_auditor.poc_artifacts import load_asan_report
+from code_auditor.retention import write_retain_manifest_v2
 from code_auditor.stages import stage5
 from code_auditor.validation.stage5 import validate_stage5_trigger_graph
 
@@ -142,6 +143,21 @@ def test_run_stage5_records_standardized_graph_and_asan_names(
             "SUMMARY: AddressSanitizer: heap-buffer-overflow src/parser.c:91\n",
             encoding="utf-8",
         )
+        reproduce = poc_dir / "reproduce.sh"
+        reproduce.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        reproduce.chmod(0o700)
+        write_retain_manifest_v2(
+            poc_dir,
+            entrypoint="reproduce.sh",
+            platform="linux",
+            interpreter="sh",
+            files=[
+                ("report.md", "report"),
+                ("reproduce.sh", "entrypoint"),
+                ("trigger-graph.json", "evidence"),
+                ("asan-report.txt", "evidence"),
+            ],
+        )
         return "done"
 
     monkeypatch.setattr(stage5, "run_agent", fake_run_agent)
@@ -167,6 +183,23 @@ def test_run_stage5_excludes_false_positive_reports(tmp_path: Path, monkeypatch)
     reproduced_dir.mkdir(parents=True)
     (reproduced_dir / "report.md").write_text(
         "# H-01\n\n## Reproduction Status\n\nreproduced\n", encoding="utf-8"
+    )
+    (reproduced_dir / "trigger-graph.json").write_text(
+        json.dumps(_trigger_graph("H-01")), encoding="utf-8"
+    )
+    reproduce = reproduced_dir / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    reproduce.chmod(0o700)
+    write_retain_manifest_v2(
+        reproduced_dir,
+        entrypoint="reproduce.sh",
+        platform="linux",
+        interpreter="sh",
+        files=[
+            ("report.md", "report"),
+            ("reproduce.sh", "entrypoint"),
+            ("trigger-graph.json", "evidence"),
+        ],
     )
 
     fp_dir = output_dir / "stage5-pocs" / "H-02_fp"

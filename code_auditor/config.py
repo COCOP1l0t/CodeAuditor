@@ -77,6 +77,14 @@ class AuditConfig:
     # settings change affects the next call without mutating an in-flight one.
     agent_settings_source: "AuditConfig | None" = field(default=None, repr=False)
     target_au_count: int = UNLIMITED_AU_COUNT
+    # Stage 5 defaults to Critical/High findings only. Explicitly enabling
+    # full analysis reproduces every evaluated severity.
+    full_analysis: bool = field(
+        default_factory=lambda: os.environ.get(
+            "CODE_AUDITOR_FULL_ANALYSIS", ""
+        ).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     agent_timeout_seconds: int | None = DEFAULT_AGENT_TIMEOUT_SECONDS
     known_disclosures: tuple[dict[str, Any], ...] = field(
         default_factory=tuple, repr=False
@@ -132,6 +140,9 @@ class AuditConfig:
     # may return an awaitable so the Web job can persist the SQLite update off
     # the event loop.
     agent_history_changed: Callable[[], Any] | None = field(default=None, repr=False)
+    # Runtime-only observer for incremental usage persistence. Web jobs use it
+    # so a worker crash or resume does not discard token/cost accounting.
+    usage_stats_changed: Callable[[], Any] | None = field(default=None, repr=False)
     # Runtime-only accumulator of token/cost usage across agent invocations.
     # Keys: agent_calls, input_tokens, output_tokens,
     # cache_creation_input_tokens, cache_read_input_tokens, cost_usd.

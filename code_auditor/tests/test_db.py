@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -89,9 +90,26 @@ def _make_output_dir(base: Path) -> Path:
 
     disclosure = out / "stage6-disclosures" / "H-01" / "disclosure"
     disclosure.mkdir(parents=True)
-    (disclosure / "report.md").write_text("# Disclosure", encoding="utf-8")
-    (disclosure / "email.txt").write_text("Subject: Vuln", encoding="utf-8")
-    (disclosure / "disclosure.zip").write_bytes(b"PK\x05\x06")
+    report_text = (
+        "# Test vulnerability\n\n"
+        "## Summary\n\nA bounded test disclosure.\n\n"
+        "## Why This Is a Security Issue\n\nIt crosses a test boundary.\n\n"
+        "## Severity Assessment\n\n"
+        "CVSS v3.1: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H - 9.8 Critical\n\n"
+        "## Security Impact\n\nTest impact.\n\n"
+        "## Root Cause\n\nMissing test validation.\n\n"
+        "## Reproduction\n\nRun `./reproduce.sh`.\n"
+    )
+    (disclosure / "report.md").write_text(report_text, encoding="utf-8")
+    (disclosure / "email.txt").write_text(
+        "Subject: Test vulnerability\n\nTest disclosure body.\n",
+        encoding="utf-8",
+    )
+    reproduce = disclosure / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    reproduce.chmod(0o755)
+    with zipfile.ZipFile(disclosure / "disclosure.zip", "w") as archive:
+        archive.writestr("report.md", report_text)
 
     return out
 
@@ -464,6 +482,27 @@ def test_record_run_stores_usage_stats(tmp_path) -> None:
     assert stats["cost_usd"] == 0.05
 
 
+def test_running_run_usage_can_be_persisted_incrementally(tmp_path) -> None:
+    store = AuditStore(str(tmp_path / "history.db"))
+    run_id = store.create_run(
+        AuditConfig(target=str(tmp_path / "target"), output_dir=str(tmp_path / "out")),
+        status=RUN_RUNNING,
+    )
+
+    updated = store.update_running_run_usage(
+        run_id,
+        {"agent_calls": 2, "input_tokens": 123, "output_tokens": 45},
+    )
+
+    assert updated is True
+    run = store.get_run(run_id)
+    assert json.loads(run["usage_stats"]) == {
+        "agent_calls": 2,
+        "input_tokens": 123,
+        "output_tokens": 45,
+    }
+
+
 def test_finish_run_updates_usage_stats(tmp_path) -> None:
     out = _make_output_dir(tmp_path)
     store = AuditStore(str(tmp_path / "history.db"))
@@ -527,7 +566,50 @@ def test_schema_init_is_idempotent(tmp_path) -> None:
         "active_started_at",
         "duration_known",
         "run_kind",
+        "full_analysis",
     } <= run_columns
+
+
+def test_schema_removes_legacy_account_and_session_tables(tmp_path) -> None:
+    db = tmp_path / "history.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                password_hash TEXT
+            );
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                token_digest TEXT
+            );
+            INSERT INTO users(id, username, password_hash)
+                VALUES (1, 'legacy', 'old-password-hash');
+            INSERT INTO sessions(id, user_id, token_digest)
+                VALUES (1, 1, 'old-session-token');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    AuditStore(str(db))
+
+    conn = sqlite3.connect(db)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        conn.close()
+    assert "users" not in tables
+    assert "sessions" not in tables
 
 
 def test_schema_migrates_poc_backfill_runs_to_maintenance(tmp_path) -> None:

@@ -48,7 +48,8 @@ DISPOSABLE_DIRECTORY_NAMES = frozenset(
         "venv",
     }
 )
-_PORTABLE_TEXT_ROLES = frozenset({"entrypoint", "script", "support"})
+_PORTABLE_TEXT_ROLES = frozenset({"entrypoint", "script"})
+_SCAN_IF_TEXT_ROLES = frozenset({"support"})
 _FORBIDDEN_PORTABLE_MARKERS = (
     b"/tmp/code-auditor/",
     b"/.code_auditor/repo/",
@@ -229,7 +230,7 @@ def _regular_file_stat(root: Path, relative_path: str) -> os.stat_result:
 
 
 def _validate_portable_text(root: Path, relative_path: str, role: str) -> None:
-    if role not in _PORTABLE_TEXT_ROLES:
+    if role not in _PORTABLE_TEXT_ROLES and role not in _SCAN_IF_TEXT_ROLES:
         return
     path = root / relative_path
     try:
@@ -237,13 +238,20 @@ def _validate_portable_text(root: Path, relative_path: str, role: str) -> None:
     except OSError as exc:
         raise RetentionError(f"cannot read retained text file {relative_path}: {exc}") from exc
     if b"\0" in content:
-        raise RetentionError(f"retained {role} must be a text file: {relative_path}")
+        if role in _PORTABLE_TEXT_ROLES:
+            raise RetentionError(f"retained {role} must be a text file: {relative_path}")
+        # Binary support payloads are legitimate reproduction inputs. They are
+        # still bounded by the manifest size and SHA-256 checks, but path-marker
+        # scanning is only meaningful for text.
+        return
     try:
         content.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise RetentionError(
-            f"retained {role} must use UTF-8 encoding: {relative_path}"
-        ) from exc
+        if role in _PORTABLE_TEXT_ROLES:
+            raise RetentionError(
+                f"retained {role} must use UTF-8 encoding: {relative_path}"
+            ) from exc
+        return
     for marker in _FORBIDDEN_PORTABLE_MARKERS:
         if marker in content:
             raise RetentionError(
@@ -354,7 +362,11 @@ def validate_retain_manifest_data(
         platform = entrypoint_data.get("platform")
         interpreter = entrypoint_data.get("interpreter")
         raw_argv = entrypoint_data.get("argv", [])
-        allowed = {("linux", "sh"), ("windows", "powershell")}
+        allowed = {
+            ("linux", "sh"),
+            ("linux", "bash"),
+            ("windows", "powershell"),
+        }
         if (platform, interpreter) not in allowed:
             raise RetentionError("unsupported entrypoint platform/interpreter")
         if (

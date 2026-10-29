@@ -216,7 +216,7 @@ Directories have mode `0700`; newly created records and logs have mode `0600`. R
 
 Records include Run/job and invocation identities, source commit, requested and inspected runtime/image identity, available Docker/runtime/kernel versions, requested and inspected resource/network settings, selected security options, exit/OOM state, and cleanup result. Missing version information remains `null`; a local binary version is not assumed to represent the daemon's runtime. Records intentionally omit command arguments, environment variables, credentials, and complete Docker inspect output. Agent logs still contain Agent output and should be treated as sensitive.
 
-The Web UI does not display these records; they stay host-side logs and journal files. Full records are available through the authenticated API (100 launches per page by default):
+The Web UI does not display these records; they stay host-side logs and journal files. Full records are available through the API (100 launches per page by default):
 
 - `GET /api/history/{run_id}/sandbox-executions?limit=100&offset=0` (maximum page size 500), filtered by Run ID even when output directories are reused.
 - `GET /api/reproduction/{job_key}/sandbox-executions`, for a standalone reproduction job retained by the Web worker.

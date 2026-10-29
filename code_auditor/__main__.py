@@ -45,8 +45,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Web UI bind host (default: 0.0.0.0)",
+        default="127.0.0.1",
+        help="Web UI bind host (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",

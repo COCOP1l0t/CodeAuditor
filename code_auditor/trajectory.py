@@ -96,6 +96,16 @@ _REDACTION_PATTERNS = (
 REDACTED = "[REDACTED]"
 
 _STEP_SOURCES = frozenset({"system", "user", "agent"})
+_CODEX_TOOL_ITEM_TYPES = frozenset(
+    {
+        "commandExecution",
+        "fileChange",
+        "mcpToolCall",
+        "dynamicToolCall",
+        "webSearch",
+        "collabAgentToolCall",
+    }
+)
 _AGENT_ONLY_FIELDS = (
     "model_name",
     "reasoning_effort",
@@ -386,6 +396,9 @@ class TrajectoryRecorder:
         self._codex_reasoning: dict[str, str] = {}
         self._codex_calls: dict[str, dict[str, Any]] = {}
         self._codex_usage: dict[str, Any] | None = None
+        self._codex_usage_total: dict[str, float] = {}
+        self._pending_codex_usage: dict[str, float] = {}
+        self._last_codex_message_step: int | None = None
         self._notes: list[str] = []
 
     # -- construction ------------------------------------------------------ #
@@ -900,12 +913,7 @@ class TrajectoryRecorder:
             usage = _codex_usage(payload)
             if usage:
                 self._codex_usage = usage
-                self.record_step_metrics(
-                    self._last_agent_step,
-                    usage,
-                    None,
-                    extra=None,
-                )
+                self._record_codex_usage_delta(usage)
             return
 
         if method == "item/agentMessage/delta":
@@ -914,7 +922,7 @@ class TrajectoryRecorder:
                 self._codex_text.append(delta)
             return
 
-        item = getattr(payload, "item", None)
+        item = _unwrap_root_model(getattr(payload, "item", None))
         if item is None:
             if method == "turn/completed":
                 self._flush_codex_message(model=model, payload=payload)
@@ -931,6 +939,11 @@ class TrajectoryRecorder:
             )
             if text:
                 self._codex_reasoning[item_id] = text
+            return
+
+        if item_type in {"userMessage", "plan", "hookPrompt"}:
+            return
+        if item_type not in _CODEX_TOOL_ITEM_TYPES:
             return
 
         if method == "item/started":
@@ -967,10 +980,12 @@ class TrajectoryRecorder:
             ],
             reasoning=reasoning,
             model=model,
+            llm_call_count=0,
         )
         error = getattr(item, "error", None)
         output = _first_text(
             getattr(item, "aggregatedOutput", None),
+            getattr(item, "aggregated_output", None),
             getattr(item, "output", None),
             getattr(item, "stdout", None),
             getattr(item, "result", None),
@@ -987,18 +1002,44 @@ class TrajectoryRecorder:
         reasoning = "\n".join(value for value in self._codex_reasoning.values()).strip()
         self._codex_text.clear()
         self._codex_reasoning.clear()
-        if not text and not reasoning:
+        turn = getattr(payload, "turn", None)
+        usage = _codex_usage(getattr(turn, "usage", None)) if turn is not None else None
+        if usage:
+            self._record_codex_usage_delta(usage)
+        if not text and not reasoning and not self._pending_codex_usage:
             return
-        self.agent_step(
+        step_id = self.agent_step(
             message=text,
             reasoning=reasoning or None,
             model=model,
             extra={"codex_event": "turn/completed"},
+            llm_call_count=1,
         )
-        turn = getattr(payload, "turn", None)
-        usage = _codex_usage(getattr(turn, "usage", None)) if turn is not None else None
-        if usage:
-            self.record_step_metrics(self._last_agent_step, usage, None)
+        self._last_codex_message_step = step_id
+        self._flush_codex_usage_delta()
+
+    def _record_codex_usage_delta(self, usage: Mapping[str, Any]) -> None:
+        """Record Codex's cumulative usage as a per-turn delta.
+
+        ``thread/tokenUsage/updated`` carries cumulative thread totals, often
+        several times per turn. Treating each update as a fresh charge makes
+        per-step sums wildly inconsistent with the run-level usage counters.
+        """
+        current = _usage_numbers(usage)
+        delta = _usage_delta(current, self._codex_usage_total)
+        self._codex_usage_total = current
+        for key, value in delta.items():
+            self._pending_codex_usage[key] = (
+                self._pending_codex_usage.get(key, 0.0) + value
+            )
+        self._flush_codex_usage_delta()
+
+    def _flush_codex_usage_delta(self) -> None:
+        if not self._pending_codex_usage or self._last_codex_message_step is None:
+            return
+        pending = dict(self._pending_codex_usage)
+        self._pending_codex_usage.clear()
+        self.record_step_metrics(self._last_codex_message_step, pending, None)
 
     # -- finalisation ------------------------------------------------------ #
 
@@ -1144,13 +1185,24 @@ def _metrics_from_usage(usage: Mapping[str, Any] | None) -> dict[str, Any]:
                 return value
         return None
 
-    input_tokens = number("input_tokens", "inputTokens", "prompt_tokens")
+    explicit_prompt = number("prompt_tokens", "total_prompt_tokens")
+    input_tokens = number("input_tokens", "inputTokens")
     cache_read = number("cache_read_input_tokens", "cachedInputTokens", "cached_tokens")
-    cache_write = number("cache_creation_input_tokens", "cacheCreationInputTokens")
+    cache_write = number(
+        "cache_creation_input_tokens",
+        "cacheCreationInputTokens",
+        "cache_write_input_tokens",
+    )
     output_tokens = number("output_tokens", "outputTokens", "completion_tokens")
-    reasoning_tokens = number("reasoningOutputTokens", "reasoning_tokens")
+    reasoning_tokens = number(
+        "reasoningOutputTokens",
+        "reasoning_output_tokens",
+        "reasoning_tokens",
+    )
 
-    if input_tokens is not None:
+    if explicit_prompt is not None:
+        metrics["prompt_tokens"] = int(explicit_prompt)
+    elif input_tokens is not None:
         total_prompt = input_tokens + (cache_read or 0) + (cache_write or 0)
         metrics["prompt_tokens"] = int(total_prompt)
     if output_tokens is not None:
@@ -1229,7 +1281,8 @@ def atif_totals_from_usage_stats(stats: Mapping[str, Any] | None) -> dict[str, A
                 return float(value)
         return None
 
-    inputs = number("input_tokens", "prompt_tokens")
+    prompt_total = number("prompt_tokens", "total_prompt_tokens")
+    inputs = number("input_tokens")
     outputs = number("output_tokens", "completion_tokens")
     cache_read = number("cache_read_input_tokens", "cached_tokens")
     cache_write = number("cache_creation_input_tokens")
@@ -1237,7 +1290,9 @@ def atif_totals_from_usage_stats(stats: Mapping[str, Any] | None) -> dict[str, A
     calls = number("agent_calls")
 
     totals: dict[str, Any] = {}
-    if inputs is not None:
+    if prompt_total is not None:
+        totals["total_prompt_tokens"] = int(prompt_total)
+    elif inputs is not None:
         totals["total_prompt_tokens"] = int(inputs + (cache_read or 0) + (cache_write or 0))
     if outputs is not None:
         totals["total_completion_tokens"] = int(outputs)
@@ -1284,6 +1339,70 @@ def _codex_usage(payload: Any) -> dict[str, Any] | None:
         if isinstance(inner, dict):
             return _codex_usage(inner)
     return data or None
+
+
+def _unwrap_root_model(value: Any) -> Any:
+    """Unwrap Pydantic ``RootModel`` values used by generated SDK unions."""
+    root = getattr(value, "root", None)
+    return root if root is not None else value
+
+
+_USAGE_NUMBER_ALIASES: dict[str, tuple[str, ...]] = {
+    "input_tokens": ("input_tokens", "inputTokens"),
+    "output_tokens": ("output_tokens", "outputTokens"),
+    "total_tokens": ("total_tokens", "totalTokens"),
+    "cache_read_input_tokens": (
+        "cache_read_input_tokens",
+        "cached_input_tokens",
+        "cachedInputTokens",
+    ),
+    "cache_write_input_tokens": (
+        "cache_write_input_tokens",
+        "cache_creation_input_tokens",
+        "cacheCreationInputTokens",
+    ),
+    "reasoning_output_tokens": (
+        "reasoning_output_tokens",
+        "reasoningOutputTokens",
+    ),
+}
+
+
+def _usage_numbers(usage: Mapping[str, Any]) -> dict[str, float]:
+    """Normalize one provider usage breakdown to numeric canonical keys."""
+    result: dict[str, float] = {}
+    for canonical, aliases in _USAGE_NUMBER_ALIASES.items():
+        for alias in aliases:
+            value = usage.get(alias)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            result[canonical] = float(value)
+            break
+    if "total_tokens" in result and "output_tokens" in result:
+        result["prompt_tokens"] = max(
+            0.0, result["total_tokens"] - result["output_tokens"]
+        )
+    else:
+        result["prompt_tokens"] = (
+            result.get("input_tokens", 0.0)
+            + result.get("cache_read_input_tokens", 0.0)
+            + result.get("cache_write_input_tokens", 0.0)
+        )
+    return result
+
+
+def _usage_delta(
+    current: Mapping[str, float], previous: Mapping[str, float]
+) -> dict[str, float]:
+    """Return non-negative per-key differences between two cumulative totals."""
+    delta: dict[str, float] = {}
+    for key, value in current.items():
+        before = previous.get(key, 0.0)
+        amount = value - before
+        # A new turn/thread resets the provider counters. Treat that as a new
+        # increment rather than silently dropping the first update.
+        delta[key] = amount if amount >= 0 else value
+    return delta
 
 
 def _codex_tool_name(item: Any, item_type: str) -> str:

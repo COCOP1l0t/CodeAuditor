@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS runs (
     model TEXT,
     max_parallel INTEGER,
     target_au_count INTEGER,
+    full_analysis INTEGER NOT NULL DEFAULT 0,
     log_level TEXT,
     status TEXT NOT NULL,
     run_kind TEXT NOT NULL DEFAULT 'audit',
@@ -262,26 +263,6 @@ CREATE TABLE IF NOT EXISTS analysis_units (
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_units_run ON analysis_units(run_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_units_target_key ON analysis_units(target_key);
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user')),
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at REAL NOT NULL,
-    last_login_at REAL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_digest TEXT NOT NULL UNIQUE,
-    created_at REAL NOT NULL,
-    expires_at REAL NOT NULL,
-    last_seen_at REAL NOT NULL,
-    revoked_at REAL
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_digest);
-CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS provider_settings (
     backend TEXT PRIMARY KEY CHECK(backend IN ('claude', 'codex')),
     mode TEXT NOT NULL DEFAULT 'local' CHECK(mode IN ('local', 'custom')),
@@ -355,6 +336,7 @@ _RUN_EXTRA_COLUMNS = {
     "active_started_at": '"active_started_at" REAL',
     "duration_known": '"duration_known" INTEGER NOT NULL DEFAULT 1',
     "run_kind": "\"run_kind\" TEXT NOT NULL DEFAULT 'audit'",
+    "full_analysis": '"full_analysis" INTEGER NOT NULL DEFAULT 0',
     # A terminal maintenance run may carry a non-fatal cleanup note. Keep it
     # separate from ``error`` so the History badge does not report a completed
     # batch as ``done ⚠`` while retaining the diagnostic for the detail view.
@@ -687,6 +669,8 @@ def scan_output_dir(
     vuln_dir = Path(stage_dir(str(base), 4))
     if vuln_dir.is_dir():
         for path in sorted(vuln_dir.glob("*.json")):
+            if path.name == "semantic-dedupe.json" or path.parent.name == "_pending":
+                continue
             vuln = _parse_vuln(path, repo_url)
             if vuln:
                 result["vulnerabilities"].append(vuln)
@@ -952,94 +936,6 @@ class AuditStore:
         finally:
             conn.close()
 
-    # ── Web authentication ────────────────────────────────────────────────
-
-    def auth_user_count(self) -> int:
-        """Return the number of accounts, used to gate first-run setup."""
-        with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
-        return int(row["count"] if row else 0)
-
-    @staticmethod
-    def _public_user(row: sqlite3.Row | dict) -> dict[str, object]:
-        return {
-            "id": int(row["id"]),
-            "username": str(row["username"]),
-            "role": str(row["role"]),
-            "is_active": bool(row["is_active"]),
-            "created_at": float(row["created_at"]),
-            "last_login_at": (
-                float(row["last_login_at"])
-                if row["last_login_at"] is not None
-                else None
-            ),
-        }
-
-    def create_auth_user(
-        self, username: str, password_hash: str, *, role: str = "user"
-    ) -> dict[str, object]:
-        now = time.time()
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO users(username, password_hash, role, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (username, password_hash, role, now),
-            )
-            row = conn.execute(
-                "SELECT id, username, role, is_active, created_at, last_login_at "
-                "FROM users WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-        if row is None:  # pragma: no cover - SQLite guarantees the row exists
-            raise RuntimeError("created user could not be loaded")
-        return self._public_user(row)
-
-    def create_initial_auth_admin(
-        self, username: str, password_hash: str
-    ) -> dict[str, object]:
-        """Atomically create the one allowed first-run administrator."""
-        now = time.time()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
-                raise ValueError("administrator setup has already been completed")
-            cursor = conn.execute(
-                """
-                INSERT INTO users(username, password_hash, role, created_at)
-                VALUES (?, ?, 'admin', ?)
-                """,
-                (username, password_hash, now),
-            )
-            row = conn.execute(
-                "SELECT id, username, role, is_active, created_at, last_login_at "
-                "FROM users WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-        if row is None:  # pragma: no cover - SQLite guarantees the row exists
-            raise RuntimeError("created administrator could not be loaded")
-        return self._public_user(row)
-
-    def get_auth_user_by_username(self, username: str) -> dict[str, object] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, username, password_hash, role, is_active,
-                       created_at, last_login_at
-                FROM users WHERE username = ? COLLATE NOCASE
-                """,
-                (username,),
-            ).fetchone()
-        return dict(row) if row is not None else None
-
-    def mark_auth_login(self, user_id: int, now: float | None = None) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE users SET last_login_at = ? WHERE id = ?",
-                (time.time() if now is None else now, user_id),
-            )
-
     # ── Agent provider settings ───────────────────────────────────────────
 
     def get_provider_settings(self) -> dict[str, dict[str, str]]:
@@ -1152,70 +1048,18 @@ class AuditStore:
         """Record that the operator stored the key file; False when not managed."""
         return self._secret_cipher.acknowledge_backup()
 
-    def create_auth_session(
-        self,
-        user_id: int,
-        token_digest: str,
-        *,
-        created_at: float,
-        expires_at: float,
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sessions(
-                    user_id, token_digest, created_at, expires_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (user_id, token_digest, created_at, expires_at, created_at),
-            )
-
-    def get_auth_user_by_session(
-        self, token_digest: str, *, now: float | None = None
-    ) -> dict[str, object] | None:
-        current = time.time() if now is None else now
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT u.id, u.username, u.role, u.is_active,
-                       u.created_at, u.last_login_at
-                FROM sessions s
-                JOIN users u ON u.id = s.user_id
-                WHERE s.token_digest = ?
-                  AND s.revoked_at IS NULL
-                  AND s.expires_at > ?
-                  AND u.is_active = 1
-                """,
-                (token_digest, current),
-            ).fetchone()
-            if row is not None:
-                conn.execute(
-                    "UPDATE sessions SET last_seen_at = ? WHERE token_digest = ?",
-                    (current, token_digest),
-                )
-        return self._public_user(row) if row is not None else None
-
-    def revoke_auth_session(
-        self, token_digest: str, *, now: float | None = None
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET revoked_at = ? "
-                "WHERE token_digest = ? AND revoked_at IS NULL",
-                (time.time() if now is None else now, token_digest),
-            )
-
-    def purge_expired_auth_sessions(self, *, now: float | None = None) -> int:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM sessions WHERE expires_at <= ? OR revoked_at IS NOT NULL",
-                (time.time() if now is None else now,),
-            )
-        return int(cursor.rowcount)
-
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Authentication is intentionally not part of CodeAuditor. Drop
+            # credentials and bearer sessions left by older releases so the
+            # account/password system cannot remain usable after an upgrade.
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS sessions;
+                DROP TABLE IF EXISTS users;
+                """
+            )
             existing = {
                 row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()
             }
@@ -2044,10 +1888,10 @@ class AuditStore:
                 """
                 INSERT INTO runs (
                     target, output_dir, wiki_path,
-                    backend, model, max_parallel, target_au_count, log_level,
-                    status, run_kind, started_at, active_started_at,
+                    backend, model, max_parallel, target_au_count, full_analysis,
+                    log_level, status, run_kind, started_at, active_started_at,
                     duration_known, created_at, backends_used
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     config.target,
@@ -2057,6 +1901,7 @@ class AuditStore:
                     config.model,
                     config.max_parallel,
                     config.target_au_count,
+                    int(config.full_analysis),
                     config.log_level,
                     status,
                     run_kind,
@@ -2068,6 +1913,23 @@ class AuditStore:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def update_running_run_usage(
+        self,
+        run_id: int,
+        usage_stats: Mapping[str, float],
+    ) -> bool:
+        """Persist partial token/cost accounting while a run is still active."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET usage_stats = ? WHERE id = ? AND status = ?",
+                (
+                    json.dumps(dict(usage_stats), ensure_ascii=False),
+                    run_id,
+                    RUN_RUNNING,
+                ),
+            )
+        return bool(cursor.rowcount)
 
     def finish_run(
         self,
@@ -2818,12 +2680,23 @@ class AuditStore:
                     (run_id, *sorted(REPRODUCED_STATUSES)),
                 ).fetchone()["count"]
             )
-            disclosures_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS count FROM disclosures "
-                    "WHERE run_id = ? AND report_path != ''",
-                    (run_id,),
-                ).fetchone()["count"]
+            disclosure_rows = conn.execute(
+                "SELECT vuln_id FROM disclosures "
+                "WHERE run_id = ? AND report_path != ''",
+                (run_id,),
+            ).fetchall()
+            # Stage 6 checkpoints are written only after static validation.
+            # Prefer them when present so failed drafts in directories do not
+            # inflate disclosures_count while historical output trees without
+            # markers retain the previous filesystem-derived behavior.
+            stage6_markers = {
+                path.name.removeprefix("stage6--")
+                for path in (Path(output_dir) / ".markers").glob("stage6--*")
+            }
+            disclosures_count = (
+                sum(1 for row in disclosure_rows if row["vuln_id"] in stage6_markers)
+                if stage6_markers
+                else len(disclosure_rows)
             )
             conn.execute(
                 """
@@ -4534,8 +4407,8 @@ class AuditStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT dedupe_key, title, location, cwe,
-                       vulnerability_class, trigger, summary
+                SELECT project, dedupe_key, title, location, cwe,
+                       vulnerability_class, trigger, summary, artifact_links
                 FROM disclosed_bugs
                 WHERE deleted_at IS NULL
                 ORDER BY project, id

@@ -8,6 +8,7 @@ import pytest
 
 from code_auditor.repos import (
     RepoError,
+    _clone_command,
     ensure_repo,
     ensure_repo_sync,
     repo_local_path,
@@ -91,6 +92,19 @@ def test_validate_remote_repo_url_accepts_safe_remotes(url) -> None:
 def test_validate_remote_repo_url_rejects_unsafe_inputs(url) -> None:
     with pytest.raises(RepoError):
         validate_remote_repo_url(url)
+
+
+def test_clone_command_supports_shallow_recovery() -> None:
+    assert _clone_command("https://example.test/repo", "/tmp/repo", 1) == [
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        "--",
+        "https://example.test/repo",
+        "/tmp/repo",
+    ]
 
 
 # ── ensure_repo / ensure_repo_sync ───────────────────────────────────────────
@@ -363,3 +377,24 @@ async def test_ensure_poc_worktree_non_git_target_returns_none(tmp_path) -> None
     out.mkdir()
     assert await ensure_poc_worktree(str(tmp_path), str(out)) is None
     assert not (out / ".poc-worktree").exists()
+
+
+async def test_cleanup_poc_worktree_removes_only_named_disposable_tree(tmp_path) -> None:
+    from code_auditor.repos import cleanup_poc_worktree, ensure_poc_worktree
+
+    src = _make_source_repo(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    worktree = await ensure_poc_worktree(str(src), str(out))
+    assert worktree is not None
+    (Path(worktree) / "build-cache").mkdir()
+    (Path(worktree) / "build-cache" / "large.bin").write_bytes(b"x" * 1024)
+
+    assert await cleanup_poc_worktree(str(src), str(out), worktree) is True
+    assert not Path(worktree).exists()
+    assert (src / ".git").is_dir()
+
+    unrelated = out / "keep-me"
+    unrelated.mkdir()
+    assert await cleanup_poc_worktree(str(src), str(out), str(unrelated)) is False
+    assert unrelated.exists()

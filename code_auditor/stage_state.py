@@ -77,12 +77,28 @@ class StageStateStore:
                 error=str(value.get("error") or ""),
             )
 
-    def reset(self) -> None:
-        """Start a fresh pipeline execution while preserving the output tree."""
-        self._stages = {stage: StageStatus(stage=stage) for stage in range(7)}
+    def reset(self, *, preserve_completed: bool = False) -> None:
+        """Start a fresh execution while optionally retaining completed timing."""
+        previous = dict(self._stages) if preserve_completed else {}
+        self._stages = {
+            stage: (
+                previous[stage]
+                if previous.get(stage) is not None
+                and previous[stage].status == "done"
+                else StageStatus(stage=stage)
+            )
+            for stage in range(7)
+        }
+        self._write()
+
+    def clear(self, stage: int) -> None:
+        """Reset one stage while preserving the others."""
+        self._stages[stage] = StageStatus(stage=stage)
         self._write()
 
     def begin(self, stage: int, description: str) -> None:
+        if self._stages[stage].status == "done":
+            return
         self._stages[stage] = StageStatus(
             stage=stage,
             status="running",
@@ -108,6 +124,8 @@ class StageStateStore:
 
     def complete(self, stage: int) -> None:
         state = self._stages[stage]
+        if state.status == "done" and state.ended_at is not None:
+            return
         state.status = "done"
         state.ended_at = time.time()
         self._write()

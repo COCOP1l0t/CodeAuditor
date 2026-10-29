@@ -49,11 +49,13 @@ uv sync --locked
 uv run code-auditor
 ```
 
+Web UI 不提供账号、密码、登录或会话身份验证。默认仅绑定 `127.0.0.1`；如需绑定其他网卡，请只在可信网络中使用，或置于你自己的访问代理之后。
+
 Web 服务选项：
 
 | 标志 | 说明 |
 |------|------|
-| `--host` | 绑定地址；默认 `0.0.0.0` |
+| `--host` | 绑定地址；默认 `127.0.0.1` |
 | `--port` | 监听端口；默认 `8000` |
 
 仓库、Wiki、后端、模型、沙箱模式、并行度和输出路径等审计参数统一由 Web 界面和 `~/.code_auditor/settings.json` 管理。在 **New Audit** 中，审计目标可以是托管 checkout、远程 Git URL，也可以通过系统文件夹选择器选取本地代码目录；本地目录会被原地审计且不会执行 `git pull`。维护命令请查看 `code-auditor --help`。
@@ -95,6 +97,12 @@ Web 界面会发现 `~/.code_auditor/wiki/` 下的知识库。CodeAuditor 将所
 ```
 
 同一仓库 commit 会复用输出目录并从检查点恢复。若要重新开始，请删除输出目录或其中的 `.markers/` 目录。
+
+## 可靠性控制
+
+Web 任务因进程退出中断后默认自动恢复；设置 `CODE_AUDITOR_AUTO_RESUME_INTERRUPTED=0` 可禁用。大型仓库可设置 `CODE_AUDITOR_GIT_CLONE_DEPTH=1` 直接浅克隆；完整历史克隆超时后也会自动重试一次 depth=1。`CODE_AUDITOR_GIT_CLONE_TIMEOUT_SECONDS` 可调整超时。
+
+Stage 5 默认只复现 **Critical 和 High** 漏洞。在 New Audit 中勾选 **Full analysis**，或设置 `CODE_AUDITOR_FULL_ANALYSIS=1`，才会复现所有严重级别。`CODE_AUDITOR_MAX_STAGE5_VULNS` 可进一步限制 PoC 数量，`CODE_AUDITOR_MIN_STAGE5_CVSS` 可追加 CVSS 门限。Stage 6 会对披露产物做静态校验，并在只剩打包格式问题时执行一次定向修复。
 
 ## 开发
 

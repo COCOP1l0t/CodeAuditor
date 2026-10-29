@@ -21,6 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -108,6 +109,7 @@ class AuditStartParams:
     output_dir: str | None = None
     wiki: str | None = None
     max_parallel: int = 1
+    full_analysis: bool = False
     backend: str = "claude"
     model: str | None = None
     provider_mode: ProviderMode = "local"
@@ -540,6 +542,8 @@ class AuditJob:
             | None
         ) = None
         self._next_history_retry_at: float = 0.0
+        self._usage_persist_task: asyncio.Task | None = None
+        self._usage_persist_dirty = False
 
     # ── events ────────────────────────────────────────────────────────────
 
@@ -582,6 +586,7 @@ class AuditJob:
         config.sandbox_run_id = self.run_id
         config.sandbox_job_key = self.job_key or None
         config.agent_history_changed = self._agent_history_changed
+        config.usage_stats_changed = self._usage_stats_changed
 
     async def _agent_history_changed(self) -> None:
         """Persist and publish a backend/model when its invocation starts."""
@@ -615,6 +620,46 @@ class AuditJob:
                     exc,
                 )
         self.publish_job_event(agent_history_updated=True)
+
+    def _usage_stats_changed(self) -> None:
+        """Schedule an incremental SQLite write without blocking agent calls."""
+        if (
+            self.store is None
+            or self.kind != JOB_AUDIT
+            or self.run_id is None
+            or self.config is None
+        ):
+            return
+        self._usage_persist_dirty = True
+        if self._usage_persist_task is not None and not self._usage_persist_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._usage_persist_task = loop.create_task(self._persist_usage_stats())
+
+    async def _persist_usage_stats(self) -> None:
+        try:
+            while self._usage_persist_dirty and self.store is not None and self.run_id is not None:
+                self._usage_persist_dirty = False
+                config = self.config
+                if config is None:
+                    return
+                try:
+                    await asyncio.to_thread(
+                        self.store.update_running_run_usage,
+                        self.run_id,
+                        dict(config.usage_stats),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to update Run #%d incremental usage: %s",
+                        self.run_id,
+                        exc,
+                    )
+        finally:
+            self._usage_persist_task = None
 
     def _stop_duration_clock(self, ended_at: float) -> None:
         """Fold this active session into the job's accumulated duration once."""
@@ -873,6 +918,7 @@ class AuditJob:
             provider_base_url=params.provider_base_url,
             provider_api_key=params.provider_api_key,
             target_au_count=params.target_au_count,
+            full_analysis=params.full_analysis,
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             sandbox_enabled=sandbox_enabled,
             sandbox_runtime=params.sandbox_runtime,
@@ -1720,6 +1766,33 @@ class AuditJobManager:
             raise JobValidationError(
                 "The recorded Wiki is no longer available under the managed Wiki directory."
             )
+        def _known_disclosures_excluding_current_output() -> tuple[dict[str, Any], ...]:
+            current_output = os.path.realpath(output_dir)
+            retained: list[dict[str, Any]] = []
+            for entry in self.store.disclosure_dedupe_index():
+                belongs_to_current = False
+                try:
+                    links = json.loads(str(entry.get("artifact_links") or "[]"))
+                except (TypeError, ValueError):
+                    links = []
+                if isinstance(links, list):
+                    for link in links:
+                        if not isinstance(link, dict):
+                            continue
+                        path = link.get("path")
+                        if isinstance(path, str) and path:
+                            try:
+                                belongs_to_current = path_is_within(
+                                    os.path.realpath(path), current_output
+                                )
+                            except (OSError, ValueError):
+                                belongs_to_current = False
+                        if belongs_to_current:
+                            break
+                if not belongs_to_current:
+                    retained.append(entry)
+            return tuple(retained)
+
         sandbox_enabled, sandbox_network_enabled = sandbox_mode_flags(sandbox_mode)
         config = AuditConfig(
             target=target,
@@ -1737,11 +1810,12 @@ class AuditJobManager:
             provider_base_url=provider_base_url,
             provider_api_key=provider_api_key,
             target_au_count=target_au_count,
+            full_analysis=bool(run.get("full_analysis") or 0),
             agent_timeout_seconds=DEFAULT_AGENT_TIMEOUT_SECONDS,
             sandbox_enabled=sandbox_enabled,
             sandbox_runtime=sandbox_runtime,
             sandbox_network_enabled=sandbox_network_enabled,
-            known_disclosures=tuple(self.store.disclosure_dedupe_index()),
+            known_disclosures=_known_disclosures_excluding_current_output(),
         )
         # Carry forward the original session's accounting: finish_run writes
         # these collectors wholesale, so seed them from the run row or the
@@ -1786,6 +1860,7 @@ class AuditJobManager:
             provider_base_url=provider_base_url,
             provider_api_key=provider_api_key,
             target_au_count=target_au_count,
+            full_analysis=config.full_analysis,
             log_level=config.log_level,
             repos_dir=repos_dir,
             results_dir=results_dir,

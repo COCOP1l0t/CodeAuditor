@@ -1,4 +1,4 @@
-# Stage 6 Semantic Vulnerability Deduplication
+# Semantic Vulnerability Deduplication
 
 You are a security vulnerability deduplication expert. Your job is to determine whether a candidate vulnerability is semantically the same as any previously discovered vulnerability listed below.
 
@@ -20,7 +20,7 @@ Minor differences in wording, exact line numbers, file paths, severity ratings, 
 **Trigger:** __CANDIDATE_TRIGGER__
 **Summary:** __CANDIDATE_SUMMARY__
 
-## Previously Discovered Vulnerabilities
+## Previously Retained Vulnerabilities
 
 __EXISTING_ENTRIES__
 

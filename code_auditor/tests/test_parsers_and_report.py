@@ -277,6 +277,8 @@ def test_stage6_prompt_requires_target_guidelines_security_rationale() -> None:
         "target_path": "/tmp/target",
         "disclosure_dir": "/tmp/disclosure",
         "vuln_id": "H-01",
+            "stage5_evidence_context": "Reuse validated evidence.",
+            "submission_policy_context": "No policy block.",
         "wiki_context": "No wiki context.",
     })
 

@@ -2034,15 +2034,9 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert 'id="trajectory-inspector"' in res.text
     assert 'id="btn-settings"' in res.text
     assert 'id="settings-dialog"' in res.text
-    assert 'id="auth-gate"' in res.text
-    assert '<div id="auth-loading"' in res.text
-    assert '<section id="auth-gate" aria-labelledby="auth-title" hidden>' in res.text
-    assert 'id="auth-setup-form"' in res.text
-    assert 'id="auth-login-form"' in res.text
-    assert 'id="auth-register-form"' in res.text
-    assert 'id="btn-logout"' in res.text
     assert 'id="s-backend"' in res.text
     assert 'id="s-mode"' in res.text
+    assert 'id="f-full-analysis"' in res.text
     assert "Active jobs switch on their next agent call" in res.text
     assert res.text.count('class="table-shell') == 5
     assert 'class="table-shell history-table-shell"' in res.text
@@ -2072,6 +2066,13 @@ def test_api_index_serves_html(tmp_path) -> None:
         "r-backend",
         "r-model",
         "r-log-level",
+        "auth-gate",
+        "auth-loading",
+        "auth-setup-form",
+        "auth-login-form",
+        "auth-register-form",
+        "auth-user-menu",
+        "btn-logout",
     ):
         assert f'id="{removed_id}"' not in res.text
 
@@ -2089,6 +2090,8 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "showTerminalDock" in script.text
     assert "terminalSessions" in script.text
     assert "refreshTerminalToken" in script.text
+    assert "/api/auth/" not in script.text
+    assert "bootstrapAuthentication" not in script.text
     assert "terminal-refresh" in script.text
     assert "wireSortableTable" in script.text
     assert "openDisclosureEditDialog" in script.text
@@ -2105,8 +2108,6 @@ def test_api_index_serves_html(tmp_path) -> None:
     assert "openCveDialog" in script.text
     assert "appendEvidenceActionButtons" in script.text
     assert "disclosureUnavailableReasons" in script.text
-    assert "bootstrapAuthentication" in script.text
-    assert "auth-setup" in script.text
     assert "No validated retained Stage 5/6 reproducer is registered." in script.text
     assert "No validated runtime trigger-graph.json is registered." in script.text
     assert "ASan may not apply or may have produced no report." in script.text
@@ -3301,6 +3302,19 @@ async def test_start_with_git_url_clone_failure_marks_failed(
     assert "clone failed" in job.error
 
 
+def test_api_has_no_account_authentication(tmp_path) -> None:
+    with TestClient(_make_app(tmp_path)) as client:
+        assert client.get("/api/config").status_code == 200
+        assert client.get("/api/dashboard").status_code == 200
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "not-used-anymore"},
+        ).status_code == 404
+        page = client.get("/")
+        assert "Sign in to CodeAuditor" not in page.text
+        assert 'id="auth-gate"' not in page.text
+
+
 def test_api_start_requires_target_or_git_url(tmp_path) -> None:
     client = TestClient(_make_app(tmp_path))
     res = client.post("/api/audit", json={})
@@ -3520,7 +3534,11 @@ def test_api_start_with_git_url(tmp_path, monkeypatch) -> None:
     app = _make_app(tmp_path)
     with TestClient(app) as client:
         res = client.post(
-            "/api/audit", json={"git_url": "https://github.com/user/repo.git"}
+            "/api/audit",
+            json={
+                "git_url": "https://github.com/user/repo.git",
+                "full_analysis": True,
+            },
         )
         assert res.status_code == 202
         run_id = res.json()["run_id"]
@@ -3529,6 +3547,7 @@ def test_api_start_with_git_url(tmp_path, monkeypatch) -> None:
         assert job is not None
         assert job.config is not None
         assert job.config.target == str(cloned)
+        assert job.config.full_analysis is True
 
 
 # ── Repos & history target filter API ────────────────────────────────────────

@@ -320,6 +320,105 @@ def test_codex_items_map_to_tool_steps_and_a_final_message() -> None:
     assert message_step["metrics"]["extra"]["reasoning_tokens"] == 2
 
 
+def test_codex_cumulative_token_updates_are_recorded_as_deltas() -> None:
+    recorder = TrajectoryRecorder(model_name="deepseek-flash")
+    recorder.user("audit")
+    recorder.on_codex_event(
+        CodexEvent(
+            "item/completed",
+            CodexPayload(
+                item=CodexItem(
+                    id="i1",
+                    type="commandExecution",
+                    command="rg pattern .",
+                    aggregatedOutput="match",
+                )
+            ),
+        )
+    )
+
+    def usage(input_tokens: int, cached: int, output_tokens: int) -> dict[str, object]:
+        return {
+            "tokenUsage": {
+                "total": {
+                    "inputTokens": input_tokens,
+                    "cachedInputTokens": cached,
+                    "outputTokens": output_tokens,
+                    "reasoningOutputTokens": 0,
+                }
+            }
+        }
+
+    recorder.on_codex_event(
+        CodexEvent("thread/tokenUsage/updated", usage(30, 10, 7))
+    )
+    recorder.on_codex_event(
+        CodexEvent("thread/tokenUsage/updated", usage(60, 20, 14))
+    )
+    recorder.on_codex_event(
+        CodexEvent(
+            "item/agentMessage/delta",
+            CodexPayload(delta="done", turn_id="t1"),
+        )
+    )
+    recorder.on_codex_event(
+        CodexEvent(
+            "turn/completed",
+            CodexPayload(
+                turn=CodexItem(
+                    id="t1",
+                    usage={
+                        "inputTokens": 60,
+                        "cachedInputTokens": 20,
+                        "outputTokens": 14,
+                        "reasoningOutputTokens": 0,
+                    },
+                )
+            ),
+        )
+    )
+    recorder.finish()
+
+    document = recorder.to_dict()
+    tool_step = document["steps"][1]
+    message_step = document["steps"][2]
+    assert tool_step["llm_call_count"] == 0
+    assert message_step["llm_call_count"] == 1
+    assert message_step["metrics"]["prompt_tokens"] == 80
+    assert message_step["metrics"]["completion_tokens"] == 14
+    assert document["final_metrics"]["total_prompt_tokens"] == 80
+    assert document["final_metrics"]["total_completion_tokens"] == 14
+    assert validate_trajectory(document) == []
+
+
+def test_codex_root_model_item_is_unwrapped_for_tool_capture() -> None:
+    class RootItem:
+        def __init__(self, root: object) -> None:
+            self.root = root
+
+    recorder = TrajectoryRecorder(model_name="deepseek-flash")
+    item = CodexItem(
+        id="call-1",
+        type="commandExecution",
+        command="ls -la",
+        aggregatedOutput="README.md",
+    )
+    recorder.on_codex_event(
+        CodexEvent("item/started", CodexPayload(item=RootItem(item)))
+    )
+    recorder.on_codex_event(
+        CodexEvent("item/completed", CodexPayload(item=RootItem(item)))
+    )
+    recorder.finish()
+
+    document = recorder.to_dict()
+    step = document["steps"][0]
+    assert step["tool_calls"][0]["function_name"] == "shell"
+    assert step["tool_calls"][0]["arguments"] == {"command": "ls -la"}
+    assert "README.md" in step["observation"]["results"][0]["content"]
+    assert validate_trajectory(document) == []
+
+
 # --------------------------------------------------------------------------- #
 # redaction, spilling, merging
 # --------------------------------------------------------------------------- #

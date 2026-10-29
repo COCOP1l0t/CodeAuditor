@@ -10,79 +10,7 @@
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css" />
 </head>
 <body>
-  <div id="auth-loading" role="status" aria-live="polite">Checking your session…</div>
-  <section id="auth-gate" aria-labelledby="auth-title" hidden>
-    <div class="auth-card">
-      <div class="auth-brand">
-        <img class="auth-logo" src="/static/icon.svg" alt="" aria-hidden="true" />
-        <span>CodeAuditor</span>
-      </div>
-      <h1 id="auth-title">Sign in to CodeAuditor</h1>
-      <p id="auth-intro" class="dim">Use your CodeAuditor account to access audit history and evidence.</p>
-
-      <section id="auth-setup-panel" class="auth-panel" hidden>
-        <h2>First-run setup</h2>
-        <p class="dim">Create the administrator account before using the Web UI.</p>
-        <form id="auth-setup-form" class="auth-form">
-          <label>Administrator username
-            <input id="auth-setup-username" name="username" type="text" minlength="3" maxlength="64"
-                   pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" autocomplete="username" required />
-          </label>
-          <label>Password
-            <input id="auth-setup-password" name="password" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <label>Confirm password
-            <input id="auth-setup-confirm" name="confirm" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <button type="submit" class="btn btn-start">Create administrator</button>
-        </form>
-      </section>
-
-      <section id="auth-login-panel" class="auth-panel" hidden>
-        <h2>Sign in</h2>
-        <form id="auth-login-form" class="auth-form">
-          <label>Username
-            <input id="auth-login-username" name="username" type="text" minlength="3" maxlength="64"
-                   autocomplete="username" required />
-          </label>
-          <label>Password
-            <input id="auth-login-password" name="password" type="password" maxlength="512"
-                   autocomplete="current-password" required />
-          </label>
-          <button type="submit" class="btn btn-start">Sign in</button>
-        </form>
-      </section>
-
-      <section id="auth-register-panel" class="auth-panel" hidden>
-        <h2>Create account</h2>
-        <form id="auth-register-form" class="auth-form">
-          <label>Username
-            <input id="auth-register-username" name="username" type="text" minlength="3" maxlength="64"
-                   pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" autocomplete="username" required />
-          </label>
-          <label>Password
-            <input id="auth-register-password" name="password" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <label>Confirm password
-            <input id="auth-register-confirm" name="confirm" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <button type="submit" class="btn btn-start">Create account</button>
-        </form>
-      </section>
-
-      <p id="auth-error" class="error" role="alert"></p>
-      <p id="auth-switch" class="auth-switch" hidden>
-        <span id="auth-switch-copy">Need an account?</span>
-        <button type="button" id="auth-switch-button" class="link-button">Create account</button>
-      </p>
-    </div>
-  </section>
-
-  <div id="app-shell" class="layout" hidden>
+  <div id="app-shell" class="layout">
   <aside id="sidebar">
     <div class="sidebar-header">
       <img class="logo-mark" src="/static/icon.svg" alt="" aria-hidden="true" />
@@ -128,10 +56,6 @@
   <div id="workspace">
   <header id="workspace-toolbar">
     <span id="agent-settings-summary" class="agent-settings-summary">Loading LLM backend…</span>
-    <div id="auth-user-menu" class="auth-user-menu" hidden>
-      <span id="auth-user-label" class="auth-user-label"></span>
-      <button type="button" id="btn-logout" class="btn">Sign out</button>
-    </div>
     <button type="button" id="btn-settings" class="btn workspace-settings-button"
             aria-haspopup="dialog" aria-controls="settings-dialog" title="Configure runtime settings">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
@@ -293,6 +217,13 @@
             Max parallel agents
             <input type="number" name="max_parallel" id="f-max-parallel"
                    min="1" max="16" value="1" />
+          </label>
+          <label class="settings-checkbox audit-full-analysis">
+            <input type="checkbox" id="f-full-analysis" />
+            <span>
+              <strong>Full analysis</strong>
+              <small>Reproduce every severity in Stage 5. Off by default: only Critical and High findings are reproduced.</small>
+            </span>
           </label>
           <label>
             Wiki knowledge base

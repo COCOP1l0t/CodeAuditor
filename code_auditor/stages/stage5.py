@@ -21,6 +21,7 @@ from ..reproduction_status import is_failed_status, read_reproduction_status
 from ..retention import (
     RetentionError,
     export_retained_artifacts,
+    load_retain_manifest,
     secure_generated_manifest_mode,
 )
 from ..sandbox import DockerScratch, docker_scratch
@@ -262,7 +263,7 @@ async def _run_reproduce(
                         "output, or runtime evidence. Fix every issue below:\n\n"
                         f"```\n{format_validation_issues(current)}\n```"
                     ),
-                    max_attempts=1,
+                    max_attempts=2,
                 )
                 if issues:
                     logger.warning(
@@ -328,6 +329,44 @@ async def _run_reproduce(
             )
             resolved_report = os.path.join(persistent_destination, "report.md")
 
+        if sandbox is None and reproduced and resolved_report is not None:
+            retained_source = os.path.dirname(resolved_report)
+            secure_generated_manifest_mode(retained_source)
+            try:
+                load_retain_manifest(
+                    retained_source,
+                    required_paths=("report.md", "reproduce.sh"),
+                    max_file_bytes=config.retain_max_file_bytes,
+                    max_total_bytes=config.retain_max_total_bytes,
+                )
+            except RetentionError as exc:
+                logger.warning(
+                    "Stage 5: Local retained package for %s is invalid: %s. "
+                    "Requesting one bounded repair.",
+                    vuln_id,
+                    exc,
+                )
+                repair_prompt = (
+                    f"The local Stage 5 retained package at `{retained_source}` is invalid: "
+                    f"{exc}. Repair `retain-manifest.json` and the minimal retained files it "
+                    "lists. Keep `report.md` and `reproduce.sh`; make the reproducer portable "
+                    "by removing references to CodeAuditor scratch/worktree/toolchain/home "
+                    "state. Do not rerun the PoC or change the observed reproduction result."
+                )
+                await run_agent(
+                    repair_prompt,
+                    work_config,
+                    max_turns=15,
+                    **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
+                )
+                secure_generated_manifest_mode(retained_source)
+                load_retain_manifest(
+                    retained_source,
+                    required_paths=("report.md", "reproduce.sh"),
+                    max_file_bytes=config.retain_max_file_bytes,
+                    max_total_bytes=config.retain_max_total_bytes,
+                )
+
     if resolved_report is None:
         # No retained report means the task did not finish; leave the
         # checkpoint unset so a resume retries it instead of treating an
@@ -369,6 +408,7 @@ async def run_stage5(
     vuln_files: list[str],
     config: AuditConfig,
     checkpoint: CheckpointManager,
+    progress: object | None = None,
 ) -> list[str]:
     """Run PoC reproduction for each verified vulnerability in parallel."""
     if not vuln_files:
@@ -377,10 +417,23 @@ async def run_stage5(
 
     logger.info("Stage 5: Reproducing %d verified vulnerabilities.", len(vuln_files))
 
+    completed = 0
+
+    def task_complete(index: int, vuln_file: str) -> None:
+        nonlocal completed
+        completed += 1
+        if progress is not None:
+            progress.update(
+                items_done=completed,
+                items_total=len(vuln_files),
+                detail=f"Reproduced {completed}/{len(vuln_files)} vulnerabilities",
+            )
+
     results = await run_parallel_limited(
         vuln_files,
         config.max_parallel,
         lambda vf, _: _run_reproduce(vf, config, checkpoint),
+        on_complete=task_complete,
     )
 
     reports = collect_parallel_results(

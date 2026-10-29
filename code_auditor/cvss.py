@@ -24,13 +24,27 @@ _VECTOR = re.compile(
 # fail an otherwise valid disclosure.
 _SCORE_LABEL = re.compile(
     r"(?:\bcvss(?:\s*(?:v|:)?\s*3\.[01])?\b|\bbase\s+score\b|\bscore\b)"
-    r"\s*[:=]?\s*(?P<score>10\.0|[0-9]\.[0-9])",
+    r"\s*[:=]?\s*(?P<score>10\.0|[0-9]\.[0-9])"
+    r"(?![0-9.\-\u2013\u2014])",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_SCORE = re.compile(
+    r"\b(?:cap(?:ped)?|contextual|temporal|policy|reduced|recalculat\w*|"
+    r"conservative(?:\s+disclosure)?|opt[-\s]in|project[-\s]calibrated|"
+    r"severity\s+(?:band|range)|project\s+severity|rather\s+than|uncapped)\b",
     re.IGNORECASE,
 )
 
 
 def _labelled_scores(text: str) -> list[float]:
     return [float(match.group("score")) for match in _SCORE_LABEL.finditer(text)]
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove presentation-only Markdown before extracting written scores."""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("`", "").replace("*", "").replace("_", "")
+    return text
 
 
 def base_score(vector: str) -> float:
@@ -92,24 +106,79 @@ def report_score_errors(text: str, *, require_vector: bool = False) -> list[str]
         start = start + 2 if start >= 0 else 0
         end = text.find("\n\n", match.end())
         end = end if end >= 0 else len(text)
-        paragraph = text[start:end]
+        paragraph = _strip_markdown(text[start:end])
+        preceding = ""
         if "CVSS" not in paragraph:
             previous = text.rfind("\n\n", 0, max(0, start - 2))
-            paragraph = text[previous + 2 if previous >= 0 else 0 : end]
+            paragraph = _strip_markdown(
+                text[previous + 2 if previous >= 0 else 0 : end]
+            )
         cleaned = _VECTOR.sub("", paragraph)
         cleaned = re.sub(r"CVSS\s*(?:v|:)?\s*3\.[01]", "CVSS", cleaned, flags=re.I)
         scores = _labelled_scores(cleaned)
         if not scores and start:
             previous = text.rfind("\n\n", 0, max(0, start - 2))
-            preceding = text[previous + 2 if previous >= 0 else 0 : start]
+            preceding = _strip_markdown(
+                text[previous + 2 if previous >= 0 else 0 : start]
+            )
             preceding = _VECTOR.sub("", preceding)
             preceding = re.sub(
                 r"CVSS\s*(?:v|:)?\s*3\.[01]", "CVSS", preceding, flags=re.I
             )
             scores = _labelled_scores(preceding)
-        if scores and calculated not in scores:
-            errors.append(
-                f"Line {line}: CVSS score {scores[0]:.1f} does not match "
-                f"the written vector ({calculated:.1f}); verify score and metrics"
+        if not scores and ("CVSS" in paragraph or "score" in paragraph.casefold()):
+            # Some templates write `CVSS: <vector> — 8.1 High` without the
+            # word "Score". Only inspect the vector's own line so unrelated
+            # section numbers elsewhere are not mistaken for a CVSS score.
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_end = text.find("\n", match.end())
+            line = _strip_markdown(
+                text[line_start : line_end if line_end >= 0 else len(text)]
             )
+            line = _VECTOR.sub("", line)
+            line = re.sub(
+                r"CVSS\s*(?:v|:)?\s*3\.[01]", "CVSS", line, flags=re.I
+            )
+            scores = [
+                float(value)
+                for value in re.findall(r"(?<![\w.])([0-9]\.[0-9])(?![\w.])", line)
+                if value != "3.1"
+            ]
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        line_text = _strip_markdown(
+            text[line_start : line_end if line_end >= 0 else len(text)]
+        )
+        line_text = _VECTOR.sub("", line_text)
+        line_text = re.sub(
+            r"CVSS\s*(?:v|:)?\s*3\.[01]", "CVSS", line_text, flags=re.I
+        )
+        line_scores = [
+            float(value)
+            for value in re.findall(r"(?<![\w.])([0-9]\.[0-9])(?![\w.])", line_text)
+            if value != "3.1"
+        ]
+        if scores and calculated not in scores and calculated not in line_scores:
+            # A report may intentionally pair the uncapped base vector with a
+            # project severity cap or a temporal/contextual score. The range
+            # itself is not proof of an arithmetic error; the report must still
+            # explain the distinction in prose.
+            context_text = " ".join(
+                (
+                    paragraph,
+                    preceding,
+                    _strip_markdown(
+                        text[
+                            max(0, match.start() - 400) : min(
+                                len(text), match.end() + 700
+                            )
+                        ]
+                    ),
+                )
+            )
+            if not _CONTEXTUAL_SCORE.search(context_text):
+                errors.append(
+                    f"Line {line}: CVSS score {scores[0]:.1f} does not match "
+                    f"the written vector ({calculated:.1f}); verify score and metrics"
+                )
     return list(dict.fromkeys(errors))

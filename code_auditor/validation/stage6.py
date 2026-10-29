@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from ..config import ValidationIssue
 from ..cvss import report_score_errors
 from ..disclosures import extract_email_subject
+from ..retention import RetentionError, load_retain_manifest
 
 # Canonical section -> accepted heading spellings (casefolded). Stage 5 retest
 # reports and other upstream templates name these sections differently, so a
@@ -158,6 +159,8 @@ def validate_stage6_disclosure(disclosure_dir: str) -> list[ValidationIssue]:
             ):
                 issue("Unindented continuation in disclosure email header")
                 break
+        for error in report_score_errors(email, require_vector=False):
+            issue(f"Disclosure email: {error}")
 
     archive_path = base / "disclosure.zip"
     if archive_path.is_file() and not archive_path.is_symlink():
@@ -263,4 +266,19 @@ def validate_stage6_disclosure(disclosure_dir: str) -> list[ValidationIssue]:
             zlib.error,
         ) as exc:
             issue(f"Unreadable or corrupt disclosure archive: {exc}")
+
+    manifest_path = base / "retain-manifest.json"
+    if manifest_path.exists():
+        try:
+            load_retain_manifest(
+                base,
+                required_paths=(
+                    "report.md",
+                    "email.txt",
+                    "disclosure.zip",
+                    "reproduce.sh",
+                ),
+            )
+        except (OSError, RetentionError) as exc:
+            issue(f"Invalid retained disclosure manifest: {exc}")
     return issues

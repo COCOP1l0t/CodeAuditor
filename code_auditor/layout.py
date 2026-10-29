@@ -64,6 +64,7 @@ def stage4_paths(output_dir: str) -> dict[str, str]:
     return {
         "directory": directory,
         "pending": os.path.join(directory, "_pending"),
+        "duplicates": os.path.join(directory, "_duplicates"),
         "logs": os.path.join(directory, "logs"),
     }
 

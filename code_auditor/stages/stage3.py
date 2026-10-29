@@ -127,6 +127,7 @@ async def run_stage3(
     checkpoint: CheckpointManager,
     auditing_focus_path: str,
     vuln_criteria_path: str,
+    progress: object | None = None,
 ) -> list[str]:
     if not units:
         logger.warning("Stage 3: No analysis units to process.")
@@ -135,6 +136,18 @@ async def run_stage3(
     total = len(units)
     logger.info("Stage 3: Starting bug discovery across %d analysis units (max parallel: %d).", total, config.max_parallel)
 
+    completed = 0
+
+    def task_complete(index: int, unit: AnalysisUnit) -> None:
+        nonlocal completed
+        completed += 1
+        if progress is not None:
+            progress.update(
+                items_done=completed,
+                items_total=total,
+                detail=f"Analyzed {completed}/{total} analysis units",
+            )
+
     results = await run_parallel_limited(
         units,
         config.max_parallel,
@@ -142,6 +155,7 @@ async def run_stage3(
             unit, config, checkpoint, auditing_focus_path, vuln_criteria_path,
             unit_index=idx + 1, total_units=total,
         ),
+        on_complete=task_complete,
     )
 
     finding_groups = collect_parallel_results(

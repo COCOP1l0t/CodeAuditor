@@ -30,7 +30,35 @@ logger = get_logger("repos")
 
 DEFAULT_REPOS_DIR = os.path.join("~", ".code_auditor", "repo")
 DEFAULT_RESULTS_DIR = os.path.join("~", ".code_auditor", "results")
-CLONE_TIMEOUT_SECONDS = 30 * 60
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# Full-history clones of large repositories can exceed 30 minutes on slow
+# links. Operators can force a shallow clone with
+# CODE_AUDITOR_GIT_CLONE_DEPTH=1, or tune the timeout independently.
+CLONE_TIMEOUT_SECONDS = _env_positive_int("CODE_AUDITOR_GIT_CLONE_TIMEOUT_SECONDS", 30 * 60)
+CONFIGURED_CLONE_DEPTH = _env_positive_int("CODE_AUDITOR_GIT_CLONE_DEPTH", 0)
+
+
+def _clone_command(url: str, destination: str, depth: int = 0) -> list[str]:
+    command = ["git", "clone"]
+    if depth:
+        command.extend(["--depth", str(depth), "--single-branch"])
+    command.extend(["--", url, destination])
+    return command
+
+
+def _clone_attempt_depths() -> tuple[int, ...]:
+    if CONFIGURED_CLONE_DEPTH:
+        return (CONFIGURED_CLONE_DEPTH,)
+    # Preserve full history by default, but recover automatically from a large
+    # repository timing out instead of leaving Stage 0 permanently failed.
+    return (0, 1)
 
 _SCP_LIKE_RE = re.compile(r"^[\w.-]+@(?P<host>[\w.-]+):(?P<path>.+)$")
 _SAFE_SEGMENT_RE = re.compile(r"^[\w.-]+$")
@@ -199,40 +227,58 @@ async def _ensure_repo_locked(url: str, dest: str) -> str:
 
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     logger.info("Cloning %s into %s ...", url, dest)
-    process_job = ProcessJob()
-    proc = await asyncio.create_subprocess_exec(
-        "git", "clone", "--", url, dest,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=_clone_env(),
-        start_new_session=os.name != "nt",
-        creationflags=(
-            subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        ),
-    )
-    process_job.assign_pid(proc.pid)
-    try:
-        out, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=CLONE_TIMEOUT_SECONDS
+    for attempt, depth in enumerate(_clone_attempt_depths()):
+        if attempt:
+            shutil.rmtree(dest, ignore_errors=True)
+            logger.warning(
+                "Retrying clone of %s with shallow depth=%d after timeout.",
+                url,
+                depth,
+            )
+        process_job = ProcessJob()
+        proc = await asyncio.create_subprocess_exec(
+            *_clone_command(url, dest, depth),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=_clone_env(),
+            start_new_session=os.name != "nt",
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            ),
         )
-    except (TimeoutError, asyncio.CancelledError) as exc:
-        process_job.terminate()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        shutil.rmtree(dest, ignore_errors=True)
-        if isinstance(exc, asyncio.CancelledError):
-            raise
-        raise RepoError(
-            f"git clone timed out for {url} after {CLONE_TIMEOUT_SECONDS} seconds"
-        ) from exc
-    finally:
-        process_job.close()
-    if proc.returncode != 0:
-        tail = (out or b"").decode("utf-8", errors="replace")[-500:]
-        shutil.rmtree(dest, ignore_errors=True)
-        raise RepoError(f"git clone failed for {url}: {tail}")
-    logger.info("Clone complete: %s", dest)
-    return dest
+        process_job.assign_pid(proc.pid)
+        timed_out = False
+        try:
+            out, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=CLONE_TIMEOUT_SECONDS
+            )
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            process_job.terminate()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            shutil.rmtree(dest, ignore_errors=True)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            timed_out = True
+        finally:
+            process_job.close()
+        if timed_out:
+            if depth == 0 and len(_clone_attempt_depths()) > 1:
+                continue
+            raise RepoError(
+                f"git clone timed out for {url} after {CLONE_TIMEOUT_SECONDS} seconds"
+            )
+        if proc.returncode != 0:
+            tail = (out or b"").decode("utf-8", errors="replace")[-500:]
+            shutil.rmtree(dest, ignore_errors=True)
+            raise RepoError(f"git clone failed for {url}: {tail}")
+        logger.info(
+            "Clone complete: %s%s",
+            dest,
+            f" (shallow depth={depth})" if depth else "",
+        )
+        return dest
+    raise AssertionError("clone attempts exhausted without a result")
 
 
 def ensure_repo_sync(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
@@ -246,25 +292,40 @@ def ensure_repo_sync(url: str, repos_dir: str = DEFAULT_REPOS_DIR) -> str:
 
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     logger.info("Cloning %s into %s ...", url, dest)
-    try:
-        result = subprocess.run(
-            ["git", "clone", "--", url, dest],
-            capture_output=True,
-            text=True,
-            env=_clone_env(),
-            timeout=CLONE_TIMEOUT_SECONDS,
+    for attempt, depth in enumerate(_clone_attempt_depths()):
+        if attempt:
+            shutil.rmtree(dest, ignore_errors=True)
+            logger.warning(
+                "Retrying clone of %s with shallow depth=%d after timeout.",
+                url,
+                depth,
+            )
+        try:
+            result = subprocess.run(
+                _clone_command(url, dest, depth),
+                capture_output=True,
+                text=True,
+                env=_clone_env(),
+                timeout=CLONE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            shutil.rmtree(dest, ignore_errors=True)
+            if depth == 0 and len(_clone_attempt_depths()) > 1:
+                continue
+            raise RepoError(
+                f"git clone timed out for {url} after {CLONE_TIMEOUT_SECONDS} seconds"
+            ) from exc
+        if result.returncode != 0:
+            tail = (result.stdout + result.stderr)[-500:]
+            shutil.rmtree(dest, ignore_errors=True)
+            raise RepoError(f"git clone failed for {url}: {tail}")
+        logger.info(
+            "Clone complete: %s%s",
+            dest,
+            f" (shallow depth={depth})" if depth else "",
         )
-    except subprocess.TimeoutExpired as exc:
-        shutil.rmtree(dest, ignore_errors=True)
-        raise RepoError(
-            f"git clone timed out for {url} after {CLONE_TIMEOUT_SECONDS} seconds"
-        ) from exc
-    if result.returncode != 0:
-        tail = (result.stdout + result.stderr)[-500:]
-        shutil.rmtree(dest, ignore_errors=True)
-        raise RepoError(f"git clone failed for {url}: {tail}")
-    logger.info("Clone complete: %s", dest)
-    return dest
+        return dest
+    raise AssertionError("clone attempts exhausted without a result")
 
 
 # ── Repository identity ──────────────────────────────────────────────────────
@@ -467,3 +528,65 @@ async def ensure_poc_worktree(target: str, output_dir: str) -> str | None:
         return None
     logger.info("PoC worktree created at %s (commit %s).", destination, commit[:12])
     return destination
+
+
+async def cleanup_poc_worktree(target: str, output_dir: str, worktree: str | None) -> bool:
+    """Remove the disposable Stage 5/6 worktree after a successful audit.
+
+    Retained Stage 5/6 evidence is independent of this checkout. Keeping the
+    full worktree leaves dependency installs and build caches in the result
+    directory, often many gigabytes per audit.
+    """
+    if not worktree:
+        return False
+    root = os.path.realpath(output_dir)
+    candidate = os.path.realpath(worktree)
+    if os.path.basename(candidate) != ".poc-worktree":
+        return False
+    if os.path.commonpath((root, candidate)) != root:
+        return False
+    if os.path.islink(candidate) or not os.path.isdir(candidate):
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            target,
+            "worktree",
+            "remove",
+            "--force",
+            "--",
+            candidate,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=current_audit_subprocess_env(),
+        )
+        output, _ = await proc.communicate()
+    except OSError as exc:
+        logger.warning("Could not invoke git to remove PoC worktree %s: %s", candidate, exc)
+        output = b""
+        proc = None
+    if proc is None or proc.returncode != 0:
+        if output:
+            logger.warning(
+                "git worktree remove failed for %s: %s",
+                candidate,
+                output.decode("utf-8", errors="replace")[-500:],
+            )
+        shutil.rmtree(candidate, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        prune = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            target,
+            "worktree",
+            "prune",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=current_audit_subprocess_env(),
+        )
+        await prune.wait()
+    removed = not os.path.exists(candidate)
+    if removed:
+        logger.info("Removed disposable PoC worktree %s.", candidate)
+    return removed

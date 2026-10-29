@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Protocol
@@ -9,7 +10,7 @@ from .checkpoint import CheckpointManager
 from .config import AuditConfig, resolve_agent_model
 from .layout import stage1_paths
 from .logger import get_logger
-from .repos import ensure_poc_worktree
+from .repos import cleanup_poc_worktree, ensure_poc_worktree
 from .runtime_capabilities import require_stage56_execution
 from .stage_runtime import stage_span
 from .stage_state import StageStateStore
@@ -270,6 +271,62 @@ class ProgressReporter(Protocol):
     def end_stage(self, stage: int) -> None: ...
 
 
+def _select_stage5_vulnerabilities(
+    vuln_files: list[str], *, full_analysis: bool = False
+) -> list[str]:
+    """Select Stage 5 targets, defaulting to Critical/High findings only.
+
+    Full analysis reproduces every evaluated vulnerability. The opt-in
+    environment budget can further cap or raise the CVSS threshold.
+    """
+    try:
+        max_items = int(os.environ.get("CODE_AUDITOR_MAX_STAGE5_VULNS", "0"))
+    except ValueError:
+        max_items = 0
+    try:
+        min_score = float(os.environ.get("CODE_AUDITOR_MIN_STAGE5_CVSS", "0"))
+    except ValueError:
+        min_score = 0.0
+    env_full = os.environ.get("CODE_AUDITOR_FULL_ANALYSIS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    include_all = full_analysis or env_full
+    ranked: list[tuple[int, float, str]] = []
+    for index, path in enumerate(vuln_files):
+        severity = ""
+        score = 0.0
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                severity = str(data.get("severity") or "").strip().lower()
+                score = float(data.get("cvss_score") or 0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        if not include_all and severity not in {"critical", "high"} and score < 7.0:
+            continue
+        if score < min_score:
+            continue
+        ranked.append((index, score, path))
+    if max_items > 0:
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        ranked = ranked[:max_items]
+    selected = [path for _index, _score, path in ranked]
+    mode = "full" if include_all else "Critical/High"
+    logger.info(
+        "Stage 5 selection (%s) selected %d/%d vulnerabilities "
+        "(min CVSS %.1f, max items %d).",
+        mode,
+        len(selected),
+        len(vuln_files),
+        min_score,
+        max_items,
+    )
+    return selected
+
+
 async def run_audit(
     config: AuditConfig,
     reporter: ProgressReporter | None = None,
@@ -288,9 +345,12 @@ async def _run_audit_stages(
 ) -> None:
     checkpoint = CheckpointManager(config.output_dir, config.resume)
     stage_state = StageStateStore(config.output_dir)
-    stage_state.reset()
-
+    stage_state.reset(preserve_completed=config.resume)
     if config.resume:
+        # Stage 6 is terminal and may be retried after a validation failure.
+        # Keep stages 0-5 timings, but never leave Stage 6 marked done while its
+        # failed disclosure tasks are running again.
+        stage_state.clear(6)
         logger.info("Resume mode enabled. Existing output files and markers will be reused.")
 
     async with stage_span(
@@ -341,6 +401,7 @@ async def _run_audit_stages(
             checkpoint,
             auditing_focus_path,
             vuln_criteria_path,
+            progress=progress,
         )
         progress.update(
             items_done=total_aus,
@@ -357,13 +418,17 @@ async def _run_audit_stages(
         f"Evaluating {len(bug_files)} findings",
     ) as progress:
         vuln_files = await run_stage4(
-            bug_files, config, checkpoint, vuln_criteria_path
+            bug_files, config, checkpoint, vuln_criteria_path, progress=progress
         )
         progress.update(
             items_done=len(vuln_files),
             items_total=len(bug_files),
-            detail=f"{len(vuln_files)} confirmed vulnerabilities",
+            detail=f"{len(vuln_files)} representative vulnerabilities after semantic dedupe",
         )
+
+    stage5_vuln_files = _select_stage5_vulnerabilities(
+        vuln_files, full_analysis=config.full_analysis
+    )
 
     # Stage 5: PoC reproduction per verified vulnerability
     async with stage_span(
@@ -371,9 +436,9 @@ async def _run_audit_stages(
         reporter,
         stage_state,
         5,
-        f"Reproducing {len(vuln_files)} vulnerabilities",
+        f"Reproducing {len(stage5_vuln_files)} vulnerabilities",
     ) as progress:
-        if vuln_files:
+        if stage5_vuln_files:
             sandbox_mode = (
                 "docker-networked"
                 if config.sandbox_enabled and config.sandbox_network_enabled
@@ -382,14 +447,16 @@ async def _run_audit_stages(
                 else "local-worktree"
             )
             require_stage56_execution(sandbox_mode, config.sandbox_runtime)
-        if vuln_files and not config.sandbox_enabled and config.poc_worktree is None:
+        if stage5_vuln_files and not config.sandbox_enabled and config.poc_worktree is None:
             config.poc_worktree = await ensure_poc_worktree(
                 config.target, config.output_dir
             )
-        stage5_reports = await run_stage5(vuln_files, config, checkpoint)
+        stage5_reports = await run_stage5(
+            stage5_vuln_files, config, checkpoint, progress=progress
+        )
         progress.update(
             items_done=len(stage5_reports),
-            items_total=len(vuln_files),
+            items_total=len(stage5_vuln_files),
             detail=f"{len(stage5_reports)} PoCs reproduced",
         )
 
@@ -402,12 +469,24 @@ async def _run_audit_stages(
         f"Preparing {len(stage5_reports)} disclosures",
     ) as progress:
         disclosure_reports = await run_stage6(
-            stage5_reports, config, checkpoint
+            stage5_reports, config, checkpoint, progress=progress
+        )
+        candidate_total = int(
+            getattr(config, "stage6_candidate_total", len(stage5_reports))
         )
         progress.update(
             items_done=len(disclosure_reports),
-            items_total=len(stage5_reports),
+            items_total=candidate_total,
             detail=f"{len(disclosure_reports)} disclosure packages prepared",
+        )
+
+    if not config.sandbox_enabled:
+        # Retained reports/trajectories are independent of the disposable
+        # worktree. Clean it after a terminal Stage 6 result even when some
+        # disclosure sub-tasks failed; otherwise a failed run can leave tens of
+        # gigabytes of rebuild caches behind indefinitely.
+        await cleanup_poc_worktree(
+            config.target, config.output_dir, config.poc_worktree
         )
 
     if config.task_errors:

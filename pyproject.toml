@@ -9,7 +9,6 @@ description = "Web-based multi-stage code auditing agent application using Claud
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.48",
-    "codex-app-server-sdk @ https://github.com/openai/codex/archive/6e838a19fa52f2c30442c5bd2913acd1e6fe4c9d.tar.gz#subdirectory=sdk/python",
     "cryptography>=42",
     "rich>=13.0",
     "fastapi>=0.110",
@@ -18,6 +17,7 @@ dependencies = [
     "websockets>=14",
     "pywinpty>=2.0; sys_platform == 'win32'",
     "pywin32>=306; sys_platform == 'win32'",
+    "openai-codex>=0.163.0,<0.164.0",
 ]
 
 [dependency-groups]

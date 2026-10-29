@@ -20,18 +20,6 @@ const STATUS_LABEL = {
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
-const authLoading = $("auth-loading");
-const authGate = $("auth-gate");
-const appShell = $("app-shell");
-const authSetupPanel = $("auth-setup-panel");
-const authLoginPanel = $("auth-login-panel");
-const authRegisterPanel = $("auth-register-panel");
-const authError = $("auth-error");
-const authSwitch = $("auth-switch");
-const authSwitchCopy = $("auth-switch-copy");
-const authSwitchButton = $("auth-switch-button");
-const authUserMenu = $("auth-user-menu");
-const authUserLabel = $("auth-user-label");
 const form = $("audit-form");
 const logPane = $("log-pane");
 const jobList = $("job-list");
@@ -932,6 +920,7 @@ form.addEventListener("submit", async (e) => {
     return;
   }
   body.max_parallel = maxParallel;
+  body.full_analysis = $("f-full-analysis").checked;
   const wiki = $("f-wiki-select").value;
   if (wiki) body.wiki = wiki;
 
@@ -5518,176 +5507,6 @@ function initScrollTopButton() {
   update();
 }
 
-// ── Authentication ─────────────────────────────────────────────────────────
-let applicationStarted = false;
-
-function setAuthError(message = "") {
-  authError.textContent = message;
-}
-
-function showAuthPanel(mode, message = "") {
-  const setup = mode === "setup";
-  const register = mode === "register";
-  $("auth-title").textContent = setup
-    ? "Set up CodeAuditor"
-    : register
-      ? "Create a CodeAuditor account"
-      : "Sign in to CodeAuditor";
-  $("auth-intro").textContent = setup
-    ? "Create the administrator account before using the Web UI."
-    : "Use your CodeAuditor account to access audit history and evidence.";
-  authSetupPanel.hidden = !setup;
-  authLoginPanel.hidden = setup || register;
-  authRegisterPanel.hidden = setup || !register;
-  authSwitch.hidden = setup;
-  if (!setup) {
-    authSwitchCopy.textContent = register
-      ? "Already have an account?"
-      : "Need an account?";
-    authSwitchButton.textContent = register ? "Sign in" : "Create account";
-  }
-  authGate.hidden = false;
-  authLoading.hidden = true;
-  appShell.hidden = true;
-  authUserMenu.hidden = true;
-  setAuthError(message);
-}
-
-function showAuthenticatedApp(user) {
-  authLoading.hidden = true;
-  authGate.hidden = true;
-  appShell.hidden = false;
-  authUserMenu.hidden = false;
-  authUserLabel.textContent = `${user.username} · ${user.role}`;
-  setAuthError();
-  if (!applicationStarted) {
-    applicationStarted = true;
-    startApplication();
-  }
-}
-
-async function authJson(path, payload) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify(payload),
-  });
-  let body = {};
-  try {
-    body = await response.json();
-  } catch (_) {
-    // Preserve a useful generic error for non-JSON server failures.
-  }
-  if (!response.ok) {
-    throw new Error(
-      errorDetail(body.detail) || `Request failed (${response.status})`
-    );
-  }
-  return body;
-}
-
-function credentialsFrom(formId, confirmId = "") {
-  const authForm = $(formId);
-  const username = authForm.elements.username.value;
-  const password = authForm.elements.password.value;
-  if (confirmId && password !== $(confirmId).value) {
-    throw new Error("Passwords do not match.");
-  }
-  return { username, password };
-}
-
-function setFormBusy(formId, busy) {
-  $(formId).querySelector("button[type=submit]").disabled = busy;
-}
-
-$("auth-setup-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setAuthError();
-  setFormBusy("auth-setup-form", true);
-  try {
-    const credentials = credentialsFrom("auth-setup-form", "auth-setup-confirm");
-    const result = await authJson("/api/auth/setup", credentials);
-    showAuthenticatedApp(result.user);
-  } catch (error) {
-    setAuthError(error.message);
-  } finally {
-    setFormBusy("auth-setup-form", false);
-  }
-});
-
-$("auth-login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setAuthError();
-  setFormBusy("auth-login-form", true);
-  try {
-    const credentials = credentialsFrom("auth-login-form");
-    const result = await authJson("/api/auth/login", credentials);
-    showAuthenticatedApp(result.user);
-  } catch (error) {
-    setAuthError(error.message);
-  } finally {
-    setFormBusy("auth-login-form", false);
-  }
-});
-
-$("auth-register-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setAuthError();
-  setFormBusy("auth-register-form", true);
-  try {
-    const credentials = credentialsFrom(
-      "auth-register-form",
-      "auth-register-confirm"
-    );
-    await authJson("/api/auth/register", credentials);
-    $("auth-login-username").value = credentials.username;
-    showAuthPanel("login", "Account created. Sign in to continue.");
-  } catch (error) {
-    setAuthError(error.message);
-  } finally {
-    setFormBusy("auth-register-form", false);
-  }
-});
-
-authSwitchButton.addEventListener("click", () => {
-  const showingRegister = !authRegisterPanel.hidden;
-  showAuthPanel(showingRegister ? "login" : "register");
-});
-
-$("btn-logout").addEventListener("click", async () => {
-  const button = $("btn-logout");
-  button.disabled = true;
-  try {
-    await fetch("/api/auth/logout", {
-      method: "POST",
-      credentials: "same-origin",
-    });
-  } finally {
-    window.location.reload();
-  }
-});
-
-async function bootstrapAuthentication() {
-  try {
-    const response = await fetch("/api/auth/status", {
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-    const status = await response.json();
-    if (!response.ok) {
-      throw new Error(status.detail || `Authentication status failed (${response.status})`);
-    }
-    if (status.authenticated && status.user) {
-      showAuthenticatedApp(status.user);
-    } else {
-      showAuthPanel(status.setup_required ? "setup" : "login");
-    }
-  } catch (error) {
-    showAuthPanel("login", `Authentication service unavailable: ${error.message}`);
-  }
-}
-
 // ── Boot ────────────────────────────────────────────────────────────────────
 async function startApplication() {
   resetStages();
@@ -5714,4 +5533,4 @@ async function startApplication() {
   );
 }
 
-bootstrapAuthentication();
+startApplication();

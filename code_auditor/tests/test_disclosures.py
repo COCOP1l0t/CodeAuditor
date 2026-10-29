@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import zipfile
 from dataclasses import replace
@@ -12,8 +13,10 @@ import pytest
 from code_auditor.checkpoint import CheckpointManager
 from code_auditor.config import AuditConfig
 from code_auditor.disclosures import build_dedupe_key, extract_email_subject
+from code_auditor.retention import write_retain_manifest_v2
 from code_auditor.stages import stage6
 from code_auditor.utils import extract_json_object
+from code_auditor.validation.stage6 import validate_stage6_disclosure
 
 
 def _finding(**overrides: object) -> dict[str, object]:
@@ -329,6 +332,7 @@ def test_run_disclosure_without_sandbox_still_writes_artifacts(
         reproduce.write_text(
             "#!/bin/sh\nexec echo reproduced\n", encoding="utf-8"
         )
+        os.chmod(reproduce, 0o700)
         (disclosure / "report.md").write_text(
             "# Disclosure\n\n### Summary\nExample.\n\n### Details\nExample.\n\n"
             "### PoC\nExisting evidence.\n\n### Impact\nExample.\n",
@@ -719,3 +723,200 @@ def test_extract_json_object_rejects_invalid_text() -> None:
 def test_extract_json_object_ignores_braces_inside_strings() -> None:
     text = 'Agent commentary: {"message":"literal } brace", "ok": true} trailing'
     assert extract_json_object(text) == '{"message":"literal } brace", "ok": true}'
+
+
+def _write_reusable_stage5(output: Path, vuln_id: str = "H-01") -> Path:
+    poc = output / "stage5-pocs" / vuln_id
+    poc.mkdir(parents=True)
+    report = poc / "report.md"
+    report.write_text(
+        f"# {vuln_id}\n\n## Reproduction Status\n\nreproduced\n\n"
+        "## Observed Result\n\nreal output\n",
+        encoding="utf-8",
+    )
+    reproduce = poc / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(reproduce, 0o700)
+    graph = {
+        "schema_version": 1,
+        "finding_id": vuln_id,
+        "title": "verified",
+        "trigger": "attacker input",
+        "evidence_basis": "runtime trace",
+        "nodes": [
+            {
+                "id": "source",
+                "function": "source",
+                "location": "src/source.ts:1",
+                "role": "source",
+                "description": "receives input",
+                "evidence": "trace",
+                "key_parameters": [],
+            },
+            {
+                "id": "sink",
+                "function": "sink",
+                "location": "src/sink.ts:2",
+                "role": "sink",
+                "description": "uses input",
+                "evidence": "trace",
+                "key_parameters": [],
+            },
+        ],
+        "edges": [
+            {
+                "from": "source",
+                "to": "sink",
+                "label": "calls",
+                "condition": "always",
+                "attacker_controlled": True,
+            }
+        ],
+    }
+    (poc / "trigger-graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    write_retain_manifest_v2(
+        poc,
+        entrypoint="reproduce.sh",
+        platform="linux",
+        interpreter="sh",
+        files=[("report.md", "report"), ("reproduce.sh", "entrypoint")],
+    )
+    return report
+
+
+def test_stage5_evidence_reuse_checks_hashes(tmp_path: Path) -> None:
+    config, _checkpoint, _target, output = _stage6_config(tmp_path)
+    report = _write_reusable_stage5(output)
+
+    ok, reason = stage6._stage5_evidence_status(str(report), config)
+    assert ok is True
+    assert "hashes are valid" in reason
+
+    reproduce = report.parent / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    ok, reason = stage6._stage5_evidence_status(str(report), config)
+    assert ok is False
+    assert "manifest is invalid" in reason
+
+
+def test_normalizes_disclosure_zip_to_root_and_refreshes_manifest(tmp_path: Path) -> None:
+    disclosure = tmp_path / "disclosure"
+    disclosure.mkdir()
+    (disclosure / "report.md").write_text("# Report\n", encoding="utf-8")
+    (disclosure / "email.txt").write_text("Subject: Test\n\nBody\n", encoding="utf-8")
+    reproduce = disclosure / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(reproduce, 0o700)
+    (disclosure / "evidence.txt").write_text("evidence\n", encoding="utf-8")
+    with zipfile.ZipFile(disclosure / "disclosure.zip", "w") as archive:
+        archive.write(disclosure / "report.md", "disclosure/report.md")
+    (disclosure / "retain-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "entrypoint": {
+                    "path": "reproduce.sh",
+                    "platform": "linux",
+                    "interpreter": "sh",
+                    "argv": [],
+                },
+                "files": [
+                    {"path": "report.md", "role": "report"},
+                    {"path": "email.txt", "role": "disclosure"},
+                    {"path": "reproduce.sh", "role": "entrypoint"},
+                    {"path": "evidence.txt", "role": "evidence"},
+                    {"path": "disclosure.zip", "role": "disclosure"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stage6._normalize_disclosure_package(str(disclosure))
+
+    with zipfile.ZipFile(disclosure / "disclosure.zip") as archive:
+        names = set(archive.namelist())
+    assert "report.md" in names
+    assert "reproduce.sh" in names
+    assert "disclosure/report.md" not in names
+    assert "email.txt" not in names
+    manifest = json.loads((disclosure / "retain-manifest.json").read_text())
+    assert manifest["schema_version"] == 2
+    assert {item["path"] for item in manifest["files"]} == {
+        "report.md",
+        "email.txt",
+        "reproduce.sh",
+        "evidence.txt",
+        "disclosure.zip",
+    }
+
+
+def test_run_disclosure_reuses_stage5_evidence_and_marks_policy_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, checkpoint, target, output = _stage6_config(tmp_path)
+    config.sandbox_enabled = False
+    (target / "SECURITY.md").write_text(
+        "We do not accept AI generated security reports. "
+        "Submitting one causes an automatic ban.\n",
+        encoding="utf-8",
+    )
+    report = _write_reusable_stage5(output, "H-01")
+    prompts: list[str] = []
+
+    async def fake_run_agent(
+        prompt: str,
+        work_config: AuditConfig,
+        **_kwargs: object,
+    ) -> str:
+        prompts.append(prompt)
+        disclosure = (
+            Path(work_config.output_dir) / "stage6-disclosures" / "H-01" / "disclosure"
+        )
+        disclosure.mkdir(parents=True, exist_ok=True)
+        (disclosure / "report.md").write_text(
+            "# Disclosure\n\n### Summary\nExample.\n\n### Details\nReused evidence.\n\n"
+            "### PoC\nRetained PoC.\n\n### Impact\nExample.\n",
+            encoding="utf-8",
+        )
+        (disclosure / "email.txt").write_text(
+            "Subject: Example\n\nAI-assisted report.\n", encoding="utf-8"
+        )
+        reproduce = disclosure / "reproduce.sh"
+        reproduce.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(reproduce, 0o700)
+        with zipfile.ZipFile(disclosure / "disclosure.zip", "w") as archive:
+            archive.write(disclosure / "report.md", "report.md")
+            archive.write(reproduce, "reproduce.sh")
+        (disclosure / "retain-manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entrypoint": "reproduce.sh",
+                    "files": [
+                        {"path": "report.md", "role": "report"},
+                        {"path": "email.txt", "role": "disclosure"},
+                        {"path": "reproduce.sh", "role": "entrypoint"},
+                        {"path": "disclosure.zip", "role": "disclosure"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "done"
+
+    monkeypatch.setattr(stage6, "run_agent", fake_run_agent)
+    result = asyncio.run(stage6._run_disclosure(str(report), config, checkpoint))
+
+    assert result is not None
+    assert "Reuse the Stage 5 retained report" in prompts[0]
+    disclosure = output / "stage6-disclosures" / "H-01" / "disclosure"
+    assert "X-CodeAuditor-Submission: blocked" in (
+        disclosure / "email.txt"
+    ).read_text(encoding="utf-8")
+    policy = json.loads(
+        (output / "stage6-disclosures" / "H-01" / "submission-policy.json").read_text()
+    )
+    assert policy["submission_ready"] is False
+    assert validate_stage6_disclosure(str(disclosure)) == []

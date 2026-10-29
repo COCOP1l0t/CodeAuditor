@@ -128,6 +128,7 @@ def test_record_agent_usage_accumulates_claude_style() -> None:
         "output_tokens": 250,
         "cache_creation_input_tokens": 300,
         "cache_read_input_tokens": 4000,
+        "prompt_tokens": 5800,
         "cost_usd": 0.75,
     }
 
@@ -144,6 +145,7 @@ def test_record_agent_usage_accepts_codex_camel_case() -> None:
     assert config.usage_stats["input_tokens"] == 800
     assert config.usage_stats["output_tokens"] == 100
     assert config.usage_stats["cache_read_input_tokens"] == 6000
+    assert config.usage_stats["prompt_tokens"] == 6800
     assert "cost_usd" not in config.usage_stats
 
 

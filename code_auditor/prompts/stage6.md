@@ -16,6 +16,14 @@ The PoC artifacts (scripts, configuration files, crafted inputs, build outputs) 
 
 __FINDING_REFERENCE__
 
+## Stage 5 Evidence Reuse
+
+__STAGE5_EVIDENCE_CONTEXT__
+
+## Target Submission Policy
+
+__SUBMISSION_POLICY_CONTEXT__
+
 The target project source code is at:
 
 `__TARGET_PATH__`
@@ -40,8 +48,8 @@ __WIKI_CONTEXT__
 | "Let me create a simplified version of the vulnerable function" | Still re-implementation. Exercise the project's own code. |
 | "I'll print what the ASAN output would look like" | Fabricated evidence. All output must come from real execution. |
 | "The crash would produce this stack trace" | Run it. Capture real output. Never simulate. |
-| "I already verified this in Stage 5, I'll skip verification" | Verify again. The minimal PoC must trigger independently. |
-| "I'll just copy the Stage 5 report and clean it up" | Write a new report from scratch. Verify every claim. |
+| "Stage 5 evidence is valid, so I must rebuild everything again" | When the reuse context above says Stage 5 report, manifest, sizes, and hashes are valid, reuse them. Do not rerun the expensive build unless an artifact is missing or invalid. |
+| "I'll copy the Stage 5 report without checking it" | Reuse verified evidence and observed results, but write a disclosure-quality report whose claims match the retained evidence. |
 | "This unit test demonstrates the vulnerability" | Unit tests are not PoCs. Attack through the realistic vector. |
 | "I'll skip the zip, the files are already there" | Package everything. The maintainer gets one zip. |
 
@@ -57,7 +65,7 @@ If any of these thoughts cross your mind, you are about to violate the methodolo
 
 The reproduction must run against the actual target project — not a re-implementation of the vulnerable logic, a standalone test program, or a unit test. If the provided artifacts use a harness (e.g., for a library project), verify that the harness exercises the vulnerability through the project's real code paths and interfaces, not a simplified reimplementation.
 
-Read the vulnerability report and follow its reproduction steps exactly:
+First apply the **Stage 5 Evidence Reuse** section above. If reuse is authorized, do not rebuild or rerun the PoC. Validate the retained report, evidence, entrypoint, manifest, sizes, and hashes, then reuse the recorded observed output. If reuse is not authorized, follow the reproduction steps exactly:
 
 1. Build or locate the target as described in the report.
 2. Start the target in its intended deployment configuration.
@@ -71,6 +79,11 @@ If reproduction fails, investigate and fix the issue before proceeding. The repr
 - [ ] Reproduction runs against the actual target project, not a re-implementation or unit test
 - [ ] Vulnerability reproduces following the report's instructions
 - [ ] Observed evidence matches the report's description
+
+When Stage 5 reuse is authorized, the equivalent checkpoint is:
+
+- [ ] Stage 5 report, evidence, entrypoint, manifest, sizes, and hashes are present and internally consistent
+- [ ] The disclosure never presents stale or invented output as a new run
 
 ### Step 2: Create the Minimal PoC
 
@@ -233,6 +246,10 @@ timeline, and provide contact information.>
 Regards
 ```
 
+If the **Target Submission Policy** says generated/AI-assisted reports are
+blocked, begin the body with `INTERNAL DRAFT — DO NOT SEND WITHOUT INDEPENDENT
+HUMAN VALIDATION` and do not imply the message is submission-ready.
+
 **Step 4 checkpoint** — before proceeding, verify:
 
 - [ ] Email written to `__DISCLOSURE_DIR__/email.txt`
@@ -263,7 +280,7 @@ Create `__DISCLOSURE_DIR__/disclosure.zip` containing:
 
 - [ ] `__DISCLOSURE_DIR__/disclosure.zip` created
 - [ ] Zip contains the report and all minimal PoC files (plus any other helpful artifacts)
-- [ ] Email in `__DISCLOSURE_DIR__/email.txt` is ready to send
+- [ ] Email in `__DISCLOSURE_DIR__/email.txt` is ready for internal review, or clearly marked as an internal draft when target policy blocks generated reports
 - [ ] All artifacts are consistent — report observations match the minimal PoC output, email summary aligns with the report, no internal identifiers anywhere
 
 ### Step 6: Declare Retained Files

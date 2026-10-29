@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from code_auditor.cvss import base_score, report_score_errors
+from code_auditor.retention import write_retain_manifest_v2
 from code_auditor.validation.stage6 import validate_stage6_disclosure
 
 
@@ -54,6 +56,43 @@ def test_cvss_ignores_unlabelled_decimals_near_the_vector() -> None:
     )
     # A genuine mislabeled score is still reported.
     assert report_score_errors("CVSS v3.1: 4.2\n\nAV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+
+
+def test_cvss_ignores_policy_score_ranges() -> None:
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:H"
+    text = (
+        "The policy treats CVSS 7.0-8.9 as High.\n\n"
+        f"CVSS v3.1: `{vector}` - 8.2 High"
+    )
+    assert report_score_errors(text) == []
+
+
+def test_cvss_accepts_explicit_contextual_cap_for_base_vector() -> None:
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+    text = (
+        f"CVSS v3.1: `{vector}` - 6.9 Medium. "
+        "This is a project severity cap for an optional deployment; "
+        "the uncapped base score is 7.5."
+    )
+    assert report_score_errors(text) == []
+
+
+def test_cvss_checks_markdown_and_same_line_score() -> None:
+    vector = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H"
+    text = f"- **CVSS v3.1:** `{vector}` — **8.1, High**"
+    errors = report_score_errors(text)
+    assert errors and "7.5" in errors[0]
+    assert report_score_errors(text.replace("8.1", "7.5")) == []
+
+
+def test_cvss_checks_bold_base_score_label() -> None:
+    text = (
+        "- **Base score:** **6.9 (Medium)**\n"
+        "- **Vector:** `CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:N`"
+    )
+    errors = report_score_errors(text)
+    assert errors and "6.4" in errors[0]
+    assert report_score_errors(text.replace("6.9", "6.4")) == []
 
 
 def _package(base: Path, *, report: str | None = None) -> None:
@@ -183,3 +222,29 @@ def test_malformed_email_headers_fail(tmp_path: Path, email: str) -> None:
     _package(tmp_path)
     (tmp_path / "email.txt").write_text(email)
     assert any("email" in x for x in _errors(tmp_path))
+
+
+def test_retained_manifest_hash_mismatch_fails(tmp_path: Path) -> None:
+    _package(tmp_path)
+    reproduce = tmp_path / "reproduce.sh"
+    reproduce.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(reproduce, 0o700)
+    write_retain_manifest_v2(
+        tmp_path,
+        entrypoint="reproduce.sh",
+        platform="linux",
+        interpreter="sh",
+        files=[
+            ("report.md", "report"),
+            ("email.txt", "disclosure"),
+            ("evidence.txt", "evidence"),
+            ("reproduce.sh", "entrypoint"),
+            ("disclosure.zip", "disclosure"),
+        ],
+    )
+    assert _errors(tmp_path) == []
+
+    (tmp_path / "evidence.txt").write_text("Edited evidence\n")
+    assert any(
+        "Invalid retained disclosure manifest" in error for error in _errors(tmp_path)
+    )

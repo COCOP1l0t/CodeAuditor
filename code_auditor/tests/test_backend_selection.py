@@ -33,7 +33,7 @@ from code_auditor.sandbox import DockerScratch
 def test_cli_defaults_to_web_server() -> None:
     args = _build_parser().parse_args([])
 
-    assert args.host == "0.0.0.0"
+    assert args.host == "127.0.0.1"
     assert args.port == 8000
 
 
@@ -120,7 +120,7 @@ def test_main_starts_web_by_default(
     main_module.main()
 
     assert captured == {
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 8000,
     }
 
@@ -920,23 +920,20 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
     async def run_case() -> None:
         captured: dict[str, object] = {}
         fake_openai_codex = types.ModuleType("openai_codex")
-        fake_openai_codex_client = types.ModuleType("openai_codex.client")
         fake_openai_codex_types = types.ModuleType("openai_codex.types")
 
         class FakeApprovalMode(Enum):
             deny_all = "deny_all"
             auto_review = "auto_review"
 
-        class FakeSandboxPolicy:
-            @classmethod
-            def model_validate(cls, value: dict[str, str]) -> dict[str, str]:
-                return value
+        class FakeSandbox:
+            full_access = "full-access"
 
         class FakeReasoningEffort:
             def __init__(self, value: str) -> None:
                 self.value = value
 
-        class FakeAppServerConfig:
+        class FakeCodexConfig:
             def __init__(
                 self,
                 *,
@@ -949,9 +946,6 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
                 captured["cwd"] = cwd
                 captured["config_overrides"] = config_overrides
                 captured["env"] = env
-
-        class FakeAppServerClient:
-            pass
 
         class FakeDeltaPayload:
             delta = "codex-result"
@@ -982,11 +976,11 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
                 captured["prompt"] = prompt
                 captured["run_kwargs"] = kwargs
                 captured["run_approval_mode"] = kwargs.get("approval_mode")
-                captured["run_sandbox_policy"] = kwargs.get("sandbox_policy")
+                captured["run_sandbox"] = kwargs.get("sandbox")
                 return FakeTurnHandle()
 
         class FakeAsyncCodex:
-            def __init__(self, *, config: FakeAppServerConfig) -> None:
+            def __init__(self, *, config: FakeCodexConfig) -> None:
                 captured["app_server_config"] = config
                 self._client = types.SimpleNamespace(_sync=types.SimpleNamespace(_proc=None))
 
@@ -1001,14 +995,12 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
                 captured["thread_start_approval_mode"] = kwargs.get("approval_mode")
                 return FakeThread()
 
-        fake_openai_codex.AppServerConfig = FakeAppServerConfig
         fake_openai_codex.ApprovalMode = FakeApprovalMode
         fake_openai_codex.AsyncCodex = FakeAsyncCodex
-        fake_openai_codex_client.AppServerClient = FakeAppServerClient
+        fake_openai_codex.CodexConfig = FakeCodexConfig
+        fake_openai_codex.Sandbox = FakeSandbox
         fake_openai_codex_types.ReasoningEffort = FakeReasoningEffort
-        fake_openai_codex_types.SandboxPolicy = FakeSandboxPolicy
         monkeypatch.setitem(sys.modules, "openai_codex", fake_openai_codex)
-        monkeypatch.setitem(sys.modules, "openai_codex.client", fake_openai_codex_client)
         monkeypatch.setitem(sys.modules, "openai_codex.types", fake_openai_codex_types)
         monkeypatch.setattr(agent, "_resolve_codex_bin", lambda: "/tmp/codex")
 
@@ -1040,10 +1032,16 @@ def test_codex_backend_uses_current_openai_codex_sdk(monkeypatch: pytest.MonkeyP
         assert captured["thread_start_approval_mode"] is FakeApprovalMode.deny_all
         assert "service_tier" not in captured["thread_start_kwargs"]
         assert captured["run_approval_mode"] is FakeApprovalMode.deny_all
-        assert captured["run_sandbox_policy"] == {"type": "dangerFullAccess"}
+        assert captured["run_sandbox"] == "full-access"
         assert "service_tier" not in captured["run_kwargs"]
 
     asyncio.run(run_case())
+
+
+def test_installed_codex_dependency_uses_current_sdk() -> None:
+    sdk = agent._load_codex_sdk()
+    assert sdk.flavor == "openai_codex"
+    assert sdk.app_server_config_cls.__name__ == "CodexConfig"
 
 
 def test_codex_backend_inherits_legacy_service_tier(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1402,6 +1400,7 @@ def test_claude_backend_records_result_usage_stats(
             "input_tokens": 1200,
             "output_tokens": 300,
             "cache_read_input_tokens": 5000,
+            "prompt_tokens": 6200,
             "cost_usd": 0.042,
         }
 
@@ -1480,6 +1479,14 @@ def test_codex_activity_summary_tracks_command_lifecycle() -> None:
         "Completed command: rg -n sink src"
     )
     assert agent._codex_item_activity("item/agentMessage/delta", payload) is None
+
+
+def test_codex_activity_summary_unwraps_root_model_items() -> None:
+    item = types.SimpleNamespace(type="commandExecution")
+    payload = types.SimpleNamespace(item=types.SimpleNamespace(root=item))
+
+    assert agent._codex_item_activity("item/started", payload) == "Started command"
+    assert agent._codex_item_activity("item/completed", payload) == "Completed command"
 
 
 def test_project_does_not_declare_textual_dependency() -> None:

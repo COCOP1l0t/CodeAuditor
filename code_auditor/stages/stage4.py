@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from contextlib import suppress
 from dataclasses import dataclass
@@ -17,6 +18,11 @@ from ..layout import checkpoint_key, stage4_paths
 from ..logger import get_logger
 from ..prompts import load_prompt
 from ..repos import capture_repo_identity
+from ..semantic_dedupe import (
+    candidate_from_finding,
+    filter_semantic_duplicates,
+    write_dedupe_report,
+)
 from ..stage_runtime import finalize_checkpoint, repair_until_valid
 from ..utils import (
     collect_parallel_results,
@@ -32,6 +38,7 @@ logger = get_logger("stage4")
 
 _SEVERITY_ORDER = ["Critical", "High", "Medium", "Low"]
 _SEVERITY_PREFIX = {"Critical": "C", "High": "H", "Medium": "M", "Low": "L"}
+_VULN_FILENAME_RE = re.compile(r"^[CHML]-\d{2,}\.json$")
 
 
 def _task_key(finding_filename: str) -> str:
@@ -79,7 +86,7 @@ class _VulnerabilityDocument:
 
 def _list_existing_final_files(stage4_dir: str) -> list[str]:
     files = list_json_files(stage4_dir)
-    return [f for f in files if os.path.basename(f) != "_pending"]
+    return [f for f in files if _VULN_FILENAME_RE.fullmatch(os.path.basename(f))]
 
 
 def _load_existing_documents(paths: list[str]) -> list[_VulnerabilityDocument]:
@@ -220,6 +227,75 @@ def _dedupe_findings(
     return deduped
 
 
+async def _semantic_dedupe_pending(
+    pending_paths: list[str],
+    config: AuditConfig,
+) -> list[str]:
+    """Keep one representative pending finding per semantic root cause.
+
+    This runs before IDs are assigned and before Stage 5. Expensive PoC work is
+    therefore limited to root causes that survived both exact and semantic
+    deduplication. Duplicate pending files are retained under ``_duplicates``
+    for auditability instead of being deleted.
+    """
+    if not pending_paths:
+        return []
+
+    paths = stage4_paths(config.output_dir)
+    duplicates_dir = paths["duplicates"]
+    log_dir = os.path.join(paths["directory"], ".semantic-dedupe-logs")
+    report_path = os.path.join(paths["directory"], "semantic-dedupe.json")
+    repo_url = capture_repo_identity(config.target).get("repo_url", "")
+
+    candidates = []
+    for path in pending_paths:
+        try:
+            document = _VulnerabilityDocument.load(path)
+        except ValueError:
+            logger.warning("Stage 4: Could not load pending finding for dedupe: %s", path)
+            continue
+        candidate = candidate_from_finding(
+            os.path.basename(path),
+            document.data,
+            repo_url=repo_url,
+            payload=path,
+        )
+        candidates.append(candidate)
+
+    kept, decisions = await filter_semantic_duplicates(
+        candidates,
+        config.known_disclosures,
+        config,
+        log_dir=log_dir,
+        label="Stage 4",
+        run_agent_fn=run_agent,
+        load_prompt_fn=load_prompt,
+    )
+    write_dedupe_report(report_path, decisions)
+
+    duplicate_ids = {
+        decision.candidate_id
+        for decision in decisions
+        if decision.decision == "duplicate"
+    }
+    if duplicate_ids:
+        os.makedirs(duplicates_dir, exist_ok=True)
+        for candidate in candidates:
+            if candidate.candidate_id not in duplicate_ids:
+                continue
+            source = str(candidate.payload)
+            destination = os.path.join(duplicates_dir, candidate.candidate_id)
+            with suppress(FileNotFoundError):
+                os.replace(source, destination)
+
+    logger.info(
+        "Stage 4: Semantic dedupe kept %d/%d freshly evaluated findings.",
+        len(kept),
+        len(pending_paths),
+    )
+    return [str(candidate.payload) for candidate in kept]
+
+
 def _assign_ids_and_finalize(pending_paths: list[str], config: AuditConfig) -> list[str]:
     stage4_dir = stage4_paths(config.output_dir)["directory"]
     existing_final_files = _list_existing_final_files(stage4_dir)
@@ -330,6 +406,7 @@ async def run_stage4(
     config: AuditConfig,
     checkpoint: CheckpointManager,
     vuln_criteria_path: str,
+    progress: object | None = None,
 ) -> list[str]:
     if not finding_files:
         logger.info("Stage 4: No findings to evaluate.")
@@ -340,10 +417,23 @@ async def run_stage4(
     if config.resume:
         _backfill_stage4_markers(finding_files, config, checkpoint)
 
+    completed = 0
+
+    def task_complete(index: int, finding_path: str) -> None:
+        nonlocal completed
+        completed += 1
+        if progress is not None:
+            progress.update(
+                items_done=completed,
+                items_total=len(finding_files),
+                detail=f"Evaluated {completed}/{len(finding_files)} findings",
+            )
+
     results = await run_parallel_limited(
         finding_files,
         config.max_parallel,
         lambda ff, _: _run_finding(ff, config, checkpoint, vuln_criteria_path),
+        on_complete=task_complete,
     )
 
     confirmed_pending = collect_parallel_results(
@@ -356,6 +446,14 @@ async def run_stage4(
     )
 
     logger.info("Stage 4: %s confirmed findings (from %s candidates).", len(confirmed_pending), len(finding_files))
+    if progress is not None:
+        progress.update(
+            items_done=len(finding_files),
+            items_total=len(finding_files),
+            detail="Semantically deduplicating confirmed findings",
+        )
+
+    confirmed_pending = await _semantic_dedupe_pending(confirmed_pending, config)
 
     final_paths = _assign_ids_and_finalize(confirmed_pending, config)
     logger.info("Stage 4 complete. Final findings: %s", len(final_paths))

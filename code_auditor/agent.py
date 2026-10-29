@@ -573,11 +573,12 @@ def _codex_item_activity(method: str, payload: object) -> str | None:
     if method not in {"item/started", "item/completed"}:
         return None
     item = getattr(payload, "item", None)
+    item = getattr(item, "root", item)
     if item is None:
         return None
     item_type = getattr(item, "type", "")
     item_type = getattr(item_type, "value", item_type)
-    if item_type in {"", "agentMessage", "reasoning"}:
+    if item_type in {"", "agentMessage", "reasoning", "userMessage", "plan", "hookPrompt"}:
         return None
     phase = "Started" if method == "item/started" else "Completed"
     if item_type == "commandExecution":
@@ -618,25 +619,22 @@ class _CodexSdk:
 def _load_codex_sdk() -> _CodexSdk:
     try:
         from openai_codex import (  # type: ignore[import-not-found]
-            AppServerConfig,
             ApprovalMode,
             AsyncCodex,
+            CodexConfig,
+            Sandbox,
         )
-        from openai_codex.client import AppServerClient  # type: ignore[import-not-found]
-        from openai_codex.types import (  # type: ignore[import-not-found]
-            ReasoningEffort,
-            SandboxPolicy,
-        )
+        from openai_codex.types import ReasoningEffort  # type: ignore[import-not-found]
 
         return _CodexSdk(
             flavor="openai_codex",
             async_codex_cls=AsyncCodex,
-            app_server_config_cls=AppServerConfig,
-            app_server_client_cls=AppServerClient,
+            app_server_config_cls=CodexConfig,
+            app_server_client_cls=None,
             approval_mode_cls=ApprovalMode,
             ask_for_approval_cls=None,
             reasoning_effort_cls=ReasoningEffort,
-            sandbox_policy_cls=SandboxPolicy,
+            sandbox_policy_cls=Sandbox,
             text_input_cls=None,
         )
     except ImportError as openai_codex_exc:
@@ -1033,23 +1031,30 @@ async def _run_codex_agent(
     if sandbox is not None:
         sandbox.ensure_backend("codex")
     codex_bin = sandbox.wrapper_path("codex") if sandbox is not None else _resolve_codex_bin()
-    sandbox_policy = codex_sdk.sandbox_policy_cls.model_validate(
-        {
-            "type": "externalSandbox",
-            "networkAccess": "enabled" if sandbox is not None and sandbox.network_enabled else "restricted",
-        }
-        if sandbox is not None
-        else {"type": "dangerFullAccess"}
-    )
     codex_effort = codex_sdk.reasoning_effort_cls(effort) if effort else None
     if codex_sdk.flavor == "openai_codex":
         if codex_sdk.approval_mode_cls is None:
             raise RuntimeError("Current Codex SDK import did not expose ApprovalMode.")
         approval_setting = codex_sdk.approval_mode_cls.deny_all
+        # The external Docker container is the isolation boundary. Inside it
+        # Codex needs full access to the copied workspace and its toolchain.
+        sandbox_setting = codex_sdk.sandbox_policy_cls.full_access
     else:
         if codex_sdk.ask_for_approval_cls is None:
             raise RuntimeError("Legacy Codex SDK import did not expose approval types.")
         approval_setting = codex_sdk.ask_for_approval_cls.model_validate("never")
+        sandbox_setting = codex_sdk.sandbox_policy_cls.model_validate(
+            {
+                "type": "externalSandbox",
+                "networkAccess": (
+                    "enabled"
+                    if sandbox is not None and sandbox.network_enabled
+                    else "restricted"
+                ),
+            }
+            if sandbox is not None
+            else {"type": "dangerFullAccess"}
+        )
 
     log_fh = _open_agent_log(log_file)
     run_control = run_control or _AgentRunControl()
@@ -1089,6 +1094,7 @@ async def _run_codex_agent(
                         approval_mode=approval_setting,
                         cwd=cwd,
                         model=selected_model,
+                        sandbox=sandbox_setting,
                     )
                     turn = await thread.turn(
                         prompt,
@@ -1096,7 +1102,7 @@ async def _run_codex_agent(
                         cwd=cwd,
                         effort=codex_effort,
                         model=selected_model,
-                        sandbox_policy=sandbox_policy,
+                        sandbox=sandbox_setting,
                     )
                 else:
                     thread = await codex.thread_start(
@@ -1115,7 +1121,7 @@ async def _run_codex_agent(
                         cwd=cwd,
                         effort=codex_effort,
                         model=selected_model,
-                        sandbox_policy=sandbox_policy,
+                        sandbox_policy=sandbox_setting,
                     )
 
                 stream = turn.stream()

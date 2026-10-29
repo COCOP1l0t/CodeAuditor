@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
+from fastapi import FastAPI, Header, HTTPException, Query, Response, WebSocket
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -57,15 +57,6 @@ from .job import (
     JobConflictError,
     JobValidationError,
     ReproductionStartParams,
-)
-from .auth import (
-    SESSION_COOKIE_NAME,
-    SESSION_TTL_SECONDS,
-    hash_password,
-    new_session_token,
-    normalize_username,
-    session_token_digest,
-    verify_password,
 )
 from .local_directories import (
     LocalDirectoryPickerError,
@@ -123,17 +114,6 @@ class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
-class AuthCredentialsRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    username: str = Field(
-        min_length=3,
-        max_length=64,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$",
-    )
-    password: str = Field(min_length=12, max_length=512)
-
-
 class AuditStartRequest(StrictRequest):
     repository: str | None = Field(
         default=None, min_length=1, max_length=512, pattern=_REPOSITORY_NAME_PATTERN
@@ -149,6 +129,7 @@ class AuditStartRequest(StrictRequest):
         default=None, min_length=1, max_length=512, pattern=_REPOSITORY_NAME_PATTERN
     )
     max_parallel: int = Field(default=1, ge=1, le=16)
+    full_analysis: bool = False
 
     @field_validator("repository", "wiki")
     @classmethod
@@ -656,16 +637,40 @@ def create_app(
                     )
             except Exception:
                 logger.exception("Failed to purge expired Disclosure trash records.")
+
+    async def _resume_interrupted_runs(run_ids: list[int]) -> None:
+        auto_resume = os.environ.get(
+            "CODE_AUDITOR_AUTO_RESUME_INTERRUPTED", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if not auto_resume:
+            return
+        provider = settings.provider()
+        for run_id in run_ids:
             try:
-                # Revoked/expired session digests are otherwise retained
-                # forever; bound the sessions table with the same cadence.
-                await asyncio.to_thread(store.purge_expired_auth_sessions)
+                await manager.resume_cancelled(
+                    run_id,
+                    repos_dir=settings.repos_dir,
+                    results_dir=settings.results_dir,
+                    wikis_dir=settings.wikis_dir,
+                    backend=settings.backend,  # type: ignore[arg-type]
+                    provider_mode=provider.mode,
+                    provider_base_url=provider.base_url or None,
+                    provider_api_key=provider.api_key or None,
+                    model=provider.model if provider.mode == "custom" else None,
+                    sandbox_mode=settings.sandbox_mode,
+                    sandbox_runtime=settings.sandbox_runtime,
+                )
+                logger.info("Automatically resumed interrupted audit run #%d.", run_id)
             except Exception:
-                logger.exception("Failed to purge expired authentication sessions.")
+                logger.exception(
+                    "Could not automatically resume interrupted audit run #%d.",
+                    run_id,
+                )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        manager.recover_interrupted_runs()
+        interrupted_run_ids = manager.recover_interrupted_runs()
+        await _resume_interrupted_runs(interrupted_run_ids)
         purge_task = asyncio.create_task(purge_disclosure_trash())
         try:
             yield
@@ -687,78 +692,6 @@ def create_app(
     app.state.active_terminals = 0
     # One process-wide log handler routes records to the owning job's bus.
     install_web_log_handler(manager.bus_for_job)
-
-    _AUTH_PUBLIC_PATHS = {
-        "/api/auth/status",
-        "/api/auth/setup",
-        "/api/auth/login",
-        "/api/auth/logout",
-    }
-
-    async def _session_user(request) -> dict[str, object] | None:
-        """Resolve the session cookie's user without blocking the event loop."""
-        token = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if not token:
-            return None
-        return await asyncio.to_thread(
-            store.get_auth_user_by_session, session_token_digest(token)
-        )
-
-    def _session_cookie(response: Response, token: str, *, secure: bool = False) -> None:
-        response.set_cookie(
-            SESSION_COOKIE_NAME,
-            token,
-            max_age=SESSION_TTL_SECONDS,
-            httponly=True,
-            samesite="lax",
-            # Mark the bearer cookie Secure whenever the request actually
-            # arrived over HTTPS (uvicorn's proxy handling maps forwarded
-            # schemes onto request.url.scheme). Plain-HTTP local deployments
-            # keep working.
-            secure=secure,
-            path="/",
-        )
-
-    def _clear_session_cookie(response: Response) -> None:
-        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
-
-    def _issue_session(user: dict[str, object]) -> str:
-        token = new_session_token()
-        now = time.time()
-        store.create_auth_session(
-            int(user["id"]),
-            session_token_digest(token),
-            created_at=now,
-            expires_at=now + SESSION_TTL_SECONDS,
-        )
-        return token
-
-    @app.middleware("http")
-    async def require_authentication(request, call_next):
-        """Require a session after first-run setup has created an account.
-
-        Existing installations remain usable until setup is completed; this
-        compatibility mode lets an operator reach ``/api/auth/setup`` without
-        a migration-time lockout.  Once any account exists, every API except
-        the explicitly public authentication endpoints requires a session
-        cookie — including user registration, which is an administrator
-        action (see the README) and not an open sign-up.
-        """
-        path = request.url.path
-        if path.startswith("/api/") and path not in _AUTH_PUBLIC_PATHS:
-            # Keep the blocking SQLite reads off the event loop: a locked
-            # writer (busy_timeout is 30s) would otherwise stall every SSE
-            # stream and concurrent job.
-            if await asyncio.to_thread(store.auth_user_count) > 0:
-                user = await _session_user(request)
-                if user is None:
-                    return JSONResponse(
-                        {"detail": "Authentication required."},
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Session"},
-                    )
-                request.state.user = user
-        return await call_next(request)
 
     def jobs_snapshot() -> list[dict]:
         """Combine Web-owned jobs with externally owned maintenance runs."""
@@ -845,8 +778,7 @@ def create_app(
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
         elif (
-            request.url.path.startswith("/api/auth/")
-            or request.url.path
+            request.url.path
             in {
                 "/api/config",
                 "/api/dashboard",
@@ -867,109 +799,6 @@ def create_app(
         return FileResponse(STATIC_DIR / "index.html")
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-    @app.get("/api/auth/status")
-    async def auth_status(request: Request) -> dict[str, object]:
-        user = await _session_user(request)
-        return {
-            # Keep the SQLite read off the event loop; see the auth middleware.
-            "setup_required": await asyncio.to_thread(store.auth_user_count) == 0,
-            "authenticated": user is not None,
-            "user": user,
-        }
-
-    @app.post("/api/auth/setup", status_code=201)
-    def auth_setup(
-        credentials: AuthCredentialsRequest, request: Request, response: Response
-    ) -> dict[str, object]:
-        if store.auth_user_count() > 0:
-            raise HTTPException(
-                status_code=409,
-                detail="Administrator setup has already been completed.",
-            )
-        username = normalize_username(credentials.username)
-        try:
-            user = store.create_initial_auth_admin(
-                username, hash_password(credentials.password)
-            )
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail="Administrator setup has already been completed.",
-            ) from exc
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(
-                status_code=409, detail="That username is already registered."
-            ) from exc
-        # A pre-setup /api/config response may have exposed the old process
-        # token. Rotate it as soon as authentication is initialized.
-        app.state.terminal_token = secrets.token_urlsafe(32)
-        _session_cookie(
-            response,
-            _issue_session(user),
-            secure=request.url.scheme == "https",
-        )
-        return {"user": user, "setup_required": False}
-
-    @app.post("/api/auth/register", status_code=201)
-    def auth_register(
-        credentials: AuthCredentialsRequest, request: Request
-    ) -> dict[str, object]:
-        if store.auth_user_count() == 0:
-            raise HTTPException(
-                status_code=409,
-                detail="Complete administrator setup before registering users.",
-            )
-        # Registration creates credentials, so it is an administrator action.
-        # Leaving it public lets any network client mint itself an account and
-        # reach every other API; the middleware above requires the session.
-        actor = getattr(request.state, "user", None)
-        if actor is None or str(actor.get("role") or "") != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail="Administrator authentication is required to register users.",
-            )
-        username = normalize_username(credentials.username)
-        try:
-            user = store.create_auth_user(
-                username, hash_password(credentials.password), role="user"
-            )
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(
-                status_code=409, detail="That username is already registered."
-            ) from exc
-        return {"user": user}
-
-    @app.post("/api/auth/login")
-    def auth_login(
-        credentials: AuthCredentialsRequest, request: Request, response: Response
-    ) -> dict[str, object]:
-        username = normalize_username(credentials.username)
-        record = store.get_auth_user_by_username(username)
-        if (
-            record is None
-            or not bool(record.get("is_active"))
-            or not verify_password(credentials.password, str(record["password_hash"]))
-        ):
-            raise HTTPException(status_code=401, detail="Invalid username or password.")
-        user = {key: value for key, value in record.items() if key != "password_hash"}
-        store.mark_auth_login(int(user["id"]))
-        user = store.get_auth_user_by_username(username) or record
-        user.pop("password_hash", None)
-        _session_cookie(
-            response,
-            _issue_session(user),
-            secure=request.url.scheme == "https",
-        )
-        return {"user": AuditStore._public_user(user)}
-
-    @app.post("/api/auth/logout")
-    def auth_logout(request: Request, response: Response) -> dict[str, bool]:
-        token = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if token:
-            store.revoke_auth_session(session_token_digest(token))
-        _clear_session_cookie(response)
-        return {"logged_out": True}
 
     @app.get("/api/config")
     def get_config() -> dict:
@@ -1175,6 +1004,7 @@ def create_app(
                     update_repo=not bool(request.local_directory),
                     wiki=wiki_path,
                     max_parallel=request.max_parallel,
+                    full_analysis=request.full_analysis,
                     backend=settings.backend,
                     model=provider.model if provider.mode == "custom" else None,
                     provider_mode=provider.mode,

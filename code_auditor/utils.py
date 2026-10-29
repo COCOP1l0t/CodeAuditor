@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -75,6 +76,7 @@ async def run_parallel_limited(
     items: list[T],
     concurrency: int,
     worker: Callable[[T, int], Coroutine[Any, Any, R]],
+    on_complete: Callable[[int, T], Any] | None = None,
 ) -> list[tuple[str, R | None, Exception | None]]:
     """Run worker on each item with bounded concurrency. Returns (status, value, error) triples."""
     if not items:
@@ -90,6 +92,11 @@ async def run_parallel_limited(
                 results[index] = ("fulfilled", value, None)
             except Exception as exc:
                 results[index] = ("rejected", None, exc)
+            finally:
+                if on_complete is not None:
+                    completed = on_complete(index, item)
+                    if inspect.isawaitable(completed):
+                        await completed
 
     await asyncio.gather(*(run_one(i, item) for i, item in enumerate(items)))
     return results
@@ -203,9 +210,11 @@ def is_nonfatal_sandbox_cleanup_error(error: BaseException | str) -> bool:
 _USAGE_KEY_ALIASES = {
     "input_tokens": ("input_tokens", "inputTokens"),
     "output_tokens": ("output_tokens", "outputTokens"),
+    "total_tokens": ("total_tokens", "totalTokens"),
     "cache_creation_input_tokens": (
         "cache_creation_input_tokens",
         "cacheCreationInputTokens",
+        "cache_write_input_tokens",
     ),
     "cache_read_input_tokens": (
         "cache_read_input_tokens",
@@ -233,15 +242,42 @@ def record_agent_usage(
     stats = config.usage_stats
     stats["agent_calls"] = stats.get("agent_calls", 0) + 1
     if isinstance(usage, dict):
+        canonical_values: dict[str, float] = {}
         for canonical, aliases in _USAGE_KEY_ALIASES.items():
             for alias in aliases:
                 number = _usage_number(usage.get(alias))
                 if number:
                     stats[canonical] = stats.get(canonical, 0) + number
+                    canonical_values[canonical] = number
                     break
+        # Codex reports inputTokens as the complete prompt count with cached
+        # tokens as a subset. Claude reports input_tokens excluding cache
+        # reads/writes. Store one canonical prompt total so trajectory totals
+        # and the Web history do not add cache twice for Codex.
+        prompt = _usage_number(usage.get("prompt_tokens"))
+        if prompt is None:
+            total = canonical_values.get("total_tokens")
+            output = canonical_values.get("output_tokens")
+            if total is not None and output is not None:
+                prompt = max(0.0, total - output)
+            else:
+                prompt = (
+                    canonical_values.get("input_tokens", 0.0)
+                    + canonical_values.get("cache_read_input_tokens", 0.0)
+                    + canonical_values.get("cache_creation_input_tokens", 0.0)
+                )
+        if prompt:
+            stats["prompt_tokens"] = stats.get("prompt_tokens", 0) + prompt
     number = _usage_number(cost_usd)
     if number is not None:
         stats["cost_usd"] = stats.get("cost_usd", 0.0) + number
+    notify = getattr(config, "usage_stats_changed", None)
+    if callable(notify):
+        try:
+            notify()
+        except Exception:
+            # Usage persistence is observational and must never fail an agent.
+            pass
 
 
 def summarize_task_errors(task_errors: list[str], max_chars: int = 1000) -> str:

@@ -51,8 +51,28 @@ Disclosure package under `__OUTPUT_DIR__/disclosure-draft/`. It must contain
 `retain-manifest.json`. Base it on the newly observed evidence and tested commit,
 not historical output. Keep ZIP members byte-identical to their local
 counterparts, exclude email.txt and generated caches from the ZIP, and list every
-retained file in the manifest. Do not create a disclosure draft for any other
-outcome.
+retained file in the manifest. Use schema version 2 exactly like the Stage 6
+contract: the entrypoint is an object, every file has exact byte size and
+lowercase SHA-256, and roles must be one of `entrypoint`, `script`, `support`,
+`report`, `evidence`, or `disclosure`. In particular, use `disclosure` for both
+`email.txt` and `disclosure.zip`; do not invent roles such as `archive` or
+`correspondence`.
+
+```json
+{
+  "schema_version": 2,
+  "entrypoint": {"path": "reproduce.sh", "platform": "linux", "interpreter": "sh", "argv": []},
+  "files": [
+    {"path": "reproduce.sh", "role": "entrypoint", "size": 123, "sha256": "<64 lowercase hex>"},
+    {"path": "report.md", "role": "report", "size": 456, "sha256": "<64 lowercase hex>"},
+    {"path": "email.txt", "role": "disclosure", "size": 234, "sha256": "<64 lowercase hex>"},
+    {"path": "disclosure.zip", "role": "disclosure", "size": 789, "sha256": "<64 lowercase hex>"}
+  ]
+}
+```
+
+Do not list `retain-manifest.json` itself. Do not create a disclosure draft for
+any other outcome.
 
 ### Refreshed report.md — exact section contract
 
